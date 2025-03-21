@@ -1,0 +1,6 @@
+ray>=2.6.0
+numpy>=1.21.0
+matplotlib>=3.5.0
+tritonclient[http]>=2.33.0
+torch>=2.0.0
+tensorrt>=8.6.0
