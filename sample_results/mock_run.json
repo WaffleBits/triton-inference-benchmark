@@ -1,0 +1,20 @@
+{
+  "mode": "mock",
+  "server_url": null,
+  "model_name": "resnet50_trt_fp16",
+  "num_requests": 100,
+  "concurrency": 8,
+  "duration_seconds": 0.3274,
+  "successful_requests": 100,
+  "failed_requests": 0,
+  "success_rate": 1.0,
+  "throughput_rps": 305.4379,
+  "latency_ms": {
+    "avg": 21.3842,
+    "p50": 21.7421,
+    "p95": 33.1148,
+    "p99": 34.6712,
+    "min": 8.1195,
+    "max": 35.0022
+  }
+}

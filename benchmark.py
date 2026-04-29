@@ -1,132 +1,247 @@
-import time
-import numpy as np
-import matplotlib.pyplot as plt
-import ray
-import tritonclient.http as httpclient
-from tritonclient.utils import np_to_triton_dtype
-import logging
-from pathlib import Path
+from __future__ import annotations
+
+import argparse
 import json
+import random
+import statistics
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Protocol
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# Initialize Ray for distributed computing
-ray.init()
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    mode: str = "mock"
+    server_url: str = "localhost:8000"
+    model_name: str = "resnet50_trt_fp16"
+    input_name: str = "input"
+    input_shape: tuple[int, ...] = (1, 3, 224, 224)
+    num_requests: int = 200
+    concurrency: int = 10
+    retries: int = 2
+    output_dir: str = "benchmark_results"
+    seed: int = 7
 
-class TritonBenchmark:
-    def __init__(self, server_url="localhost:8000", model_name="resnet50_trt_fp16", 
-                 input_shape=(1, 3, 224, 224), num_requests=200, concurrent_requests=10):
-        self.server_url = server_url
-        self.model_name = model_name
-        self.input_shape = input_shape
-        self.num_requests = num_requests
-        self.concurrent_requests = concurrent_requests
+
+@dataclass(frozen=True)
+class InferenceResult:
+    ok: bool
+    latency_ms: float
+    error: str | None = None
+
+
+class InferenceClient(Protocol):
+    def infer(self) -> None:
+        """Execute one inference request or raise an exception."""
+
+
+class MockInferenceClient:
+    """Dependency-free client used for CI, demos, and benchmark harness tests."""
+
+    def __init__(
+        self,
+        seed: int = 7,
+        min_latency_ms: float = 8.0,
+        max_latency_ms: float = 35.0,
+        failure_rate: float = 0.02,
+    ) -> None:
+        self.random = random.Random(seed)
+        self.min_latency_ms = min_latency_ms
+        self.max_latency_ms = max_latency_ms
+        self.failure_rate = failure_rate
+
+    def infer(self) -> None:
+        latency_ms = self.random.uniform(self.min_latency_ms, self.max_latency_ms)
+        time.sleep(latency_ms / 1000)
+        if self.random.random() < self.failure_rate:
+            raise RuntimeError("synthetic inference failure")
+
+
+class TritonHttpInferenceClient:
+    """HTTP client for a live NVIDIA Triton Inference Server endpoint."""
+
+    def __init__(
+        self,
+        server_url: str,
+        model_name: str,
+        input_name: str,
+        input_shape: tuple[int, ...],
+    ) -> None:
+        try:
+            import numpy as np
+            import tritonclient.http as httpclient
+            from tritonclient.utils import np_to_triton_dtype
+        except ImportError as exc:
+            raise RuntimeError(
+                "Live Triton mode requires numpy and tritonclient. "
+                "Install them with: pip install -r requirements.txt"
+            ) from exc
+
+        self.np = np
+        self.httpclient = httpclient
+        self.np_to_triton_dtype = np_to_triton_dtype
         self.client = httpclient.InferenceServerClient(url=server_url)
-        
-    @ray.remote
-    def _send_inference_request(self, input_data, retries=3):
-        """Send a single inference request with retry mechanism"""
-        inputs = [httpclient.InferInput("input", input_data.shape, 
-                                      np_to_triton_dtype(input_data.dtype))]
-        inputs[0].set_data_from_numpy(input_data)
+        self.model_name = model_name
+        self.input_name = input_name
+        self.input_shape = input_shape
 
-        for attempt in range(retries):
-            try:
-                start_time = time.time()
-                response = self.client.infer(self.model_name, inputs)
-                latency = (time.time() - start_time) * 1000  # Convert to ms
-                return {"status": "success", "latency": latency}
-            except Exception as e:
-                logger.warning(f"Attempt {attempt+1}: Error {e}")
-                if attempt == retries - 1:
-                    return {"status": "failed", "error": str(e)}
-                time.sleep(1)  # Wait before retry
-    
-    def generate_dummy_input(self):
-        """Generate dummy input data for benchmarking"""
-        return np.random.rand(*self.input_shape).astype(np.float32)
-    
-    def run_benchmark(self):
-        """Execute distributed benchmark"""
-        logger.info(f"Starting benchmark with {self.num_requests} requests...")
-        
-        futures = []
-        results = {"latencies": [], "errors": 0, "successes": 0}
-        
-        # Launch distributed inference requests
-        for _ in range(self.num_requests // self.concurrent_requests):
-            batch = [self.generate_dummy_input() for _ in range(self.concurrent_requests)]
-            futures += [self._send_inference_request.remote(self, data) for data in batch]
-        
-        # Collect results
-        for result in ray.get(futures):
-            if result["status"] == "success":
-                results["latencies"].append(result["latency"])
-                results["successes"] += 1
-            else:
-                results["errors"] += 1
-        
-        # Calculate metrics
-        if results["latencies"]:
-            avg_latency = np.mean(results["latencies"])
-            p95_latency = np.percentile(results["latencies"], 95)
-            p99_latency = np.percentile(results["latencies"], 99)
-            throughput = 1000 * self.concurrent_requests / avg_latency
-            
-            metrics = {
-                "average_latency_ms": float(avg_latency),
-                "p95_latency_ms": float(p95_latency),
-                "p99_latency_ms": float(p99_latency),
-                "throughput_fps": float(throughput),
-                "successful_requests": results["successes"],
-                "failed_requests": results["errors"]
-            }
-            
-            self._save_results(metrics)
-            self._plot_results(results["latencies"])
-            
-            return metrics
-        return None
+    def infer(self) -> None:
+        input_data = self.np.random.rand(*self.input_shape).astype(self.np.float32)
+        request_input = self.httpclient.InferInput(
+            self.input_name,
+            input_data.shape,
+            self.np_to_triton_dtype(input_data.dtype),
+        )
+        request_input.set_data_from_numpy(input_data)
+        self.client.infer(self.model_name, [request_input])
 
-    def _save_results(self, metrics):
-        """Save benchmark results to JSON"""
-        output_dir = Path("benchmark_results")
-        output_dir.mkdir(exist_ok=True)
-        
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        output_file = output_dir / f"benchmark_{timestamp}.json"
-        
-        with open(output_file, 'w') as f:
-            json.dump(metrics, f, indent=4)
-        logger.info(f"Results saved to {output_file}")
 
-    def _plot_results(self, latencies):
-        """Generate visualization of latency distribution"""
-        plt.figure(figsize=(10, 5))
-        plt.hist(latencies, bins=30, alpha=0.7, color='green', edgecolor='black')
-        plt.xlabel("Latency (ms)")
-        plt.ylabel("Frequency")
-        plt.title(f"Distributed Inference Latency Distribution\n{self.model_name}")
-        plt.grid(True)
-        
-        output_dir = Path("benchmark_results")
-        output_dir.mkdir(exist_ok=True)
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        plt.savefig(output_dir / f"latency_distribution_{timestamp}.png")
-        plt.close()
+def percentile(values: list[float], percentile_rank: float) -> float:
+    if not values:
+        return 0.0
+    if percentile_rank <= 0:
+        return min(values)
+    if percentile_rank >= 100:
+        return max(values)
+
+    sorted_values = sorted(values)
+    index = round((percentile_rank / 100) * (len(sorted_values) - 1))
+    return sorted_values[index]
+
+
+def execute_with_retries(client: InferenceClient, retries: int) -> InferenceResult:
+    start = time.perf_counter()
+    last_error: str | None = None
+
+    for _ in range(retries + 1):
+        try:
+            client.infer()
+            latency_ms = (time.perf_counter() - start) * 1000
+            return InferenceResult(ok=True, latency_ms=latency_ms)
+        except Exception as exc:  # noqa: BLE001 - benchmark harness records client failures.
+            last_error = str(exc)
+
+    latency_ms = (time.perf_counter() - start) * 1000
+    return InferenceResult(ok=False, latency_ms=latency_ms, error=last_error)
+
+
+def run_benchmark(client: InferenceClient, config: BenchmarkConfig) -> dict[str, object]:
+    start = time.perf_counter()
+    results: list[InferenceResult] = []
+
+    with ThreadPoolExecutor(max_workers=config.concurrency) as executor:
+        futures = [
+            executor.submit(execute_with_retries, client, config.retries)
+            for _ in range(config.num_requests)
+        ]
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    duration_seconds = time.perf_counter() - start
+    return summarize_results(results, duration_seconds, config)
+
+
+def summarize_results(
+    results: list[InferenceResult],
+    duration_seconds: float,
+    config: BenchmarkConfig,
+) -> dict[str, object]:
+    latencies = [result.latency_ms for result in results if result.ok]
+    failures = [result for result in results if not result.ok]
+    successes = len(latencies)
+    total = len(results)
+
+    return {
+        "mode": config.mode,
+        "server_url": config.server_url if config.mode == "triton" else None,
+        "model_name": config.model_name,
+        "num_requests": total,
+        "concurrency": config.concurrency,
+        "duration_seconds": round(duration_seconds, 4),
+        "successful_requests": successes,
+        "failed_requests": len(failures),
+        "success_rate": round(successes / total, 4) if total else 0,
+        "throughput_rps": round(successes / duration_seconds, 4)
+        if duration_seconds > 0
+        else 0,
+        "latency_ms": {
+            "avg": round(statistics.fmean(latencies), 4) if latencies else 0,
+            "p50": round(percentile(latencies, 50), 4),
+            "p95": round(percentile(latencies, 95), 4),
+            "p99": round(percentile(latencies, 99), 4),
+            "min": round(min(latencies), 4) if latencies else 0,
+            "max": round(max(latencies), 4) if latencies else 0,
+        },
+        "config": asdict(config),
+    }
+
+
+def save_metrics(metrics: dict[str, object], output_dir: str) -> Path:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    metrics_path = output_path / f"benchmark_{timestamp}.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    return metrics_path
+
+
+def build_client(config: BenchmarkConfig) -> InferenceClient:
+    if config.mode == "mock":
+        return MockInferenceClient(seed=config.seed)
+    if config.mode == "triton":
+        return TritonHttpInferenceClient(
+            server_url=config.server_url,
+            model_name=config.model_name,
+            input_name=config.input_name,
+            input_shape=config.input_shape,
+        )
+    raise ValueError(f"Unsupported mode: {config.mode}")
+
+
+def parse_shape(raw_shape: str) -> tuple[int, ...]:
+    return tuple(int(part.strip()) for part in raw_shape.split(",") if part.strip())
+
+
+def parse_args() -> BenchmarkConfig:
+    parser = argparse.ArgumentParser(description="Benchmark Triton-style inference workloads.")
+    parser.add_argument("--mode", choices=["mock", "triton"], default="mock")
+    parser.add_argument("--server-url", default="localhost:8000")
+    parser.add_argument("--model-name", default="resnet50_trt_fp16")
+    parser.add_argument("--input-name", default="input")
+    parser.add_argument("--input-shape", default="1,3,224,224")
+    parser.add_argument("--num-requests", type=int, default=200)
+    parser.add_argument("--concurrency", type=int, default=10)
+    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--output-dir", default="benchmark_results")
+    parser.add_argument("--seed", type=int, default=7)
+    args = parser.parse_args()
+
+    return BenchmarkConfig(
+        mode=args.mode,
+        server_url=args.server_url,
+        model_name=args.model_name,
+        input_name=args.input_name,
+        input_shape=parse_shape(args.input_shape),
+        num_requests=args.num_requests,
+        concurrency=args.concurrency,
+        retries=args.retries,
+        output_dir=args.output_dir,
+        seed=args.seed,
+    )
+
+
+def main() -> None:
+    config = parse_args()
+    client = build_client(config)
+    metrics = run_benchmark(client, config)
+    metrics_path = save_metrics(metrics, config.output_dir)
+
+    print(json.dumps(metrics, indent=2))
+    print(f"Saved metrics to {metrics_path}")
+
 
 if __name__ == "__main__":
-    benchmark = TritonBenchmark()
-    metrics = benchmark.run_benchmark()
-    
-    if metrics:
-        logger.info("\nBenchmark Results:")
-        logger.info(f"Average Latency: {metrics['average_latency_ms']:.2f} ms")
-        logger.info(f"P95 Latency: {metrics['p95_latency_ms']:.2f} ms")
-        logger.info(f"P99 Latency: {metrics['p99_latency_ms']:.2f} ms")
-        logger.info(f"Throughput: {metrics['throughput_fps']:.2f} inferences/sec")
-        logger.info(f"Success Rate: {metrics['successful_requests']}/{metrics['successful_requests'] + metrics['failed_requests']}")
-    
-    ray.shutdown()
+    main()
+
