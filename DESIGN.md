@@ -5,7 +5,7 @@
 The benchmark separates the harness from the inference client:
 
 - `MockInferenceClient` provides a deterministic, dependency-free workload for CI.
-- `TritonHttpInferenceClient` calls a live NVIDIA Triton Inference Server over HTTP.
+- `TritonHttpInferenceClient` calls a live Triton-compatible inference server over HTTP.
 - `run_benchmark` owns concurrency, retries, timing, and result collection.
 - `summarize_results` owns percentile, throughput, and success-rate calculation.
 
@@ -33,4 +33,3 @@ AI infrastructure repos often fail basic review because they cannot run without 
 - Add comparison mode for baseline versus candidate model versions.
 - Add GPU telemetry capture through DCGM.
 - Add distributed load generation across multiple clients.
-
