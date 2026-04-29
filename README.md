@@ -1,90 +1,76 @@
-# Distributed Inference Benchmarking Tool
+# Triton Inference Benchmark
 
-## 🚀 Overview
-A sophisticated distributed inference benchmarking tool designed for NVIDIA Triton Inference Server. This project demonstrates expertise in distributed systems, deep learning optimization, and production-grade AI infrastructure.
+[![CI](https://github.com/WaffleBits/triton-inference-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/WaffleBits/triton-inference-benchmark/actions/workflows/ci.yml)
 
-## ✨ Key Features
-- Distributed inference using Ray for parallel processing
-- TensorRT FP16 optimization support
-- Robust error handling and retry mechanisms
-- Comprehensive performance metrics (latency, throughput, P95, P99)
-- Real-time visualization of latency distribution
-- Containerized deployment with Docker
-- CI/CD pipeline with GitHub Actions
+Benchmark harness for NVIDIA Triton-style model serving. The tool supports a dependency-free mock mode for CI and an optional live HTTP mode for testing a real Triton Inference Server endpoint.
 
-## 🛠 Technical Stack
-- Python 3.10+
-- NVIDIA Triton Inference Server
-- Ray for distributed computing
-- TensorRT for optimized inference
-- Docker for containerization
-- GitHub Actions for CI/CD
+## Why This Exists
 
-## 📊 Performance Metrics
-- Average Latency (ms)
-- P95/P99 Latency
-- Throughput (inferences/second)
-- Success/Error Rate
-- Latency Distribution Visualization
+Inference infrastructure work is not just "run a model." Strong systems need repeatable benchmarks, clear latency percentiles, failure accounting, configurable concurrency, and results that can be compared over time. This repo is a small but reviewable artifact around that workflow.
 
-## 🔧 Setup & Installation
+## Features
 
-### Prerequisites
+- Concurrent load generation with configurable request count and worker count.
+- Retry-aware request execution.
+- Latency metrics: average, p50, p95, p99, min, max.
+- Throughput and success-rate reporting.
+- Dependency-free mock mode for CI and reviewer demos.
+- Optional Triton HTTP mode for live model-serving benchmarks.
+- JSON output for trend tracking and regression analysis.
+
+## Quick Start
+
+Run a local mock benchmark without GPU dependencies:
+
 ```bash
-- NVIDIA GPU with CUDA support
-- Docker with NVIDIA Container Runtime
-- Python 3.10+
+python benchmark.py --mode mock --num-requests 100 --concurrency 8
 ```
 
-### Installation
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/triton-inference-benchmark.git
-cd triton-inference-benchmark
-```
+Run against a live Triton endpoint:
 
-2. Install dependencies:
 ```bash
 pip install -r requirements.txt
+python benchmark.py \
+  --mode triton \
+  --server-url localhost:8000 \
+  --model-name resnet50_trt_fp16 \
+  --input-name input \
+  --input-shape 1,3,224,224 \
+  --num-requests 500 \
+  --concurrency 32
 ```
 
-3. Build Docker image:
+## Example Output
+
+```json
+{
+  "mode": "mock",
+  "num_requests": 100,
+  "concurrency": 8,
+  "successful_requests": 100,
+  "failed_requests": 0,
+  "success_rate": 1.0,
+  "throughput_rps": 305.42,
+  "latency_ms": {
+    "avg": 21.38,
+    "p50": 21.74,
+    "p95": 33.11,
+    "p99": 34.67
+  }
+}
+```
+
+## Test
+
 ```bash
-docker build -t triton-benchmark .
+python -m unittest discover -s tests
 ```
 
-## 🚀 Usage
+## Design Notes
 
-### Running with Docker
-```bash
-docker run --gpus all --network host triton-benchmark
-```
+See `DESIGN.md` for the benchmark model, tradeoffs, and production extensions.
 
-### Running locally
-```bash
-python benchmark.py
-```
+## Portfolio Signal
 
-## 📈 Output
-The tool generates:
-- JSON files with detailed metrics
-- Latency distribution plots
-- Console logs with key performance indicators
+This project is meant to show AI infrastructure awareness: benchmarking discipline, model-serving concepts, latency percentiles, failure accounting, and a clean path from local mock testing to live Triton measurement.
 
-## 🔍 Advanced Features
-- Configurable number of concurrent requests
-- Customizable retry mechanisms
-- Support for different model architectures
-- Real-time performance monitoring
-- Distributed load generation
-
-## 🤝 Contributing
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## 📝 License
-MIT License
-
-## 🔗 Links
-- [NVIDIA Triton Inference Server](https://github.com/triton-inference-server/server)
-- [Ray Documentation](https://docs.ray.io/)
-- [TensorRT Documentation](https://developer.nvidia.com/tensorrt)
