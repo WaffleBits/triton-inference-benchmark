@@ -1,14 +1,16 @@
-FROM nvcr.io/nvidia/tritonserver:24.02-py3
+FROM python:3.12-slim
 
-# Install required packages
-COPY requirements.txt /app/
-RUN pip install -r /app/requirements.txt
-
-# Copy benchmark code
 WORKDIR /app
+
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
 COPY benchmark.py /app/
 
-# Create directory for results
-RUN mkdir -p /app/benchmark_results
+RUN useradd --create-home --uid 10001 benchmark \
+    && mkdir -p /app/benchmark_results \
+    && chown -R benchmark:benchmark /app
+
+USER benchmark
 
 ENTRYPOINT ["python", "benchmark.py"]

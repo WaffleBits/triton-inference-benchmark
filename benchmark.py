@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,16 @@ class BenchmarkConfig:
     retries: int = 2
     output_dir: str = "benchmark_results"
     seed: int = 7
+
+
+@dataclass(frozen=True)
+class CliOptions:
+    config: BenchmarkConfig
+    export_prometheus: bool = False
+    baseline_path: str | None = None
+    max_p95_regression_pct: float = 10.0
+    max_success_rate_drop: float = 0.01
+    fail_on_regression: bool = False
 
 
 @dataclass(frozen=True)
@@ -60,7 +70,7 @@ class MockInferenceClient:
 
 
 class TritonHttpInferenceClient:
-    """HTTP client for a live NVIDIA Triton Inference Server endpoint."""
+    """HTTP client for a live Triton-compatible inference server endpoint."""
 
     def __init__(
         self,
@@ -187,6 +197,159 @@ def save_metrics(metrics: dict[str, object], output_dir: str) -> Path:
     return metrics_path
 
 
+def _number(metrics: dict[str, Any], key: str) -> float:
+    value = metrics.get(key, 0)
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def _latency(metrics: dict[str, Any], key: str) -> float:
+    latency = metrics.get("latency_ms", {})
+    if not isinstance(latency, dict):
+        return 0.0
+    value = latency.get(key, 0)
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def _config_number(metrics: dict[str, Any], key: str) -> float:
+    config = metrics.get("config", {})
+    if isinstance(config, dict):
+        value = config.get(key, metrics.get(key, 0))
+    else:
+        value = metrics.get(key, 0)
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def _escape_label(value: object) -> str:
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def _base_labels(metrics: dict[str, Any]) -> str:
+    mode = _escape_label(metrics.get("mode", "unknown"))
+    model_name = _escape_label(metrics.get("model_name", "unknown"))
+    return f'mode="{mode}",model="{model_name}"'
+
+
+def format_prometheus_metrics(metrics: dict[str, object]) -> str:
+    typed_metrics: dict[str, Any] = dict(metrics)
+    labels = _base_labels(typed_metrics)
+    lines = [
+        "# HELP triton_benchmark_requests_total Total benchmark requests by outcome.",
+        "# TYPE triton_benchmark_requests_total counter",
+        (
+            f'triton_benchmark_requests_total{{{labels},outcome="success"}} '
+            f'{_number(typed_metrics, "successful_requests"):g}'
+        ),
+        (
+            f'triton_benchmark_requests_total{{{labels},outcome="failure"}} '
+            f'{_number(typed_metrics, "failed_requests"):g}'
+        ),
+        "# HELP triton_benchmark_success_rate Successful request ratio for the benchmark run.",
+        "# TYPE triton_benchmark_success_rate gauge",
+        f"triton_benchmark_success_rate{{{labels}}} {_number(typed_metrics, 'success_rate'):g}",
+        "# HELP triton_benchmark_duration_seconds Wall-clock benchmark duration.",
+        "# TYPE triton_benchmark_duration_seconds gauge",
+        f"triton_benchmark_duration_seconds{{{labels}}} {_number(typed_metrics, 'duration_seconds'):g}",
+        "# HELP triton_benchmark_throughput_rps Successful requests per second.",
+        "# TYPE triton_benchmark_throughput_rps gauge",
+        f"triton_benchmark_throughput_rps{{{labels}}} {_number(typed_metrics, 'throughput_rps'):g}",
+        "# HELP triton_benchmark_latency_ms End-to-end successful request latency.",
+        "# TYPE triton_benchmark_latency_ms gauge",
+        f'triton_benchmark_latency_ms{{{labels},stat="avg"}} {_latency(typed_metrics, "avg"):g}',
+        f'triton_benchmark_latency_ms{{{labels},stat="min"}} {_latency(typed_metrics, "min"):g}',
+        f'triton_benchmark_latency_ms{{{labels},stat="max"}} {_latency(typed_metrics, "max"):g}',
+        f'triton_benchmark_latency_ms{{{labels},quantile="0.50"}} {_latency(typed_metrics, "p50"):g}',
+        f'triton_benchmark_latency_ms{{{labels},quantile="0.95"}} {_latency(typed_metrics, "p95"):g}',
+        f'triton_benchmark_latency_ms{{{labels},quantile="0.99"}} {_latency(typed_metrics, "p99"):g}',
+        "# HELP triton_benchmark_concurrency Configured concurrent workers.",
+        "# TYPE triton_benchmark_concurrency gauge",
+        f"triton_benchmark_concurrency{{{labels}}} {_config_number(typed_metrics, 'concurrency'):g}",
+        "# HELP triton_benchmark_retries Configured retry attempts per request.",
+        "# TYPE triton_benchmark_retries gauge",
+        f"triton_benchmark_retries{{{labels}}} {_config_number(typed_metrics, 'retries'):g}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def save_prometheus_metrics(metrics: dict[str, object], metrics_path: Path) -> Path:
+    prometheus_path = metrics_path.with_suffix(".prom")
+    prometheus_path.write_text(format_prometheus_metrics(metrics), encoding="utf-8")
+    return prometheus_path
+
+
+def load_metrics(path: str | Path) -> dict[str, object]:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"Metrics file must contain a JSON object: {path}")
+    return raw
+
+
+def _percent_change(baseline: float, candidate: float) -> float:
+    if baseline == 0:
+        return 0.0 if candidate == 0 else 100.0
+    return round(((candidate - baseline) / baseline) * 100, 4)
+
+
+def build_regression_report(
+    baseline: dict[str, object],
+    candidate: dict[str, object],
+    max_p95_regression_pct: float = 10.0,
+    max_success_rate_drop: float = 0.01,
+) -> dict[str, object]:
+    baseline_metrics: dict[str, Any] = dict(baseline)
+    candidate_metrics: dict[str, Any] = dict(candidate)
+
+    baseline_p95 = _latency(baseline_metrics, "p95")
+    candidate_p95 = _latency(candidate_metrics, "p95")
+    baseline_success = _number(baseline_metrics, "success_rate")
+    candidate_success = _number(candidate_metrics, "success_rate")
+    baseline_throughput = _number(baseline_metrics, "throughput_rps")
+    candidate_throughput = _number(candidate_metrics, "throughput_rps")
+
+    p95_delta_pct = _percent_change(baseline_p95, candidate_p95)
+    success_rate_delta = round(candidate_success - baseline_success, 4)
+    throughput_delta_pct = _percent_change(baseline_throughput, candidate_throughput)
+
+    regression_reasons: list[str] = []
+    if p95_delta_pct > max_p95_regression_pct:
+        regression_reasons.append(
+            f"p95 latency increased {p95_delta_pct}% above {max_p95_regression_pct}% threshold"
+        )
+    if success_rate_delta < -max_success_rate_drop:
+        regression_reasons.append(
+            f"success rate changed {success_rate_delta} below -{max_success_rate_drop} threshold"
+        )
+
+    return {
+        "baseline": {
+            "p95_latency_ms": baseline_p95,
+            "success_rate": baseline_success,
+            "throughput_rps": baseline_throughput,
+        },
+        "candidate": {
+            "p95_latency_ms": candidate_p95,
+            "success_rate": candidate_success,
+            "throughput_rps": candidate_throughput,
+        },
+        "changes": {
+            "p95_latency_delta_pct": p95_delta_pct,
+            "success_rate_delta": success_rate_delta,
+            "throughput_delta_pct": throughput_delta_pct,
+        },
+        "thresholds": {
+            "max_p95_regression_pct": max_p95_regression_pct,
+            "max_success_rate_drop": max_success_rate_drop,
+        },
+        "regression": bool(regression_reasons),
+        "regression_reasons": regression_reasons,
+    }
+
+
+def save_regression_report(report: dict[str, object], metrics_path: Path) -> Path:
+    report_path = metrics_path.with_name(f"{metrics_path.stem}_comparison.json")
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report_path
+
+
 def build_client(config: BenchmarkConfig) -> InferenceClient:
     if config.mode == "mock":
         return MockInferenceClient(seed=config.seed)
@@ -204,7 +367,7 @@ def parse_shape(raw_shape: str) -> tuple[int, ...]:
     return tuple(int(part.strip()) for part in raw_shape.split(",") if part.strip())
 
 
-def parse_args() -> BenchmarkConfig:
+def parse_args() -> CliOptions:
     parser = argparse.ArgumentParser(description="Benchmark Triton-style inference workloads.")
     parser.add_argument("--mode", choices=["mock", "triton"], default="mock")
     parser.add_argument("--server-url", default="localhost:8000")
@@ -216,24 +379,58 @@ def parse_args() -> BenchmarkConfig:
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--output-dir", default="benchmark_results")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--prometheus",
+        action="store_true",
+        help="Write a Prometheus text-format .prom file beside the JSON result.",
+    )
+    parser.add_argument(
+        "--baseline",
+        help="Optional prior benchmark JSON file used for baseline-versus-candidate comparison.",
+    )
+    parser.add_argument(
+        "--max-p95-regression-pct",
+        type=float,
+        default=10.0,
+        help="Allowed p95 latency increase before the comparison is marked as a regression.",
+    )
+    parser.add_argument(
+        "--max-success-rate-drop",
+        type=float,
+        default=0.01,
+        help="Allowed success-rate drop before the comparison is marked as a regression.",
+    )
+    parser.add_argument(
+        "--fail-on-regression",
+        action="store_true",
+        help="Exit with status 2 when the baseline comparison is marked as a regression.",
+    )
     args = parser.parse_args()
 
-    return BenchmarkConfig(
-        mode=args.mode,
-        server_url=args.server_url,
-        model_name=args.model_name,
-        input_name=args.input_name,
-        input_shape=parse_shape(args.input_shape),
-        num_requests=args.num_requests,
-        concurrency=args.concurrency,
-        retries=args.retries,
-        output_dir=args.output_dir,
-        seed=args.seed,
+    return CliOptions(
+        config=BenchmarkConfig(
+            mode=args.mode,
+            server_url=args.server_url,
+            model_name=args.model_name,
+            input_name=args.input_name,
+            input_shape=parse_shape(args.input_shape),
+            num_requests=args.num_requests,
+            concurrency=args.concurrency,
+            retries=args.retries,
+            output_dir=args.output_dir,
+            seed=args.seed,
+        ),
+        export_prometheus=args.prometheus,
+        baseline_path=args.baseline,
+        max_p95_regression_pct=args.max_p95_regression_pct,
+        max_success_rate_drop=args.max_success_rate_drop,
+        fail_on_regression=args.fail_on_regression,
     )
 
 
 def main() -> None:
-    config = parse_args()
+    options = parse_args()
+    config = options.config
     client = build_client(config)
     metrics = run_benchmark(client, config)
     metrics_path = save_metrics(metrics, config.output_dir)
@@ -241,7 +438,24 @@ def main() -> None:
     print(json.dumps(metrics, indent=2))
     print(f"Saved metrics to {metrics_path}")
 
+    if options.export_prometheus:
+        prometheus_path = save_prometheus_metrics(metrics, metrics_path)
+        print(f"Saved Prometheus metrics to {prometheus_path}")
+
+    if options.baseline_path:
+        baseline = load_metrics(options.baseline_path)
+        regression_report = build_regression_report(
+            baseline,
+            metrics,
+            max_p95_regression_pct=options.max_p95_regression_pct,
+            max_success_rate_drop=options.max_success_rate_drop,
+        )
+        report_path = save_regression_report(regression_report, metrics_path)
+        print(json.dumps(regression_report, indent=2))
+        print(f"Saved comparison report to {report_path}")
+        if options.fail_on_regression and regression_report["regression"]:
+            raise SystemExit(2)
+
 
 if __name__ == "__main__":
     main()
-

@@ -21,6 +21,19 @@ The tool reports:
 - Throughput in requests per second.
 - Average, p50, p95, p99, min, and max latency.
 
+When `--prometheus` is enabled, the same core measurements are written as Prometheus text-format gauges and counters beside the JSON result. This keeps the harness dependency-free while making the output easy to archive in CI, push to a metrics gateway, or ingest into a dashboarding workflow.
+
+## Regression Comparison
+
+The `--baseline` option compares a candidate benchmark run with a saved JSON result. The comparison report focuses on release-relevant signals:
+
+- p95 latency percentage change.
+- success-rate delta.
+- throughput percentage change.
+- explicit regression reasons when thresholds are exceeded.
+
+The default gates mark a run as a regression when p95 latency rises by more than 10% or success rate drops by more than 0.01. `--fail-on-regression` makes that comparison exit non-zero for CI. Those thresholds are intentionally CLI-configurable because production latency budgets differ by model, accelerator, queueing policy, and product surface.
+
 ## Why Mock Mode Exists
 
 AI infrastructure repos often fail basic review because they cannot run without specialized hardware. Mock mode makes the benchmark harness reviewable anywhere while live Triton mode remains available for real server testing.
@@ -29,7 +42,5 @@ AI infrastructure repos often fail basic review because they cannot run without 
 
 - Add warmup windows and separate cold-start metrics.
 - Add request payload profiles by model family.
-- Add Prometheus export for benchmark runs.
-- Add comparison mode for baseline versus candidate model versions.
 - Add GPU telemetry capture through DCGM.
 - Add distributed load generation across multiple clients.
