@@ -17,6 +17,9 @@ Inference infrastructure work is not just "run a model." Strong systems need rep
 - Dependency-free mock mode for CI and reviewer demos.
 - Optional Triton HTTP mode for live model-serving benchmarks.
 - JSON output for trend tracking and regression analysis.
+- Prometheus text export for dashboard or CI artifact ingestion.
+- Baseline-versus-candidate comparison with configurable p95 and success-rate gates.
+- Kubernetes Job example for cluster-local benchmark runs.
 
 ## Engineering Scope
 
@@ -27,12 +30,15 @@ Relevant areas:
 - AI infrastructure: model-serving reliability, latency analysis, failure accounting, and benchmark methodology.
 - Platform engineering: CLI design, JSON artifacts, CI-friendly mock mode, and extension points for live services.
 - Performance engineering: percentile metrics, concurrency sweeps, throughput measurement, and reproducible comparison paths.
+- Infrastructure/SRE: Prometheus-compatible benchmark artifacts, release regression checks, Kubernetes job posture, and operations notes.
 
 ## Reviewer Fast Path
 
 - Start with `benchmark.py` for benchmark orchestration and CLI behavior.
 - Review `tests/` for metric and execution coverage.
 - Read `DESIGN.md` for benchmark tradeoffs and production extensions.
+- Read `docs/OPERATIONS.md` for regression triage, SLO-oriented checks, and Prometheus export usage.
+- Review `deploy/kubernetes/benchmark-job.yaml` for the cluster-run shape.
 - Read `docs/PORTFOLIO_REVIEW.md` for the technical review guide.
 
 ## Quick Start
@@ -41,6 +47,26 @@ Run a local mock benchmark without GPU dependencies:
 
 ```bash
 python benchmark.py --mode mock --num-requests 100 --concurrency 8
+```
+
+Write JSON plus Prometheus text-format artifacts:
+
+```bash
+python benchmark.py --mode mock --num-requests 500 --concurrency 32 --prometheus
+```
+
+Compare a candidate run against a saved baseline:
+
+```bash
+python benchmark.py \
+  --mode mock \
+  --num-requests 500 \
+  --concurrency 32 \
+  --baseline sample_results/mock_run.json \
+  --max-p95-regression-pct 10 \
+  --max-success-rate-drop 0.01 \
+  --fail-on-regression \
+  --prometheus
 ```
 
 Run against a live Triton endpoint:
@@ -89,12 +115,11 @@ See `DESIGN.md` for the benchmark model, tradeoffs, and production extensions.
 
 ## Engineering Notes
 
-This project covers benchmarking discipline, model-serving concepts, latency percentiles, failure accounting, and a clean path from local mock testing to live inference measurement.
+This project covers benchmarking discipline, model-serving concepts, latency percentiles, failure accounting, Prometheus-compatible artifacts, release regression checks, and a clean path from local mock testing to live inference measurement.
 
 ## Gaps Worth Closing Next
 
-- Add baseline-versus-candidate comparison mode.
-- Add Prometheus export or a dashboard-ready report format.
 - Add warmup windows and separate cold-start metrics.
 - Add payload profiles for chat, embeddings, vision, and long-context workloads.
 - Add distributed load generation for multi-client benchmarking.
+- Add DCGM or server-side telemetry correlation for GPU utilization and queue depth.
