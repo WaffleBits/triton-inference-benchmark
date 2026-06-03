@@ -5,7 +5,9 @@ from benchmark import (
     InferenceResult,
     MockInferenceClient,
     build_regression_report,
+    build_telemetry_summary,
     format_prometheus_metrics,
+    parse_prometheus_samples,
     percentile,
     run_benchmark,
     summarize_results,
@@ -94,6 +96,71 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertTrue(report["regression"])
         self.assertEqual(report["changes"]["p95_latency_delta_pct"], 25.0)
         self.assertEqual(report["changes"]["success_rate_delta"], -0.01)
+
+    def test_parse_prometheus_samples_handles_labels_and_escapes(self) -> None:
+        samples = parse_prometheus_samples(
+            'metric_total{model="resnet50_trt_fp16",note="line one\\nquote\\\""} 7\n'
+        )
+
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0].metric, "metric_total")
+        self.assertEqual(samples[0].labels["model"], "resnet50_trt_fp16")
+        self.assertEqual(samples[0].labels["note"], 'line one\nquote"')
+        self.assertEqual(samples[0].value, 7.0)
+
+    def test_telemetry_summary_correlates_gpu_and_triton_samples(self) -> None:
+        telemetry_text = """
+        # HELP synthetic fixture
+        DCGM_FI_DEV_GPU_UTIL{gpu="0"} 72
+        DCGM_FI_DEV_GPU_UTIL{gpu="1"} 88
+        DCGM_FI_DEV_MEM_COPY_UTIL{gpu="0"} 21
+        DCGM_FI_DEV_FB_USED{gpu="0"} 9216
+        nv_inference_request_success{model="resnet50_trt_fp16",version="1"} 100
+        nv_inference_request_failure{model="resnet50_trt_fp16",version="1"} 2
+        nv_inference_queue_duration_us{model="resnet50_trt_fp16",version="1"} 4300
+        nv_inference_compute_infer_duration_us{model="other",version="1"} 999
+        """
+
+        summary = build_telemetry_summary(telemetry_text, model_name="resnet50_trt_fp16")
+
+        self.assertEqual(summary["sample_count"], 8)
+        self.assertEqual(summary["gpu"]["utilization_pct"]["avg"], 80.0)
+        self.assertEqual(summary["gpu"]["utilization_pct"]["max"], 88.0)
+        self.assertEqual(summary["gpu"]["memory_used_mib"]["max"], 9216.0)
+        self.assertEqual(summary["triton"]["request_success_total"], 100.0)
+        self.assertEqual(summary["triton"]["request_failure_total"], 2.0)
+        self.assertEqual(summary["triton"]["queue_duration_us_total"], 4300.0)
+        self.assertEqual(summary["triton"]["compute_infer_duration_us_total"], 0)
+
+    def test_prometheus_export_includes_correlated_telemetry(self) -> None:
+        config = BenchmarkConfig()
+        metrics = summarize_results(
+            [InferenceResult(ok=True, latency_ms=10.0)],
+            duration_seconds=1.0,
+            config=config,
+        )
+        metrics["telemetry"] = {
+            "gpu": {
+                "utilization_pct": {"avg": 80.0, "max": 88.0},
+                "memory_copy_utilization_pct": {},
+                "memory_used_mib": {"avg": 9216.0, "max": 9216.0},
+            },
+            "triton": {
+                "request_success_total": 100.0,
+                "request_failure_total": 2.0,
+                "request_duration_us_total": 9000.0,
+                "queue_duration_us_total": 4300.0,
+                "compute_infer_duration_us_total": 5000.0,
+            },
+        }
+
+        output = format_prometheus_metrics(metrics)
+
+        self.assertIn("triton_benchmark_gpu_utilization_percent", output)
+        self.assertIn('stat="avg"} 80', output)
+        self.assertIn("triton_benchmark_gpu_memory_used_mib", output)
+        self.assertIn("triton_benchmark_server_request_success_total", output)
+        self.assertIn("triton_benchmark_server_queue_duration_us_total", output)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,8 @@ The tool reports:
 
 When `--prometheus` is enabled, the same core measurements are written as Prometheus text-format gauges and counters beside the JSON result. This keeps the harness dependency-free while making the output easy to archive in CI, push to a metrics gateway, or ingest into a dashboarding workflow.
 
+When `--telemetry-prometheus` is provided, the benchmark attaches a correlated summary from a Triton/DCGM Prometheus text snapshot. The summary keeps server-side GPU utilization, memory use, queue duration, request duration, and inference-duration counters beside the client-side benchmark result. The parser is dependency-free so CI can validate the behavior with synthetic fixtures while live runs can still consume real scrape artifacts.
+
 ## Regression Comparison
 
 The `--baseline` option compares a candidate benchmark run with a saved JSON result. The comparison report focuses on release-relevant signals:
@@ -42,5 +44,5 @@ AI infrastructure repos often fail basic review because they cannot run without 
 
 - Add warmup windows and separate cold-start metrics.
 - Add request payload profiles by model family.
-- Add GPU telemetry capture through DCGM.
+- Add threshold checks for correlated GPU telemetry and queue depth.
 - Add distributed load generation across multiple clients.

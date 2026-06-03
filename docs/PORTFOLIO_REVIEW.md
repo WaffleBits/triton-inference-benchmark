@@ -8,6 +8,7 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - `tests/`: validation for metrics, success accounting, and benchmark behavior.
 - `DESIGN.md`: benchmark model, tradeoffs, and production extension plan.
 - `docs/OPERATIONS.md`: regression triage, Prometheus artifact usage, and SLO-oriented review notes.
+- `sample_results/mock_telemetry.prom`: synthetic Triton/DCGM snapshot for telemetry-correlation review.
 - `deploy/kubernetes/benchmark-job.yaml`: cluster-local benchmark execution shape.
 
 ## What This Demonstrates
@@ -19,6 +20,7 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - A live HTTP path that can be connected to real model-serving infrastructure.
 - Prometheus-compatible benchmark artifacts for dashboard and CI ingestion.
 - Baseline-versus-candidate comparison with explicit regression reasons.
+- Correlated server telemetry for GPU utilization, memory pressure, queue time, and Triton counters.
 - Kubernetes job posture with non-root runtime settings.
 
 ## Technical Scope
@@ -26,11 +28,11 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - AI infrastructure: model-serving reliability, benchmark methodology, latency analysis, and regression tracking.
 - Platform engineering: CLI ergonomics, JSON outputs, testable boundaries, and live-service extension points.
 - Performance engineering: concurrency sweeps, percentile metrics, retry behavior, and reproducible reports.
-- Infrastructure/SRE: operational runbooks, release regression thresholds, Prometheus output, and Kubernetes execution shape.
+- Infrastructure/SRE: operational runbooks, release regression thresholds, Prometheus output, telemetry correlation, and Kubernetes execution shape.
 
 ## Gaps Worth Closing Next
 
 - Add warmup, cold-start, and steady-state separation.
 - Add distributed load generation across multiple clients.
 - Add saved benchmark reports with trend comparisons over time.
-- Add server-side telemetry correlation for GPU utilization, queue depth, and batching behavior.
+- Add threshold checks for server-side telemetry and batching behavior.

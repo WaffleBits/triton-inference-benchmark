@@ -11,6 +11,20 @@ from pathlib import Path
 from typing import Any, Protocol
 
 
+GPU_UTILIZATION_METRICS = {"DCGM_FI_DEV_GPU_UTIL", "dcgm_gpu_utilization"}
+GPU_MEMORY_COPY_METRICS = {"DCGM_FI_DEV_MEM_COPY_UTIL", "dcgm_gpu_memory_copy_utilization"}
+GPU_MEMORY_USED_METRICS = {
+    "DCGM_FI_DEV_FB_USED",
+    "dcgm_gpu_memory_used_mib",
+    "dcgm_gpu_memory_used_bytes",
+}
+TRITON_REQUEST_SUCCESS_METRICS = {"nv_inference_request_success", "nv_inference_count"}
+TRITON_REQUEST_FAILURE_METRICS = {"nv_inference_request_failure"}
+TRITON_REQUEST_DURATION_METRICS = {"nv_inference_request_duration_us"}
+TRITON_QUEUE_DURATION_METRICS = {"nv_inference_queue_duration_us"}
+TRITON_COMPUTE_INFER_DURATION_METRICS = {"nv_inference_compute_infer_duration_us"}
+
+
 @dataclass(frozen=True)
 class BenchmarkConfig:
     mode: str = "mock"
@@ -29,6 +43,7 @@ class BenchmarkConfig:
 class CliOptions:
     config: BenchmarkConfig
     export_prometheus: bool = False
+    telemetry_prometheus_path: str | None = None
     baseline_path: str | None = None
     max_p95_regression_pct: float = 10.0
     max_success_rate_drop: float = 0.01
@@ -40,6 +55,13 @@ class InferenceResult:
     ok: bool
     latency_ms: float
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class PrometheusSample:
+    metric: str
+    labels: dict[str, str]
+    value: float
 
 
 class InferenceClient(Protocol):
@@ -197,6 +219,236 @@ def save_metrics(metrics: dict[str, object], output_dir: str) -> Path:
     return metrics_path
 
 
+def _split_prometheus_labels(raw_labels: str) -> list[str]:
+    labels: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    escaped = False
+
+    for char in raw_labels:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            current.append(char)
+            escaped = True
+            continue
+        if char == '"':
+            in_quotes = not in_quotes
+            current.append(char)
+            continue
+        if char == "," and not in_quotes:
+            labels.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+
+    if current:
+        labels.append("".join(current))
+    return labels
+
+
+def _unescape_prometheus_label(value: str) -> str:
+    return value.replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\")
+
+
+def _parse_metric_and_labels(metric_with_labels: str) -> tuple[str, dict[str, str]]:
+    if "{" not in metric_with_labels:
+        return metric_with_labels, {}
+
+    metric_name, raw_labels = metric_with_labels.split("{", 1)
+    raw_labels = raw_labels.rstrip("}")
+    labels: dict[str, str] = {}
+
+    for raw_label in _split_prometheus_labels(raw_labels):
+        if "=" not in raw_label:
+            continue
+        key, raw_value = raw_label.split("=", 1)
+        raw_value = raw_value.strip()
+        if len(raw_value) >= 2 and raw_value[0] == '"' and raw_value[-1] == '"':
+            labels[key.strip()] = _unescape_prometheus_label(raw_value[1:-1])
+
+    return metric_name, labels
+
+
+def _split_prometheus_sample_line(line: str, line_number: int) -> tuple[str, str]:
+    in_braces = False
+    in_quotes = False
+    escaped = False
+
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            in_quotes = not in_quotes
+            continue
+        if char == "{" and not in_quotes:
+            in_braces = True
+            continue
+        if char == "}" and not in_quotes:
+            in_braces = False
+            continue
+        if char.isspace() and not in_braces and not in_quotes:
+            metric_with_labels = line[:index]
+            remainder = line[index:].strip()
+            if metric_with_labels and remainder:
+                return metric_with_labels, remainder
+            break
+
+    raise ValueError(f"Invalid Prometheus sample on line {line_number}: {line}")
+
+
+def parse_prometheus_samples(prometheus_text: str) -> list[PrometheusSample]:
+    samples: list[PrometheusSample] = []
+
+    for line_number, raw_line in enumerate(prometheus_text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        metric_with_labels, remainder = _split_prometheus_sample_line(line, line_number)
+        metric_name, labels = _parse_metric_and_labels(metric_with_labels)
+        raw_value = remainder.split(maxsplit=1)[0]
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid Prometheus sample value on line {line_number}: {raw_value}"
+            ) from exc
+        samples.append(PrometheusSample(metric_name, labels, value))
+
+    return samples
+
+
+def _sample_matches_model(sample: PrometheusSample, model_name: str) -> bool:
+    if "model" in sample.labels:
+        return sample.labels["model"] == model_name
+    if "model_name" in sample.labels:
+        return sample.labels["model_name"] == model_name
+    return True
+
+
+def _values_for_metrics(
+    samples: list[PrometheusSample],
+    metric_names: set[str],
+    model_name: str | None = None,
+) -> list[float]:
+    values: list[float] = []
+    for sample in samples:
+        if sample.metric not in metric_names:
+            continue
+        if model_name and not _sample_matches_model(sample, model_name):
+            continue
+        value = sample.value
+        if sample.metric.endswith("_bytes"):
+            value = value / (1024 * 1024)
+        values.append(value)
+    return values
+
+
+def _stat_summary(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {}
+    return {
+        "avg": round(statistics.fmean(values), 4),
+        "max": round(max(values), 4),
+    }
+
+
+def _sum_values(values: list[float]) -> float:
+    return round(sum(values), 4)
+
+
+def build_telemetry_summary(
+    prometheus_text: str,
+    model_name: str,
+    source: str = "prometheus_snapshot",
+) -> dict[str, object]:
+    samples = parse_prometheus_samples(prometheus_text)
+    gpu_utilization = _values_for_metrics(samples, GPU_UTILIZATION_METRICS)
+    gpu_memory_copy = _values_for_metrics(samples, GPU_MEMORY_COPY_METRICS)
+    gpu_memory_used = _values_for_metrics(samples, GPU_MEMORY_USED_METRICS)
+
+    triton_success = _values_for_metrics(
+        samples,
+        TRITON_REQUEST_SUCCESS_METRICS,
+        model_name=model_name,
+    )
+    triton_failure = _values_for_metrics(
+        samples,
+        TRITON_REQUEST_FAILURE_METRICS,
+        model_name=model_name,
+    )
+    triton_request_duration = _values_for_metrics(
+        samples,
+        TRITON_REQUEST_DURATION_METRICS,
+        model_name=model_name,
+    )
+    triton_queue_duration = _values_for_metrics(
+        samples,
+        TRITON_QUEUE_DURATION_METRICS,
+        model_name=model_name,
+    )
+    triton_compute_infer_duration = _values_for_metrics(
+        samples,
+        TRITON_COMPUTE_INFER_DURATION_METRICS,
+        model_name=model_name,
+    )
+
+    notes: list[str] = []
+    if not any((gpu_utilization, gpu_memory_copy, gpu_memory_used)):
+        notes.append("no GPU telemetry samples matched known DCGM metric names")
+    if not any(
+        (
+            triton_success,
+            triton_failure,
+            triton_request_duration,
+            triton_queue_duration,
+            triton_compute_infer_duration,
+        )
+    ):
+        notes.append("no Triton server samples matched the configured model name")
+
+    return {
+        "source": source,
+        "sample_count": len(samples),
+        "gpu": {
+            "utilization_pct": _stat_summary(gpu_utilization),
+            "memory_copy_utilization_pct": _stat_summary(gpu_memory_copy),
+            "memory_used_mib": _stat_summary(gpu_memory_used),
+        },
+        "triton": {
+            "model_name": model_name,
+            "request_success_total": _sum_values(triton_success),
+            "request_failure_total": _sum_values(triton_failure),
+            "request_duration_us_total": _sum_values(triton_request_duration),
+            "queue_duration_us_total": _sum_values(triton_queue_duration),
+            "compute_infer_duration_us_total": _sum_values(triton_compute_infer_duration),
+        },
+        "notes": notes,
+    }
+
+
+def attach_telemetry_summary(
+    metrics: dict[str, object],
+    telemetry_prometheus_path: str | Path,
+) -> dict[str, object]:
+    path = Path(telemetry_prometheus_path)
+    enriched_metrics = dict(metrics)
+    model_name = str(metrics.get("model_name", "unknown"))
+    enriched_metrics["telemetry"] = build_telemetry_summary(
+        path.read_text(encoding="utf-8"),
+        model_name=model_name,
+        source=str(path),
+    )
+    return enriched_metrics
+
+
 def _number(metrics: dict[str, Any], key: str) -> float:
     value = metrics.get(key, 0)
     return float(value) if isinstance(value, (int, float)) else 0.0
@@ -208,6 +460,17 @@ def _latency(metrics: dict[str, Any], key: str) -> float:
         return 0.0
     value = latency.get(key, 0)
     return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def _nested_number(source: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    current: Any = source
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    if isinstance(current, (int, float)):
+        return float(current)
+    return None
 
 
 def _config_number(metrics: dict[str, Any], key: str) -> float:
@@ -267,6 +530,73 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
         "# TYPE triton_benchmark_retries gauge",
         f"triton_benchmark_retries{{{labels}}} {_config_number(typed_metrics, 'retries'):g}",
     ]
+
+    telemetry = typed_metrics.get("telemetry")
+    if isinstance(telemetry, dict):
+        telemetry_specs = [
+            (
+                "# HELP triton_benchmark_gpu_utilization_percent Correlated GPU utilization from telemetry snapshot.",
+                "# TYPE triton_benchmark_gpu_utilization_percent gauge",
+                "triton_benchmark_gpu_utilization_percent",
+                ("gpu", "utilization_pct"),
+            ),
+            (
+                "# HELP triton_benchmark_gpu_memory_copy_utilization_percent Correlated GPU memory-copy utilization from telemetry snapshot.",
+                "# TYPE triton_benchmark_gpu_memory_copy_utilization_percent gauge",
+                "triton_benchmark_gpu_memory_copy_utilization_percent",
+                ("gpu", "memory_copy_utilization_pct"),
+            ),
+            (
+                "# HELP triton_benchmark_gpu_memory_used_mib Correlated GPU memory usage from telemetry snapshot.",
+                "# TYPE triton_benchmark_gpu_memory_used_mib gauge",
+                "triton_benchmark_gpu_memory_used_mib",
+                ("gpu", "memory_used_mib"),
+            ),
+        ]
+        for help_line, type_line, metric_name, prefix in telemetry_specs:
+            emitted_header = False
+            for stat in ("avg", "max"):
+                value = _nested_number(telemetry, (*prefix, stat))
+                if value is None:
+                    continue
+                if not emitted_header:
+                    lines.extend([help_line, type_line])
+                    emitted_header = True
+                lines.append(f'{metric_name}{{{labels},stat="{stat}"}} {value:g}')
+
+        triton_specs = [
+            (
+                "request_success_total",
+                "triton_benchmark_server_request_success_total",
+                "Correlated Triton successful request counter from telemetry snapshot.",
+            ),
+            (
+                "request_failure_total",
+                "triton_benchmark_server_request_failure_total",
+                "Correlated Triton failed request counter from telemetry snapshot.",
+            ),
+            (
+                "request_duration_us_total",
+                "triton_benchmark_server_request_duration_us_total",
+                "Correlated Triton request-duration counter from telemetry snapshot.",
+            ),
+            (
+                "queue_duration_us_total",
+                "triton_benchmark_server_queue_duration_us_total",
+                "Correlated Triton queue-duration counter from telemetry snapshot.",
+            ),
+            (
+                "compute_infer_duration_us_total",
+                "triton_benchmark_server_compute_infer_duration_us_total",
+                "Correlated Triton compute-infer-duration counter from telemetry snapshot.",
+            ),
+        ]
+        for source_key, metric_name, help_text in triton_specs:
+            value = _nested_number(telemetry, ("triton", source_key))
+            if value is None:
+                continue
+            lines.extend([f"# HELP {metric_name} {help_text}", f"# TYPE {metric_name} gauge"])
+            lines.append(f"{metric_name}{{{labels}}} {value:g}")
     return "\n".join(lines) + "\n"
 
 
@@ -385,6 +715,13 @@ def parse_args() -> CliOptions:
         help="Write a Prometheus text-format .prom file beside the JSON result.",
     )
     parser.add_argument(
+        "--telemetry-prometheus",
+        help=(
+            "Optional Prometheus text snapshot from Triton/DCGM scraped near the run; "
+            "a correlated telemetry summary is attached to the JSON and .prom outputs."
+        ),
+    )
+    parser.add_argument(
         "--baseline",
         help="Optional prior benchmark JSON file used for baseline-versus-candidate comparison.",
     )
@@ -421,6 +758,7 @@ def parse_args() -> CliOptions:
             seed=args.seed,
         ),
         export_prometheus=args.prometheus,
+        telemetry_prometheus_path=args.telemetry_prometheus,
         baseline_path=args.baseline,
         max_p95_regression_pct=args.max_p95_regression_pct,
         max_success_rate_drop=args.max_success_rate_drop,
@@ -433,6 +771,8 @@ def main() -> None:
     config = options.config
     client = build_client(config)
     metrics = run_benchmark(client, config)
+    if options.telemetry_prometheus_path:
+        metrics = attach_telemetry_summary(metrics, options.telemetry_prometheus_path)
     metrics_path = save_metrics(metrics, config.output_dir)
 
     print(json.dumps(metrics, indent=2))
