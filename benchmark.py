@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import statistics
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -44,16 +46,27 @@ class CliOptions:
     config: BenchmarkConfig
     export_prometheus: bool = False
     telemetry_prometheus_path: str | None = None
+    batch_invariance_probes: int = 0
     baseline_path: str | None = None
     max_p95_regression_pct: float = 10.0
     max_success_rate_drop: float = 0.01
     fail_on_regression: bool = False
+    fail_on_batch_variance: bool = False
 
 
 @dataclass(frozen=True)
 class InferenceResult:
     ok: bool
     latency_ms: float
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class OutputInferenceResult:
+    sample_id: int
+    ok: bool
+    latency_ms: float
+    output_fingerprint: str | None = None
     error: str | None = None
 
 
@@ -69,6 +82,57 @@ class InferenceClient(Protocol):
         """Execute one inference request or raise an exception."""
 
 
+class OutputInferenceClient(Protocol):
+    def infer_output(self, sample_id: int) -> str:
+        """Execute a deterministic input and return an output fingerprint."""
+
+
+def fingerprint_triton_outputs(result: Any) -> str:
+    response = result.get_response()
+
+    if isinstance(response, dict):
+        output_names = [
+            output["name"]
+            for output in response.get("outputs", [])
+            if isinstance(output, dict) and "name" in output
+        ]
+    else:
+        output_names = [
+            output.name
+            for output in getattr(response, "outputs", [])
+            if getattr(output, "name", None)
+        ]
+
+    if not output_names:
+        raise RuntimeError("Triton response did not include output metadata")
+
+    hasher = hashlib.sha256()
+    for output_name in sorted(output_names):
+        output = result.as_numpy(output_name)
+        if output is None:
+            raise RuntimeError(f"Triton response did not include output: {output_name}")
+
+        metadata = json.dumps(
+            {
+                "dtype": str(output.dtype),
+                "name": output_name,
+                "shape": list(output.shape),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        payload = (
+            json.dumps(output.tolist(), sort_keys=True, default=str).encode()
+            if output.dtype.hasobject
+            else output.tobytes(order="C")
+        )
+        hasher.update(len(metadata).to_bytes(8, byteorder="big"))
+        hasher.update(metadata)
+        hasher.update(len(payload).to_bytes(8, byteorder="big"))
+        hasher.update(payload)
+    return hasher.hexdigest()
+
+
 class MockInferenceClient:
     """Dependency-free client used for CI, demos, and benchmark harness tests."""
 
@@ -79,6 +143,7 @@ class MockInferenceClient:
         max_latency_ms: float = 35.0,
         failure_rate: float = 0.02,
     ) -> None:
+        self.seed = seed
         self.random = random.Random(seed)
         self.min_latency_ms = min_latency_ms
         self.max_latency_ms = max_latency_ms
@@ -89,6 +154,13 @@ class MockInferenceClient:
         time.sleep(latency_ms / 1000)
         if self.random.random() < self.failure_rate:
             raise RuntimeError("synthetic inference failure")
+
+    def infer_output(self, sample_id: int) -> str:
+        sample_random = random.Random(self.seed + sample_id)
+        latency_ms = sample_random.uniform(self.min_latency_ms, self.max_latency_ms)
+        time.sleep(latency_ms / 1000)
+        payload = f"mock-output:{self.seed}:{sample_id}".encode()
+        return hashlib.sha256(payload).hexdigest()
 
 
 class TritonHttpInferenceClient:
@@ -114,20 +186,34 @@ class TritonHttpInferenceClient:
         self.np = np
         self.httpclient = httpclient
         self.np_to_triton_dtype = np_to_triton_dtype
-        self.client = httpclient.InferenceServerClient(url=server_url)
+        self.server_url = server_url
+        self.thread_local = threading.local()
         self.model_name = model_name
         self.input_name = input_name
         self.input_shape = input_shape
 
     def infer(self) -> None:
         input_data = self.np.random.rand(*self.input_shape).astype(self.np.float32)
+        self._infer(input_data)
+
+    def infer_output(self, sample_id: int) -> str:
+        random_generator = self.np.random.default_rng(sample_id)
+        input_data = random_generator.random(self.input_shape).astype(self.np.float32)
+        result = self._infer(input_data)
+        return fingerprint_triton_outputs(result)
+
+    def _infer(self, input_data: Any) -> Any:
         request_input = self.httpclient.InferInput(
             self.input_name,
             input_data.shape,
             self.np_to_triton_dtype(input_data.dtype),
         )
         request_input.set_data_from_numpy(input_data)
-        self.client.infer(self.model_name, [request_input])
+        client = getattr(self.thread_local, "client", None)
+        if client is None:
+            client = self.httpclient.InferenceServerClient(url=self.server_url)
+            self.thread_local.client = client
+        return client.infer(self.model_name, [request_input])
 
 
 def percentile(values: list[float], percentile_rank: float) -> float:
@@ -157,6 +243,134 @@ def execute_with_retries(client: InferenceClient, retries: int) -> InferenceResu
 
     latency_ms = (time.perf_counter() - start) * 1000
     return InferenceResult(ok=False, latency_ms=latency_ms, error=last_error)
+
+
+def execute_output_with_retries(
+    client: OutputInferenceClient,
+    sample_id: int,
+    retries: int,
+) -> OutputInferenceResult:
+    start = time.perf_counter()
+    last_error: str | None = None
+
+    for _ in range(retries + 1):
+        try:
+            fingerprint = client.infer_output(sample_id)
+            latency_ms = (time.perf_counter() - start) * 1000
+            return OutputInferenceResult(
+                sample_id=sample_id,
+                ok=True,
+                latency_ms=latency_ms,
+                output_fingerprint=fingerprint,
+            )
+        except Exception as exc:  # noqa: BLE001 - probe records client failures.
+            last_error = str(exc)
+
+    latency_ms = (time.perf_counter() - start) * 1000
+    return OutputInferenceResult(
+        sample_id=sample_id,
+        ok=False,
+        latency_ms=latency_ms,
+        error=last_error,
+    )
+
+
+def run_batch_invariance_probe(
+    client: OutputInferenceClient,
+    probe_count: int,
+    concurrency: int,
+    retries: int = 0,
+    seed: int = 7,
+) -> dict[str, object]:
+    if probe_count <= 0:
+        raise ValueError("probe_count must be greater than zero")
+    if concurrency <= 1:
+        raise ValueError("concurrency must be greater than one")
+
+    probe_ids = list(range(probe_count))
+    baseline_results = {
+        sample_id: execute_output_with_retries(client, sample_id, retries)
+        for sample_id in probe_ids
+    }
+
+    noise_ids = [1_000_000 + index for index in range(probe_count)]
+    candidate_work = [("probe", sample_id) for sample_id in probe_ids]
+    candidate_work.extend(("noise", sample_id) for sample_id in noise_ids)
+    random.Random(seed).shuffle(candidate_work)
+
+    candidate_results: dict[int, OutputInferenceResult] = {}
+    noise_failures = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(execute_output_with_retries, client, sample_id, retries): (
+                workload_type,
+                sample_id,
+            )
+            for workload_type, sample_id in candidate_work
+        }
+        for future in as_completed(futures):
+            workload_type, sample_id = futures[future]
+            result = future.result()
+            if workload_type == "probe":
+                candidate_results[sample_id] = result
+            elif not result.ok:
+                noise_failures += 1
+
+    mismatched_sample_ids: list[int] = []
+    matched_outputs = 0
+    compared_outputs = 0
+    errors: list[dict[str, object]] = []
+
+    for sample_id in probe_ids:
+        baseline = baseline_results[sample_id]
+        candidate = candidate_results[sample_id]
+        if not baseline.ok:
+            errors.append(
+                {
+                    "phase": "isolated",
+                    "sample_id": sample_id,
+                    "error": baseline.error,
+                }
+            )
+            continue
+        if not candidate.ok:
+            errors.append(
+                {
+                    "phase": "concurrent",
+                    "sample_id": sample_id,
+                    "error": candidate.error,
+                }
+            )
+            continue
+
+        compared_outputs += 1
+        if baseline.output_fingerprint == candidate.output_fingerprint:
+            matched_outputs += 1
+        else:
+            mismatched_sample_ids.append(sample_id)
+
+    failed_probes = len(errors)
+    exact_match = (
+        failed_probes == 0
+        and noise_failures == 0
+        and compared_outputs == probe_count
+        and matched_outputs == probe_count
+    )
+
+    return {
+        "probe_count": probe_count,
+        "concurrency": concurrency,
+        "noise_request_count": len(noise_ids),
+        "compared_outputs": compared_outputs,
+        "matched_outputs": matched_outputs,
+        "mismatched_outputs": len(mismatched_sample_ids),
+        "failed_probes": failed_probes,
+        "noise_failures": noise_failures,
+        "match_rate": round(matched_outputs / probe_count, 4),
+        "exact_match": exact_match,
+        "mismatched_sample_ids": mismatched_sample_ids,
+        "errors": errors,
+    }
 
 
 def run_benchmark(client: InferenceClient, config: BenchmarkConfig) -> dict[str, object]:
@@ -597,6 +811,55 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
                 continue
             lines.extend([f"# HELP {metric_name} {help_text}", f"# TYPE {metric_name} gauge"])
             lines.append(f"{metric_name}{{{labels}}} {value:g}")
+
+    batch_invariance = typed_metrics.get("batch_invariance")
+    if isinstance(batch_invariance, dict):
+        batch_specs = [
+            (
+                "probe_count",
+                "triton_benchmark_batch_invariance_probes_total",
+                "Total fixed inputs checked for batch-invariant outputs.",
+            ),
+            (
+                "mismatched_outputs",
+                "triton_benchmark_batch_invariance_mismatches_total",
+                "Outputs that changed between isolated and concurrent execution.",
+            ),
+            (
+                "failed_probes",
+                "triton_benchmark_batch_invariance_failures_total",
+                "Probe inputs that failed in isolated or concurrent execution.",
+            ),
+            (
+                "noise_failures",
+                "triton_benchmark_batch_invariance_noise_failures_total",
+                "Concurrent noise requests that failed during the probe.",
+            ),
+            (
+                "match_rate",
+                "triton_benchmark_batch_invariance_match_rate",
+                "Ratio of fixed inputs with identical isolated and concurrent outputs.",
+            ),
+        ]
+        for source_key, metric_name, help_text in batch_specs:
+            value = _nested_number(batch_invariance, (source_key,))
+            if value is None:
+                continue
+            lines.extend([f"# HELP {metric_name} {help_text}", f"# TYPE {metric_name} gauge"])
+            lines.append(f"{metric_name}{{{labels}}} {value:g}")
+
+        exact_match = batch_invariance.get("exact_match")
+        if isinstance(exact_match, bool):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_batch_invariance_exact_match Whether all probe outputs matched exactly.",
+                    "# TYPE triton_benchmark_batch_invariance_exact_match gauge",
+                    (
+                        f"triton_benchmark_batch_invariance_exact_match{{{labels}}} "
+                        f"{int(exact_match)}"
+                    ),
+                ]
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -722,6 +985,15 @@ def parse_args() -> CliOptions:
         ),
     )
     parser.add_argument(
+        "--batch-invariance-probes",
+        type=int,
+        default=0,
+        help=(
+            "Run this many fixed inputs in isolation and under concurrent noise traffic, "
+            "then compare exact output fingerprints."
+        ),
+    )
+    parser.add_argument(
         "--baseline",
         help="Optional prior benchmark JSON file used for baseline-versus-candidate comparison.",
     )
@@ -742,7 +1014,18 @@ def parse_args() -> CliOptions:
         action="store_true",
         help="Exit with status 2 when the baseline comparison is marked as a regression.",
     )
+    parser.add_argument(
+        "--fail-on-batch-variance",
+        action="store_true",
+        help="Exit with status 3 when any batch-invariance probe fails or changes output.",
+    )
     args = parser.parse_args()
+    if args.batch_invariance_probes < 0:
+        parser.error("--batch-invariance-probes must be zero or greater")
+    if args.batch_invariance_probes and args.concurrency <= 1:
+        parser.error("--batch-invariance-probes requires --concurrency greater than one")
+    if args.fail_on_batch_variance and not args.batch_invariance_probes:
+        parser.error("--fail-on-batch-variance requires --batch-invariance-probes")
 
     return CliOptions(
         config=BenchmarkConfig(
@@ -759,10 +1042,12 @@ def parse_args() -> CliOptions:
         ),
         export_prometheus=args.prometheus,
         telemetry_prometheus_path=args.telemetry_prometheus,
+        batch_invariance_probes=args.batch_invariance_probes,
         baseline_path=args.baseline,
         max_p95_regression_pct=args.max_p95_regression_pct,
         max_success_rate_drop=args.max_success_rate_drop,
         fail_on_regression=args.fail_on_regression,
+        fail_on_batch_variance=args.fail_on_batch_variance,
     )
 
 
@@ -773,6 +1058,14 @@ def main() -> None:
     metrics = run_benchmark(client, config)
     if options.telemetry_prometheus_path:
         metrics = attach_telemetry_summary(metrics, options.telemetry_prometheus_path)
+    if options.batch_invariance_probes:
+        metrics["batch_invariance"] = run_batch_invariance_probe(
+            client,
+            probe_count=options.batch_invariance_probes,
+            concurrency=config.concurrency,
+            retries=config.retries,
+            seed=config.seed,
+        )
     metrics_path = save_metrics(metrics, config.output_dir)
 
     print(json.dumps(metrics, indent=2))
@@ -782,6 +1075,7 @@ def main() -> None:
         prometheus_path = save_prometheus_metrics(metrics, metrics_path)
         print(f"Saved Prometheus metrics to {prometheus_path}")
 
+    exit_code = 0
     if options.baseline_path:
         baseline = load_metrics(options.baseline_path)
         regression_report = build_regression_report(
@@ -794,7 +1088,19 @@ def main() -> None:
         print(json.dumps(regression_report, indent=2))
         print(f"Saved comparison report to {report_path}")
         if options.fail_on_regression and regression_report["regression"]:
-            raise SystemExit(2)
+            exit_code = 2
+
+    batch_invariance = metrics.get("batch_invariance")
+    if (
+        options.fail_on_batch_variance
+        and isinstance(batch_invariance, dict)
+        and not batch_invariance.get("exact_match", False)
+        and exit_code == 0
+    ):
+        exit_code = 3
+
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

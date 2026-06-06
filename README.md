@@ -20,6 +20,7 @@ Inference infrastructure work is not just "run a model." Strong systems need rep
 - Prometheus text export for dashboard or CI artifact ingestion.
 - Baseline-versus-candidate comparison with configurable p95 and success-rate gates.
 - Correlated Triton/DCGM telemetry snapshots for GPU utilization, memory, queue, and server-duration context.
+- Batch-invariance probes that compare exact output fingerprints in isolation and under concurrent noise traffic.
 - Kubernetes Job example for cluster-local benchmark runs.
 
 ## Engineering Scope
@@ -65,6 +66,19 @@ python benchmark.py \
   --num-requests 500 \
   --concurrency 32 \
   --telemetry-prometheus sample_results/mock_telemetry.prom \
+  --prometheus
+```
+
+Check whether fixed inputs produce identical outputs when served alongside
+concurrent traffic:
+
+```bash
+python benchmark.py \
+  --mode mock \
+  --num-requests 100 \
+  --concurrency 8 \
+  --batch-invariance-probes 16 \
+  --fail-on-batch-variance \
   --prometheus
 ```
 
@@ -136,3 +150,4 @@ This project covers benchmarking discipline, model-serving concepts, latency per
 - Add payload profiles for chat, embeddings, vision, and long-context workloads.
 - Add distributed load generation for multi-client benchmarking.
 - Add threshold checks for correlated GPU utilization, queue depth, and server-side error counters.
+- Add approximate numeric tolerance policies alongside the exact batch-invariance fingerprint check.

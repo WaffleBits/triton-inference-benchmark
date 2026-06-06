@@ -21,6 +21,7 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Prometheus-compatible benchmark artifacts for dashboard and CI ingestion.
 - Baseline-versus-candidate comparison with explicit regression reasons.
 - Correlated server telemetry for GPU utilization, memory pressure, queue time, and Triton counters.
+- Exact-output batch-invariance testing under concurrent noise traffic.
 - Kubernetes job posture with non-root runtime settings.
 
 ## Technical Scope
@@ -28,7 +29,7 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - AI infrastructure: model-serving reliability, benchmark methodology, latency analysis, and regression tracking.
 - Platform engineering: CLI ergonomics, JSON outputs, testable boundaries, and live-service extension points.
 - Performance engineering: concurrency sweeps, percentile metrics, retry behavior, and reproducible reports.
-- Infrastructure/SRE: operational runbooks, release regression thresholds, Prometheus output, telemetry correlation, and Kubernetes execution shape.
+- Infrastructure/SRE: operational runbooks, release regression thresholds, deterministic serving checks, Prometheus output, telemetry correlation, and Kubernetes execution shape.
 
 ## Gaps Worth Closing Next
 
@@ -36,3 +37,4 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Add distributed load generation across multiple clients.
 - Add saved benchmark reports with trend comparisons over time.
 - Add threshold checks for server-side telemetry and batching behavior.
+- Add model-aware numeric tolerance policies for outputs that do not promise bitwise determinism.

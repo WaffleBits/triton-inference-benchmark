@@ -19,6 +19,8 @@ python benchmark.py \
   --mode mock \
   --num-requests 500 \
   --concurrency 32 \
+  --batch-invariance-probes 16 \
+  --fail-on-batch-variance \
   --baseline sample_results/mock_run.json \
   --telemetry-prometheus sample_results/mock_telemetry.prom \
   --max-p95-regression-pct 10 \
@@ -36,6 +38,7 @@ For a production-style inference service, the benchmark output should be reviewe
 - Throughput remains stable under the expected concurrency level.
 - Retry behavior and failure count are visible in the report, not hidden by averages.
 - GPU utilization and queue duration explain whether a latency change is client-side load, accelerator pressure, or server-side scheduling.
+- Fixed probe inputs retain exact output fingerprints when mixed with concurrent traffic.
 
 This repo does not claim a universal SLO because real targets depend on model size, accelerator type, batch policy, and product latency budget.
 
@@ -64,6 +67,20 @@ The JSON result includes:
 - Triton success, failure, request-duration, queue-duration, and compute-infer counters for the configured model.
 
 The Prometheus export mirrors the correlated values with `triton_benchmark_gpu_*` and `triton_benchmark_server_*` metrics so a benchmark artifact can be compared with server-side behavior in the same dashboard.
+
+## Batch-Invariance Triage
+
+Use `--batch-invariance-probes <count>` to compare fixed requests in two layouts:
+isolated execution and concurrent execution mixed with unrelated requests. Add
+`--fail-on-batch-variance` in CI when exact repeatability is required.
+
+When a mismatch appears:
+
+- Re-run with the same seed and model version.
+- Confirm sampling is disabled and all model inputs are deterministic.
+- Compare server batching, precision, kernel, and accelerator settings.
+- Check whether reduction order or dynamic batching changes floating-point results.
+- Treat prefix-cache reuse and resumable rollout replay as unsafe until the mismatch is understood.
 
 ## Incident / Regression Triage
 
