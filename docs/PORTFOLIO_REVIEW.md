@@ -22,13 +22,14 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Baseline-versus-candidate comparison with explicit regression reasons.
 - Correlated server telemetry for GPU utilization, memory pressure, queue time, and Triton counters.
 - Exact-output batch-invariance testing under concurrent noise traffic.
+- Token-throughput, GPU-capacity, energy, and normalized cost-to-serve estimates with explicit assumptions.
 - Kubernetes job posture with non-root runtime settings.
 
 ## Technical Scope
 
 - AI infrastructure: model-serving reliability, benchmark methodology, latency analysis, and regression tracking.
 - Platform engineering: CLI ergonomics, JSON outputs, testable boundaries, and live-service extension points.
-- Performance engineering: concurrency sweeps, percentile metrics, retry behavior, and reproducible reports.
+- Performance engineering: concurrency sweeps, percentile metrics, retry behavior, token throughput, cost modeling, and reproducible reports.
 - Infrastructure/SRE: operational runbooks, release regression thresholds, deterministic serving checks, Prometheus output, telemetry correlation, and Kubernetes execution shape.
 
 ## Gaps Worth Closing Next
