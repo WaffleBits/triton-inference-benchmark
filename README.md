@@ -21,6 +21,7 @@ Inference infrastructure work is not just "run a model." Strong systems need rep
 - Baseline-versus-candidate comparison with configurable p95 and success-rate gates.
 - Correlated Triton/DCGM telemetry snapshots for GPU utilization, memory, queue, and server-duration context.
 - Batch-invariance probes that compare exact output fingerprints in isolation and under concurrent noise traffic.
+- Token-throughput and cost-to-serve estimates with explicit GPU price, power, and workload assumptions.
 - Kubernetes Job example for cluster-local benchmark runs.
 
 ## Engineering Scope
@@ -81,6 +82,26 @@ python benchmark.py \
   --fail-on-batch-variance \
   --prometheus
 ```
+
+Estimate token throughput, accelerator cost, energy, and normalized cost:
+
+```bash
+python benchmark.py \
+  --mode mock \
+  --num-requests 500 \
+  --concurrency 32 \
+  --input-tokens-per-request 1024 \
+  --output-tokens-per-request 256 \
+  --gpu-count 2 \
+  --gpu-hourly-cost-usd 4.50 \
+  --power-watts-per-gpu 600 \
+  --electricity-cost-usd-per-kwh 0.12 \
+  --prometheus
+```
+
+The estimate charges reserved GPU capacity for the full benchmark duration and
+normalizes cost by successful requests and tokens. Set electricity to zero when
+the hourly accelerator price already includes facility power.
 
 Compare a candidate run against a saved baseline:
 

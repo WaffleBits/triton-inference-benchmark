@@ -26,6 +26,23 @@ When `--prometheus` is enabled, the same core measurements are written as Promet
 
 When `--telemetry-prometheus` is provided, the benchmark attaches a correlated summary from a Triton/DCGM Prometheus text snapshot. The summary keeps server-side GPU utilization, memory use, queue duration, request duration, and inference-duration counters beside the client-side benchmark result. The parser is dependency-free so CI can validate the behavior with synthetic fixtures while live runs can still consume real scrape artifacts.
 
+## Cost-To-Serve Model
+
+Token and cost inputs attach an estimated cost model to the benchmark result.
+The model records input/output tokens per successful request, token throughput,
+requests per GPU-hour, GPU-time cost, optional electricity cost, and normalized
+cost per million requests or tokens.
+
+GPU capacity is charged for the complete benchmark wall-clock duration, including
+time spent on failed requests. Token totals count successful requests only. This
+keeps failures visible as consumed capacity without crediting them as delivered
+work. GPU hourly price and electricity are separate inputs because cloud prices
+usually bundle facility power while owned-capacity models may not.
+
+The report excludes CPU, network, storage, idle fleet headroom, and engineering
+costs. It is a transparent scenario model for comparing like-for-like runs, not
+an accounting claim.
+
 ## Batch-Invariance Probe
 
 `--batch-invariance-probes` checks whether infrastructure scheduling changes model
