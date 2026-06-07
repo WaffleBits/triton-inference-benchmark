@@ -10,6 +10,7 @@ This benchmark is intended to produce repeatable evidence for model-serving chan
 4. If available, scrape a Triton/DCGM Prometheus snapshot close to the run.
 5. Export JSON and Prometheus text artifacts.
 6. Review p95 latency, success rate, throughput, failure count, queue time, and GPU utilization before promoting the candidate.
+7. When capacity inputs are known, compare token throughput and normalized cost under identical workload assumptions.
 
 Example:
 
@@ -25,6 +26,10 @@ python benchmark.py \
   --telemetry-prometheus sample_results/mock_telemetry.prom \
   --max-p95-regression-pct 10 \
   --max-success-rate-drop 0.01 \
+  --input-tokens-per-request 1024 \
+  --output-tokens-per-request 256 \
+  --gpu-count 2 \
+  --gpu-hourly-cost-usd 4.50 \
   --fail-on-regression \
   --prometheus
 ```
@@ -67,6 +72,24 @@ The JSON result includes:
 - Triton success, failure, request-duration, queue-duration, and compute-infer counters for the configured model.
 
 The Prometheus export mirrors the correlated values with `triton_benchmark_gpu_*` and `triton_benchmark_server_*` metrics so a benchmark artifact can be compared with server-side behavior in the same dashboard.
+
+## Cost-To-Serve Review
+
+Use token and capacity inputs to attach a scenario estimate to each result. Keep
+the same token profile, GPU count, price basis, and power assumptions across
+baseline and candidate runs.
+
+Review:
+
+- output and total token throughput
+- successful requests per GPU-hour
+- accelerator and optional electricity cost for the run
+- cost per million successful requests
+- cost per million input, output, and total tokens
+
+Treat the numbers as comparison inputs, not invoices. Cloud accelerator prices
+usually include electricity, while owned-hardware models may add it separately.
+The estimate excludes CPU, storage, network, fleet headroom, and engineering cost.
 
 ## Batch-Invariance Triage
 

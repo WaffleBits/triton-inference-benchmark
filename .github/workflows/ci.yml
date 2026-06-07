@@ -29,4 +29,9 @@ jobs:
           --concurrency 4
           --batch-invariance-probes 8
           --fail-on-batch-variance
+          --input-tokens-per-request 1024
+          --output-tokens-per-request 256
+          --gpu-count 2
+          --gpu-hourly-cost-usd 4.50
+          --prometheus
           --output-dir benchmark_results

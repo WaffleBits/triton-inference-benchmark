@@ -42,8 +42,19 @@ class BenchmarkConfig:
 
 
 @dataclass(frozen=True)
+class CostModelConfig:
+    input_tokens_per_request: int = 0
+    output_tokens_per_request: int = 0
+    gpu_count: int = 1
+    gpu_hourly_cost_usd: float = 0.0
+    power_watts_per_gpu: float = 0.0
+    electricity_cost_usd_per_kwh: float = 0.0
+
+
+@dataclass(frozen=True)
 class CliOptions:
     config: BenchmarkConfig
+    cost_model_config: CostModelConfig | None = None
     export_prometheus: bool = False
     telemetry_prometheus_path: str | None = None
     batch_invariance_probes: int = 0
@@ -421,6 +432,97 @@ def summarize_results(
             "max": round(max(latencies), 4) if latencies else 0,
         },
         "config": asdict(config),
+    }
+
+
+def build_cost_model(
+    metrics: dict[str, object],
+    config: CostModelConfig,
+) -> dict[str, object]:
+    successful_requests = int(_number(dict(metrics), "successful_requests"))
+    duration_seconds = _number(dict(metrics), "duration_seconds")
+    duration_hours = duration_seconds / 3600
+
+    input_tokens = successful_requests * config.input_tokens_per_request
+    output_tokens = successful_requests * config.output_tokens_per_request
+    total_tokens = input_tokens + output_tokens
+
+    accelerator_cost_usd = (
+        config.gpu_count * config.gpu_hourly_cost_usd * duration_hours
+    )
+    energy_kwh = (
+        config.gpu_count * config.power_watts_per_gpu * duration_hours / 1000
+    )
+    electricity_cost_usd = energy_kwh * config.electricity_cost_usd_per_kwh
+    total_cost_usd = accelerator_cost_usd + electricity_cost_usd
+
+    def per_million(cost: float, units: int) -> float | None:
+        if units <= 0:
+            return None
+        return round(cost * 1_000_000 / units, 6)
+
+    def per_second(units: int) -> float:
+        if duration_seconds <= 0:
+            return 0.0
+        return round(units / duration_seconds, 4)
+
+    return {
+        "estimate": True,
+        "workload": {
+            "input_tokens_per_request": config.input_tokens_per_request,
+            "output_tokens_per_request": config.output_tokens_per_request,
+            "successful_input_tokens": input_tokens,
+            "successful_output_tokens": output_tokens,
+            "successful_total_tokens": total_tokens,
+            "output_tokens_per_second": per_second(output_tokens),
+            "total_tokens_per_second": per_second(total_tokens),
+        },
+        "capacity": {
+            "gpu_count": config.gpu_count,
+            "successful_requests_per_gpu_hour": round(
+                successful_requests / duration_hours / config.gpu_count,
+                4,
+            )
+            if duration_hours > 0
+            else 0.0,
+            "output_tokens_per_gpu_second": round(
+                output_tokens / duration_seconds / config.gpu_count,
+                4,
+            )
+            if duration_seconds > 0
+            else 0.0,
+        },
+        "cost": {
+            "gpu_hourly_cost_usd": config.gpu_hourly_cost_usd,
+            "power_watts_per_gpu": config.power_watts_per_gpu,
+            "electricity_cost_usd_per_kwh": config.electricity_cost_usd_per_kwh,
+            "accelerator_cost_usd": round(accelerator_cost_usd, 6),
+            "energy_kwh": round(energy_kwh, 6),
+            "electricity_cost_usd": round(electricity_cost_usd, 6),
+            "total_estimated_cost_usd": round(total_cost_usd, 6),
+            "cost_per_million_requests_usd": per_million(
+                total_cost_usd,
+                successful_requests,
+            ),
+            "cost_per_million_input_tokens_usd": per_million(
+                total_cost_usd,
+                input_tokens,
+            ),
+            "cost_per_million_output_tokens_usd": per_million(
+                total_cost_usd,
+                output_tokens,
+            ),
+            "cost_per_million_total_tokens_usd": per_million(
+                total_cost_usd,
+                total_tokens,
+            ),
+        },
+        "assumptions": [
+            "GPU capacity is reserved for the full benchmark wall-clock duration.",
+            "Token counts describe successful requests only.",
+            "GPU hourly price and electricity are additive when both are configured.",
+            "Network, storage, CPU, idle fleet, and engineering costs are excluded.",
+        ],
     }
 
 
@@ -860,6 +962,88 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
                     ),
                 ]
             )
+
+    cost_model = typed_metrics.get("cost_model")
+    if isinstance(cost_model, dict):
+        workload_specs = [
+            (("workload", "successful_input_tokens"), "input"),
+            (("workload", "successful_output_tokens"), "output"),
+            (("workload", "successful_total_tokens"), "total"),
+        ]
+        lines.extend(
+            [
+                "# HELP triton_benchmark_workload_tokens_total Successful tokens represented by the benchmark workload.",
+                "# TYPE triton_benchmark_workload_tokens_total gauge",
+            ]
+        )
+        for keys, direction in workload_specs:
+            value = _nested_number(cost_model, keys)
+            if value is not None:
+                lines.append(
+                    f'triton_benchmark_workload_tokens_total{{{labels},'
+                    f'direction="{direction}"}} {value:g}'
+                )
+
+        throughput_specs = [
+            (("workload", "output_tokens_per_second"), "output"),
+            (("workload", "total_tokens_per_second"), "total"),
+        ]
+        lines.extend(
+            [
+                "# HELP triton_benchmark_token_throughput_per_second Successful token throughput.",
+                "# TYPE triton_benchmark_token_throughput_per_second gauge",
+            ]
+        )
+        for keys, direction in throughput_specs:
+            value = _nested_number(cost_model, keys)
+            if value is not None:
+                lines.append(
+                    f'triton_benchmark_token_throughput_per_second{{{labels},'
+                    f'direction="{direction}"}} {value:g}'
+                )
+
+        cost_specs = [
+            (("cost", "accelerator_cost_usd"), "accelerator"),
+            (("cost", "electricity_cost_usd"), "electricity"),
+            (("cost", "total_estimated_cost_usd"), "total"),
+        ]
+        lines.extend(
+            [
+                "# HELP triton_benchmark_estimated_cost_usd Estimated benchmark-run cost by component.",
+                "# TYPE triton_benchmark_estimated_cost_usd gauge",
+            ]
+        )
+        for keys, component in cost_specs:
+            value = _nested_number(cost_model, keys)
+            if value is not None:
+                lines.append(
+                    f'triton_benchmark_estimated_cost_usd{{{labels},'
+                    f'component="{component}"}} {value:g}'
+                )
+
+        normalized_cost_specs = [
+            ("cost_per_million_requests_usd", "request"),
+            ("cost_per_million_input_tokens_usd", "input_token"),
+            ("cost_per_million_output_tokens_usd", "output_token"),
+            ("cost_per_million_total_tokens_usd", "total_token"),
+        ]
+        emitted_normalized_header = False
+        for source_key, unit in normalized_cost_specs:
+            value = _nested_number(cost_model, ("cost", source_key))
+            if value is None:
+                continue
+            if not emitted_normalized_header:
+                lines.extend(
+                    [
+                        "# HELP triton_benchmark_estimated_cost_per_million_usd Estimated cost per million successful units.",
+                        "# TYPE triton_benchmark_estimated_cost_per_million_usd gauge",
+                    ]
+                )
+                emitted_normalized_header = True
+            lines.append(
+                f'triton_benchmark_estimated_cost_per_million_usd{{{labels},'
+                f'unit="{unit}"}} {value:g}'
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -973,6 +1157,42 @@ def parse_args() -> CliOptions:
     parser.add_argument("--output-dir", default="benchmark_results")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
+        "--input-tokens-per-request",
+        type=int,
+        default=0,
+        help="Estimated input tokens represented by each successful request.",
+    )
+    parser.add_argument(
+        "--output-tokens-per-request",
+        type=int,
+        default=0,
+        help="Estimated output tokens represented by each successful request.",
+    )
+    parser.add_argument(
+        "--gpu-count",
+        type=int,
+        default=1,
+        help="Accelerators reserved for the run when estimating capacity and cost.",
+    )
+    parser.add_argument(
+        "--gpu-hourly-cost-usd",
+        type=float,
+        default=0.0,
+        help="Hourly price per reserved accelerator.",
+    )
+    parser.add_argument(
+        "--power-watts-per-gpu",
+        type=float,
+        default=0.0,
+        help="Average accelerator power draw used for the energy estimate.",
+    )
+    parser.add_argument(
+        "--electricity-cost-usd-per-kwh",
+        type=float,
+        default=0.0,
+        help="Electricity price added when modeling owned accelerator capacity.",
+    )
+    parser.add_argument(
         "--prometheus",
         action="store_true",
         help="Write a Prometheus text-format .prom file beside the JSON result.",
@@ -1026,6 +1246,26 @@ def parse_args() -> CliOptions:
         parser.error("--batch-invariance-probes requires --concurrency greater than one")
     if args.fail_on_batch_variance and not args.batch_invariance_probes:
         parser.error("--fail-on-batch-variance requires --batch-invariance-probes")
+    if args.input_tokens_per_request < 0 or args.output_tokens_per_request < 0:
+        parser.error("token counts must be zero or greater")
+    if args.gpu_count <= 0:
+        parser.error("--gpu-count must be greater than zero")
+    if (
+        args.gpu_hourly_cost_usd < 0
+        or args.power_watts_per_gpu < 0
+        or args.electricity_cost_usd_per_kwh < 0
+    ):
+        parser.error("cost-model inputs must be zero or greater")
+
+    cost_model_enabled = any(
+        (
+            args.input_tokens_per_request,
+            args.output_tokens_per_request,
+            args.gpu_hourly_cost_usd,
+            args.power_watts_per_gpu,
+            args.electricity_cost_usd_per_kwh,
+        )
+    )
 
     return CliOptions(
         config=BenchmarkConfig(
@@ -1040,6 +1280,16 @@ def parse_args() -> CliOptions:
             output_dir=args.output_dir,
             seed=args.seed,
         ),
+        cost_model_config=CostModelConfig(
+            input_tokens_per_request=args.input_tokens_per_request,
+            output_tokens_per_request=args.output_tokens_per_request,
+            gpu_count=args.gpu_count,
+            gpu_hourly_cost_usd=args.gpu_hourly_cost_usd,
+            power_watts_per_gpu=args.power_watts_per_gpu,
+            electricity_cost_usd_per_kwh=args.electricity_cost_usd_per_kwh,
+        )
+        if cost_model_enabled
+        else None,
         export_prometheus=args.prometheus,
         telemetry_prometheus_path=args.telemetry_prometheus,
         batch_invariance_probes=args.batch_invariance_probes,
@@ -1056,6 +1306,8 @@ def main() -> None:
     config = options.config
     client = build_client(config)
     metrics = run_benchmark(client, config)
+    if options.cost_model_config:
+        metrics["cost_model"] = build_cost_model(metrics, options.cost_model_config)
     if options.telemetry_prometheus_path:
         metrics = attach_telemetry_summary(metrics, options.telemetry_prometheus_path)
     if options.batch_invariance_probes:

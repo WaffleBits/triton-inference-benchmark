@@ -4,9 +4,11 @@ from threading import Barrier, local
 
 from benchmark import (
     BenchmarkConfig,
+    CostModelConfig,
     InferenceResult,
     MockInferenceClient,
     TritonHttpInferenceClient,
+    build_cost_model,
     build_regression_report,
     build_telemetry_summary,
     fingerprint_triton_outputs,
@@ -152,6 +154,58 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertEqual(metrics["failed_requests"], 0)
         self.assertGreater(metrics["throughput_rps"], 0)
 
+    def test_cost_model_normalizes_gpu_time_and_successful_tokens(self) -> None:
+        cost_model = build_cost_model(
+            {
+                "successful_requests": 100,
+                "duration_seconds": 3600.0,
+            },
+            CostModelConfig(
+                input_tokens_per_request=1000,
+                output_tokens_per_request=250,
+                gpu_count=2,
+                gpu_hourly_cost_usd=4.0,
+                power_watts_per_gpu=500.0,
+                electricity_cost_usd_per_kwh=0.10,
+            ),
+        )
+
+        self.assertEqual(
+            cost_model["workload"]["successful_total_tokens"],
+            125000,
+        )
+        self.assertEqual(
+            cost_model["capacity"]["successful_requests_per_gpu_hour"],
+            50.0,
+        )
+        self.assertEqual(cost_model["cost"]["accelerator_cost_usd"], 8.0)
+        self.assertEqual(cost_model["cost"]["energy_kwh"], 1.0)
+        self.assertEqual(cost_model["cost"]["electricity_cost_usd"], 0.1)
+        self.assertEqual(
+            cost_model["cost"]["cost_per_million_total_tokens_usd"],
+            64.8,
+        )
+
+    def test_cost_model_charges_wall_clock_when_requests_fail(self) -> None:
+        cost_model = build_cost_model(
+            {
+                "successful_requests": 0,
+                "duration_seconds": 1800.0,
+            },
+            CostModelConfig(
+                input_tokens_per_request=100,
+                output_tokens_per_request=25,
+                gpu_count=1,
+                gpu_hourly_cost_usd=10.0,
+            ),
+        )
+
+        self.assertEqual(cost_model["cost"]["total_estimated_cost_usd"], 5.0)
+        self.assertIsNone(cost_model["cost"]["cost_per_million_requests_usd"])
+        self.assertIsNone(
+            cost_model["cost"]["cost_per_million_total_tokens_usd"]
+        )
+
     def test_batch_invariance_probe_matches_deterministic_outputs(self) -> None:
         report = run_batch_invariance_probe(
             MockInferenceClient(seed=11, failure_rate=0),
@@ -252,6 +306,31 @@ class BenchmarkHarnessTest(unittest.TestCase):
             'model="resnet50_trt_fp16"} 0\n',
             output,
         )
+
+    def test_prometheus_export_includes_cost_model_metrics(self) -> None:
+        metrics = summarize_results(
+            [InferenceResult(ok=True, latency_ms=10.0)],
+            duration_seconds=2.0,
+            config=BenchmarkConfig(num_requests=1),
+        )
+        metrics["cost_model"] = build_cost_model(
+            metrics,
+            CostModelConfig(
+                input_tokens_per_request=100,
+                output_tokens_per_request=25,
+                gpu_count=1,
+                gpu_hourly_cost_usd=3.60,
+            ),
+        )
+
+        output = format_prometheus_metrics(metrics)
+
+        self.assertIn("triton_benchmark_workload_tokens_total", output)
+        self.assertIn('direction="output"} 25', output)
+        self.assertIn("triton_benchmark_token_throughput_per_second", output)
+        self.assertIn("triton_benchmark_estimated_cost_usd", output)
+        self.assertIn("triton_benchmark_estimated_cost_per_million_usd", output)
+        self.assertIn('unit="total_token"} 16', output)
 
     def test_batch_invariance_probe_requires_concurrent_workers(self) -> None:
         with self.assertRaisesRegex(ValueError, "greater than one"):
