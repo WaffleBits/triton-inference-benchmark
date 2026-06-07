@@ -19,6 +19,8 @@ Inference infrastructure work is not just "run a model." Strong systems need rep
 - JSON output for trend tracking and regression analysis.
 - Prometheus text export for dashboard or CI artifact ingestion.
 - Baseline-versus-candidate comparison with configurable p95 and success-rate gates.
+- Correlated Triton/DCGM telemetry snapshots for GPU utilization, memory, queue, and server-duration context.
+- Batch-invariance probes that compare exact output fingerprints in isolation and under concurrent noise traffic.
 - Kubernetes Job example for cluster-local benchmark runs.
 
 ## Engineering Scope
@@ -30,7 +32,7 @@ Relevant areas:
 - AI infrastructure: model-serving reliability, latency analysis, failure accounting, and benchmark methodology.
 - Platform engineering: CLI design, JSON artifacts, CI-friendly mock mode, and extension points for live services.
 - Performance engineering: percentile metrics, concurrency sweeps, throughput measurement, and reproducible comparison paths.
-- Infrastructure/SRE: Prometheus-compatible benchmark artifacts, release regression checks, Kubernetes job posture, and operations notes.
+- Infrastructure/SRE: Prometheus-compatible benchmark artifacts, correlated server telemetry, release regression checks, Kubernetes job posture, and operations notes.
 
 ## Reviewer Fast Path
 
@@ -38,6 +40,7 @@ Relevant areas:
 - Review `tests/` for metric and execution coverage.
 - Read `DESIGN.md` for benchmark tradeoffs and production extensions.
 - Read `docs/OPERATIONS.md` for regression triage, SLO-oriented checks, and Prometheus export usage.
+- Review `sample_results/mock_telemetry.prom` for the synthetic Triton/DCGM telemetry fixture.
 - Review `deploy/kubernetes/benchmark-job.yaml` for the cluster-run shape.
 - Read `docs/PORTFOLIO_REVIEW.md` for the technical review guide.
 
@@ -53,6 +56,30 @@ Write JSON plus Prometheus text-format artifacts:
 
 ```bash
 python benchmark.py --mode mock --num-requests 500 --concurrency 32 --prometheus
+```
+
+Attach a synthetic Triton/DCGM telemetry snapshot to the benchmark result:
+
+```bash
+python benchmark.py \
+  --mode mock \
+  --num-requests 500 \
+  --concurrency 32 \
+  --telemetry-prometheus sample_results/mock_telemetry.prom \
+  --prometheus
+```
+
+Check whether fixed inputs produce identical outputs when served alongside
+concurrent traffic:
+
+```bash
+python benchmark.py \
+  --mode mock \
+  --num-requests 100 \
+  --concurrency 8 \
+  --batch-invariance-probes 16 \
+  --fail-on-batch-variance \
+  --prometheus
 ```
 
 Compare a candidate run against a saved baseline:
@@ -122,4 +149,5 @@ This project covers benchmarking discipline, model-serving concepts, latency per
 - Add warmup windows and separate cold-start metrics.
 - Add payload profiles for chat, embeddings, vision, and long-context workloads.
 - Add distributed load generation for multi-client benchmarking.
-- Add DCGM or server-side telemetry correlation for GPU utilization and queue depth.
+- Add threshold checks for correlated GPU utilization, queue depth, and server-side error counters.
+- Add approximate numeric tolerance policies alongside the exact batch-invariance fingerprint check.
