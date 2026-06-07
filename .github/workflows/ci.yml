@@ -22,5 +22,11 @@ jobs:
         run: python -m unittest discover -s tests
 
       - name: Run mock benchmark
-        run: python benchmark.py --mode mock --num-requests 20 --concurrency 4 --output-dir benchmark_results
-
+        run: >-
+          python benchmark.py
+          --mode mock
+          --num-requests 20
+          --concurrency 4
+          --batch-invariance-probes 8
+          --fail-on-batch-variance
+          --output-dir benchmark_results

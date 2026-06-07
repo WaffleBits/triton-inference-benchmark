@@ -1,0 +1,12 @@
+# Synthetic Triton/DCGM telemetry fixture for portfolio review and CI-safe demos.
+DCGM_FI_DEV_GPU_UTIL{gpu="0",uuid="GPU-synthetic-0"} 78
+DCGM_FI_DEV_GPU_UTIL{gpu="1",uuid="GPU-synthetic-1"} 86
+DCGM_FI_DEV_MEM_COPY_UTIL{gpu="0",uuid="GPU-synthetic-0"} 19
+DCGM_FI_DEV_MEM_COPY_UTIL{gpu="1",uuid="GPU-synthetic-1"} 24
+DCGM_FI_DEV_FB_USED{gpu="0",uuid="GPU-synthetic-0"} 9216
+DCGM_FI_DEV_FB_USED{gpu="1",uuid="GPU-synthetic-1"} 9472
+nv_inference_request_success{model="resnet50_trt_fp16",version="1"} 500
+nv_inference_request_failure{model="resnet50_trt_fp16",version="1"} 1
+nv_inference_request_duration_us{model="resnet50_trt_fp16",version="1"} 18400000
+nv_inference_queue_duration_us{model="resnet50_trt_fp16",version="1"} 710000
+nv_inference_compute_infer_duration_us{model="resnet50_trt_fp16",version="1"} 15100000

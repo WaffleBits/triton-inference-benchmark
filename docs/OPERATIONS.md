@@ -7,8 +7,9 @@ This benchmark is intended to produce repeatable evidence for model-serving chan
 1. Run a baseline benchmark against the current model or serving image.
 2. Save the JSON result as the comparison baseline.
 3. Run the candidate benchmark with the same request count, concurrency, payload shape, and retry settings.
-4. Export JSON and Prometheus text artifacts.
-5. Review p95 latency, success rate, throughput, and failure count before promoting the candidate.
+4. If available, scrape a Triton/DCGM Prometheus snapshot close to the run.
+5. Export JSON and Prometheus text artifacts.
+6. Review p95 latency, success rate, throughput, failure count, queue time, and GPU utilization before promoting the candidate.
 
 Example:
 
@@ -18,7 +19,10 @@ python benchmark.py \
   --mode mock \
   --num-requests 500 \
   --concurrency 32 \
+  --batch-invariance-probes 16 \
+  --fail-on-batch-variance \
   --baseline sample_results/mock_run.json \
+  --telemetry-prometheus sample_results/mock_telemetry.prom \
   --max-p95-regression-pct 10 \
   --max-success-rate-drop 0.01 \
   --fail-on-regression \
@@ -33,6 +37,8 @@ For a production-style inference service, the benchmark output should be reviewe
 - p95 and p99 latency do not regress beyond the accepted release threshold.
 - Throughput remains stable under the expected concurrency level.
 - Retry behavior and failure count are visible in the report, not hidden by averages.
+- GPU utilization and queue duration explain whether a latency change is client-side load, accelerator pressure, or server-side scheduling.
+- Fixed probe inputs retain exact output fingerprints when mixed with concurrent traffic.
 
 This repo does not claim a universal SLO because real targets depend on model size, accelerator type, batch policy, and product latency budget.
 
@@ -49,6 +55,33 @@ Use `--prometheus` to write a `.prom` file next to the JSON result. The text-for
 
 The artifact can be pushed to a metrics gateway, archived by CI, or scraped from a shared results volume.
 
+## Telemetry Correlation
+
+Use `--telemetry-prometheus <path>` to attach a Prometheus text snapshot from Triton and DCGM exporter. The benchmark does not need scrape permissions itself; it consumes a file captured by CI, a sidecar, or an operator command.
+
+The JSON result includes:
+
+- GPU utilization average and max.
+- GPU memory-copy utilization average and max.
+- GPU memory used average and max.
+- Triton success, failure, request-duration, queue-duration, and compute-infer counters for the configured model.
+
+The Prometheus export mirrors the correlated values with `triton_benchmark_gpu_*` and `triton_benchmark_server_*` metrics so a benchmark artifact can be compared with server-side behavior in the same dashboard.
+
+## Batch-Invariance Triage
+
+Use `--batch-invariance-probes <count>` to compare fixed requests in two layouts:
+isolated execution and concurrent execution mixed with unrelated requests. Add
+`--fail-on-batch-variance` in CI when exact repeatability is required.
+
+When a mismatch appears:
+
+- Re-run with the same seed and model version.
+- Confirm sampling is disabled and all model inputs are deterministic.
+- Compare server batching, precision, kernel, and accelerator settings.
+- Check whether reduction order or dynamic batching changes floating-point results.
+- Treat prefix-cache reuse and resumable rollout replay as unsafe until the mismatch is understood.
+
 ## Incident / Regression Triage
 
 When a candidate run is marked as a regression:
@@ -58,6 +91,7 @@ When a candidate run is marked as a regression:
 - Re-run with the same seed in mock mode to validate harness behavior.
 - Re-run live mode with a fixed model version and payload shape.
 - Inspect server logs, accelerator telemetry, queue depth, and request batching before changing the benchmark threshold.
+- Compare correlated queue duration and GPU utilization before changing concurrency or batching policy.
 
 ## Public-Safe Boundaries
 
