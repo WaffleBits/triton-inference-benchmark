@@ -52,9 +52,22 @@ class CostModelConfig:
 
 
 @dataclass(frozen=True)
+class LlmMetricsConfig:
+    context_tokens_per_request: int = 0
+    batch_size: int = 1
+    time_to_first_token_ms: float | None = None
+    inter_token_latency_ms: float | None = None
+    kv_cache_bytes_per_request: int = 0
+    bytes_read_per_output_token: int = 0
+    baseline_quality_score: float | None = None
+    candidate_quality_score: float | None = None
+
+
+@dataclass(frozen=True)
 class CliOptions:
     config: BenchmarkConfig
     cost_model_config: CostModelConfig | None = None
+    llm_metrics_config: LlmMetricsConfig | None = None
     export_prometheus: bool = False
     telemetry_prometheus_path: str | None = None
     batch_invariance_probes: int = 0
@@ -523,6 +536,83 @@ def build_cost_model(
             "GPU hourly price and electricity are additive when both are configured.",
             "Network, storage, CPU, idle fleet, and engineering costs are excluded.",
         ],
+    }
+
+
+def build_llm_metrics(
+    metrics: dict[str, object],
+    config: LlmMetricsConfig,
+    cost_config: CostModelConfig | None = None,
+) -> dict[str, object]:
+    successful_requests = int(_number(dict(metrics), "successful_requests"))
+    duration_seconds = _number(dict(metrics), "duration_seconds")
+    output_tokens = (
+        successful_requests * cost_config.output_tokens_per_request
+        if cost_config
+        else 0
+    )
+    gpu_count = cost_config.gpu_count if cost_config else 1
+    power_watts = cost_config.power_watts_per_gpu if cost_config else 0.0
+    board_joules = gpu_count * power_watts * duration_seconds
+    quality_delta = None
+    quality_degradation_pct = None
+    if (
+        config.baseline_quality_score is not None
+        and config.candidate_quality_score is not None
+    ):
+        quality_delta = round(
+            config.baseline_quality_score - config.candidate_quality_score,
+            8,
+        )
+        if config.baseline_quality_score:
+            quality_degradation_pct = round(
+                quality_delta / config.baseline_quality_score * 100,
+                6,
+            )
+
+    return {
+        "context_tokens_per_request": config.context_tokens_per_request,
+        "batch_size": config.batch_size,
+        "latency_ms": {
+            "time_to_first_token": config.time_to_first_token_ms,
+            "inter_token": config.inter_token_latency_ms,
+        },
+        "throughput": {
+            "output_tokens_per_second": round(output_tokens / duration_seconds, 4)
+            if duration_seconds > 0
+            else 0.0,
+            "requests_per_gpu_hour": round(
+                successful_requests / duration_seconds * 3600 / gpu_count,
+                4,
+            )
+            if duration_seconds > 0
+            else 0.0,
+        },
+        "memory": {
+            "kv_cache_bytes_per_request": config.kv_cache_bytes_per_request,
+            "bytes_read_per_output_token": config.bytes_read_per_output_token,
+        },
+        "energy": {
+            "estimated_board_joules": round(board_joules, 6),
+            "estimated_joules_per_output_token": round(
+                board_joules / output_tokens,
+                6,
+            )
+            if output_tokens
+            else None,
+        },
+        "quality": {
+            "baseline_score": config.baseline_quality_score,
+            "candidate_score": config.candidate_quality_score,
+            "absolute_degradation": quality_delta,
+            "relative_degradation_percent": quality_degradation_pct,
+        },
+        "claim_scope": {
+            "latency_source": "caller-provided decode measurements",
+            "traffic": "logical bytes supplied by the benchmark operator",
+            "energy": "board-power estimate without idle-power subtraction",
+            "quality": "metric semantics are defined by the supplied evaluation",
+        },
     }
 
 
@@ -1044,6 +1134,70 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
                 f'triton_benchmark_estimated_cost_per_million_usd{{{labels},'
                 f'unit="{unit}"}} {value:g}'
             )
+
+    llm_metrics = typed_metrics.get("llm_metrics")
+    if isinstance(llm_metrics, dict):
+        latency_specs = [
+            (("latency_ms", "time_to_first_token"), "ttft"),
+            (("latency_ms", "inter_token"), "itl"),
+        ]
+        emitted_latency_header = False
+        for keys, phase in latency_specs:
+            value = _nested_number(llm_metrics, keys)
+            if value is None:
+                continue
+            if not emitted_latency_header:
+                lines.extend(
+                    [
+                        "# HELP triton_benchmark_llm_latency_ms LLM decode latency by phase.",
+                        "# TYPE triton_benchmark_llm_latency_ms gauge",
+                    ]
+                )
+                emitted_latency_header = True
+            lines.append(
+                f'triton_benchmark_llm_latency_ms{{{labels},phase="{phase}"}} {value:g}'
+            )
+
+        llm_specs = [
+            (
+                ("context_tokens_per_request",),
+                "triton_benchmark_llm_context_tokens",
+                "Prompt context tokens represented by each request.",
+            ),
+            (
+                ("batch_size",),
+                "triton_benchmark_llm_batch_size",
+                "Logical decode batch size.",
+            ),
+            (
+                ("memory", "kv_cache_bytes_per_request"),
+                "triton_benchmark_llm_kv_cache_bytes",
+                "Logical KV-cache bytes per request.",
+            ),
+            (
+                ("memory", "bytes_read_per_output_token"),
+                "triton_benchmark_llm_bytes_read_per_output_token",
+                "Logical bytes read for each generated output token.",
+            ),
+            (
+                ("energy", "estimated_joules_per_output_token"),
+                "triton_benchmark_llm_joules_per_output_token",
+                "Estimated board joules per generated output token.",
+            ),
+            (
+                ("quality", "relative_degradation_percent"),
+                "triton_benchmark_llm_quality_degradation_percent",
+                "Relative quality-score degradation from baseline.",
+            ),
+        ]
+        for keys, metric_name, help_text in llm_specs:
+            value = _nested_number(llm_metrics, keys)
+            if value is None:
+                continue
+            lines.extend(
+                [f"# HELP {metric_name} {help_text}", f"# TYPE {metric_name} gauge"]
+            )
+            lines.append(f"{metric_name}{{{labels}}} {value:g}")
     return "\n".join(lines) + "\n"
 
 
@@ -1193,6 +1347,50 @@ def parse_args() -> CliOptions:
         help="Electricity price added when modeling owned accelerator capacity.",
     )
     parser.add_argument(
+        "--context-tokens-per-request",
+        type=int,
+        default=0,
+        help="Prompt context represented by each LLM request.",
+    )
+    parser.add_argument(
+        "--llm-batch-size",
+        type=int,
+        default=1,
+        help="Logical decode batch size represented by the LLM measurement.",
+    )
+    parser.add_argument(
+        "--time-to-first-token-ms",
+        type=float,
+        help="Measured model-forward time to first generated token.",
+    )
+    parser.add_argument(
+        "--inter-token-latency-ms",
+        type=float,
+        help="Measured steady-state decode latency per generated token.",
+    )
+    parser.add_argument(
+        "--kv-cache-bytes-per-request",
+        type=int,
+        default=0,
+        help="Logical KV-cache capacity occupied by one request.",
+    )
+    parser.add_argument(
+        "--bytes-read-per-output-token",
+        type=int,
+        default=0,
+        help="Logical memory bytes read for each generated token.",
+    )
+    parser.add_argument(
+        "--baseline-quality-score",
+        type=float,
+        help="Reference score from an identified model-quality evaluation.",
+    )
+    parser.add_argument(
+        "--candidate-quality-score",
+        type=float,
+        help="Candidate score from the same model-quality evaluation.",
+    )
+    parser.add_argument(
         "--prometheus",
         action="store_true",
         help="Write a Prometheus text-format .prom file beside the JSON result.",
@@ -1256,6 +1454,25 @@ def parse_args() -> CliOptions:
         or args.electricity_cost_usd_per_kwh < 0
     ):
         parser.error("cost-model inputs must be zero or greater")
+    if (
+        args.context_tokens_per_request < 0
+        or args.llm_batch_size <= 0
+        or args.kv_cache_bytes_per_request < 0
+        or args.bytes_read_per_output_token < 0
+    ):
+        parser.error("LLM context, batch, and byte inputs must be non-negative")
+    if (
+        args.time_to_first_token_ms is not None
+        and args.time_to_first_token_ms < 0
+    ) or (
+        args.inter_token_latency_ms is not None
+        and args.inter_token_latency_ms < 0
+    ):
+        parser.error("LLM latency inputs must be zero or greater")
+    if (args.baseline_quality_score is None) != (
+        args.candidate_quality_score is None
+    ):
+        parser.error("baseline and candidate quality scores must be supplied together")
 
     cost_model_enabled = any(
         (
@@ -1264,6 +1481,16 @@ def parse_args() -> CliOptions:
             args.gpu_hourly_cost_usd,
             args.power_watts_per_gpu,
             args.electricity_cost_usd_per_kwh,
+        )
+    )
+    llm_metrics_enabled = any(
+        (
+            args.context_tokens_per_request,
+            args.time_to_first_token_ms is not None,
+            args.inter_token_latency_ms is not None,
+            args.kv_cache_bytes_per_request,
+            args.bytes_read_per_output_token,
+            args.baseline_quality_score is not None,
         )
     )
 
@@ -1290,6 +1517,18 @@ def parse_args() -> CliOptions:
         )
         if cost_model_enabled
         else None,
+        llm_metrics_config=LlmMetricsConfig(
+            context_tokens_per_request=args.context_tokens_per_request,
+            batch_size=args.llm_batch_size,
+            time_to_first_token_ms=args.time_to_first_token_ms,
+            inter_token_latency_ms=args.inter_token_latency_ms,
+            kv_cache_bytes_per_request=args.kv_cache_bytes_per_request,
+            bytes_read_per_output_token=args.bytes_read_per_output_token,
+            baseline_quality_score=args.baseline_quality_score,
+            candidate_quality_score=args.candidate_quality_score,
+        )
+        if llm_metrics_enabled
+        else None,
         export_prometheus=args.prometheus,
         telemetry_prometheus_path=args.telemetry_prometheus,
         batch_invariance_probes=args.batch_invariance_probes,
@@ -1308,6 +1547,12 @@ def main() -> None:
     metrics = run_benchmark(client, config)
     if options.cost_model_config:
         metrics["cost_model"] = build_cost_model(metrics, options.cost_model_config)
+    if options.llm_metrics_config:
+        metrics["llm_metrics"] = build_llm_metrics(
+            metrics,
+            options.llm_metrics_config,
+            options.cost_model_config,
+        )
     if options.telemetry_prometheus_path:
         metrics = attach_telemetry_summary(metrics, options.telemetry_prometheus_path)
     if options.batch_invariance_probes:

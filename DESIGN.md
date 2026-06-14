@@ -43,6 +43,20 @@ The report excludes CPU, network, storage, idle fleet headroom, and engineering
 costs. It is a transparent scenario model for comparing like-for-like runs, not
 an accounting claim.
 
+## LLM Decode Metrics
+
+The optional LLM record keeps model-serving metrics that cannot be derived from
+whole-request latency alone: time to first token, inter-token latency, logical
+context and batch size, KV-cache footprint, bytes read per output token,
+estimated joules per output token, and same-evaluation quality delta.
+
+Token throughput and requests per GPU-hour reuse the cost-model token counts and
+benchmark wall time. Energy uses configured average GPU board power multiplied
+by wall time; it does not subtract idle power. Memory traffic is caller-supplied
+logical traffic unless a separate hardware-counter artifact is attached. TTFT
+and inter-token latency are caller-supplied because the generic Triton request
+client does not observe per-token streaming events.
+
 ## Batch-Invariance Probe
 
 `--batch-invariance-probes` checks whether infrastructure scheduling changes model
