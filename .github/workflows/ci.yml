@@ -12,9 +12,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
@@ -33,5 +33,14 @@ jobs:
           --output-tokens-per-request 256
           --gpu-count 2
           --gpu-hourly-cost-usd 4.50
+          --power-watts-per-gpu 600
+          --context-tokens-per-request 1024
+          --llm-batch-size 4
+          --time-to-first-token-ms 25
+          --inter-token-latency-ms 10
+          --kv-cache-bytes-per-request 58720256
+          --bytes-read-per-output-token 777458304
+          --baseline-quality-score 0.80
+          --candidate-quality-score 0.79
           --prometheus
           --output-dir benchmark_results

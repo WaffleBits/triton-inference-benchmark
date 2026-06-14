@@ -22,6 +22,8 @@ Inference infrastructure work is not just "run a model." Strong systems need rep
 - Correlated Triton/DCGM telemetry snapshots for GPU utilization, memory, queue, and server-duration context.
 - Batch-invariance probes that compare exact output fingerprints in isolation and under concurrent noise traffic.
 - Token-throughput and cost-to-serve estimates with explicit GPU price, power, and workload assumptions.
+- LLM decode metrics for TTFT, inter-token latency, context, batch, KV-cache
+  footprint, bytes per output token, joules per output token, and quality delta.
 - Kubernetes Job example for cluster-local benchmark runs.
 
 ## Engineering Scope
@@ -102,6 +104,32 @@ python benchmark.py \
 The estimate charges reserved GPU capacity for the full benchmark duration and
 normalizes cost by successful requests and tokens. Set electricity to zero when
 the hourly accelerator price already includes facility power.
+
+Attach LLM-specific decode measurements and quality context:
+
+```bash
+python benchmark.py \
+  --mode mock \
+  --num-requests 100 \
+  --concurrency 4 \
+  --input-tokens-per-request 2048 \
+  --output-tokens-per-request 128 \
+  --context-tokens-per-request 2048 \
+  --llm-batch-size 4 \
+  --time-to-first-token-ms 90.29 \
+  --inter-token-latency-ms 11.59 \
+  --kv-cache-bytes-per-request 117440512 \
+  --bytes-read-per-output-token 1554916608 \
+  --power-watts-per-gpu 165.6 \
+  --baseline-quality-score 0.800 \
+  --candidate-quality-score 0.780 \
+  --prometheus
+```
+
+TTFT and inter-token latency are supplied by the decode runner because the
+generic request client cannot infer token boundaries. Traffic is a logical
+model, energy uses configured board power without idle subtraction, and quality
+score semantics come from the named external evaluation.
 
 Compare a candidate run against a saved baseline:
 

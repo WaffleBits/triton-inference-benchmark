@@ -6,9 +6,11 @@ from benchmark import (
     BenchmarkConfig,
     CostModelConfig,
     InferenceResult,
+    LlmMetricsConfig,
     MockInferenceClient,
     TritonHttpInferenceClient,
     build_cost_model,
+    build_llm_metrics,
     build_regression_report,
     build_telemetry_summary,
     fingerprint_triton_outputs,
@@ -206,6 +208,38 @@ class BenchmarkHarnessTest(unittest.TestCase):
             cost_model["cost"]["cost_per_million_total_tokens_usd"]
         )
 
+    def test_llm_metrics_report_decode_memory_energy_and_quality(self) -> None:
+        metrics = build_llm_metrics(
+            {
+                "successful_requests": 10,
+                "duration_seconds": 20.0,
+            },
+            LlmMetricsConfig(
+                context_tokens_per_request=2048,
+                batch_size=4,
+                time_to_first_token_ms=90.0,
+                inter_token_latency_ms=11.5,
+                kv_cache_bytes_per_request=117_440_512,
+                bytes_read_per_output_token=1_554_916_608,
+                baseline_quality_score=0.8,
+                candidate_quality_score=0.78,
+            ),
+            CostModelConfig(
+                output_tokens_per_request=128,
+                gpu_count=1,
+                power_watts_per_gpu=165.0,
+            ),
+        )
+
+        self.assertEqual(metrics["throughput"]["output_tokens_per_second"], 64.0)
+        self.assertEqual(metrics["throughput"]["requests_per_gpu_hour"], 1800.0)
+        self.assertEqual(
+            metrics["energy"]["estimated_joules_per_output_token"],
+            2.578125,
+        )
+        self.assertEqual(metrics["quality"]["absolute_degradation"], 0.02)
+        self.assertEqual(metrics["quality"]["relative_degradation_percent"], 2.5)
+
     def test_batch_invariance_probe_matches_deterministic_outputs(self) -> None:
         report = run_batch_invariance_probe(
             MockInferenceClient(seed=11, failure_rate=0),
@@ -331,6 +365,39 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertIn("triton_benchmark_estimated_cost_usd", output)
         self.assertIn("triton_benchmark_estimated_cost_per_million_usd", output)
         self.assertIn('unit="total_token"} 16', output)
+
+    def test_prometheus_export_includes_llm_metrics(self) -> None:
+        metrics = summarize_results(
+            [InferenceResult(ok=True, latency_ms=10.0)],
+            duration_seconds=1.0,
+            config=BenchmarkConfig(num_requests=1),
+        )
+        metrics["llm_metrics"] = build_llm_metrics(
+            metrics,
+            LlmMetricsConfig(
+                context_tokens_per_request=2048,
+                batch_size=4,
+                time_to_first_token_ms=90.0,
+                inter_token_latency_ms=11.5,
+                kv_cache_bytes_per_request=117_440_512,
+                bytes_read_per_output_token=1_554_916_608,
+                baseline_quality_score=0.8,
+                candidate_quality_score=0.78,
+            ),
+            CostModelConfig(
+                output_tokens_per_request=128,
+                power_watts_per_gpu=165.0,
+            ),
+        )
+
+        output = format_prometheus_metrics(metrics)
+
+        self.assertIn('phase="ttft"} 90', output)
+        self.assertIn('phase="itl"} 11.5', output)
+        self.assertIn("triton_benchmark_llm_kv_cache_bytes", output)
+        self.assertIn("triton_benchmark_llm_bytes_read_per_output_token", output)
+        self.assertIn("triton_benchmark_llm_joules_per_output_token", output)
+        self.assertIn("triton_benchmark_llm_quality_degradation_percent", output)
 
     def test_batch_invariance_probe_requires_concurrent_workers(self) -> None:
         with self.assertRaisesRegex(ValueError, "greater than one"):
