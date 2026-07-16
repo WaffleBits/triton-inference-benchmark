@@ -2,54 +2,24 @@
 
 [![CI](https://github.com/WaffleBits/triton-inference-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/WaffleBits/triton-inference-benchmark/actions/workflows/ci.yml)
 
-Benchmark harness for Triton-style model serving. The tool supports a dependency-free mock mode for CI and an optional live HTTP mode for testing a real inference server endpoint.
-
-## Why This Exists
-
-Inference infrastructure work is not just "run a model." Strong systems need repeatable benchmarks, clear latency percentiles, failure accounting, configurable concurrency, and results that can be compared over time. This repo is a small but reviewable artifact around that workflow.
+Load-generation harness for Triton-style model serving. It drives concurrent
+requests, records latency percentiles, accounts for retries and failures,
+exports Prometheus text, and gates candidate runs against a saved baseline. A
+dependency-free mock backend runs in CI; an optional HTTP mode drives a real
+inference endpoint.
 
 ## Features
 
-- Concurrent load generation with configurable request count and worker count.
-- Retry-aware request execution.
-- Latency metrics: average, p50, p95, p99, min, max.
-- Throughput and success-rate reporting.
-- Dependency-free mock mode for CI and reviewer demos.
-- Optional Triton HTTP mode for live model-serving benchmarks.
-- JSON output for trend tracking and regression analysis.
-- Prometheus text export for dashboard or CI artifact ingestion.
-- Baseline-versus-candidate comparison with configurable p95 and success-rate gates.
-- Correlated Triton/DCGM telemetry snapshots for GPU utilization, memory, queue, and server-duration context.
-- Batch-invariance probes that compare exact output fingerprints in isolation and under concurrent noise traffic.
-- Token-throughput and cost-to-serve estimates with explicit GPU price, power, and workload assumptions.
-- LLM decode metrics for TTFT, inter-token latency, context, batch, KV-cache
-  footprint, bytes per output token, joules per output token, and quality delta.
-- Kubernetes Job example for cluster-local benchmark runs.
-
-## Engineering Scope
-
-This repo focuses on repeatable load generation, concurrency controls, retry accounting, percentile latency, throughput, and machine-readable output that can feed regression tracking.
-
-Relevant areas:
-
-- AI infrastructure: model-serving reliability, latency analysis, failure accounting, and benchmark methodology.
-- Platform engineering: CLI design, JSON artifacts, CI-friendly mock mode, and extension points for live services.
-- Performance engineering: percentile metrics, concurrency sweeps, throughput measurement, and reproducible comparison paths.
-- Infrastructure/SRE: Prometheus-compatible benchmark artifacts, correlated server telemetry, release regression checks, Kubernetes job posture, and operations notes.
-
-## Reviewer Fast Path
-
-- Start with `benchmark.py` for benchmark orchestration and CLI behavior.
-- Review `tests/` for metric and execution coverage.
-- Read `DESIGN.md` for benchmark tradeoffs and production extensions.
-- Read `docs/OPERATIONS.md` for regression triage, SLO-oriented checks, and Prometheus export usage.
-- Review `sample_results/mock_telemetry.prom` for the synthetic Triton/DCGM telemetry fixture.
-- Review `deploy/kubernetes/benchmark-job.yaml` for the cluster-run shape.
-- Read `docs/PORTFOLIO_REVIEW.md` for the technical review guide.
+- Concurrent load generation with configurable request and worker counts.
+- Retry-aware request execution with failure accounting.
+- Latency metrics: average, p50, p95, p99, min, max, plus throughput and success rate.
+- JSON output and Prometheus text export for trend tracking.
+- Baseline-versus-candidate comparison with p95 and success-rate gates.
+- Dependency-free mock backend for CI, and an optional Triton HTTP mode.
 
 ## Quick Start
 
-Run a local mock benchmark without GPU dependencies:
+Run a mock benchmark without GPU dependencies:
 
 ```bash
 python benchmark.py --mode mock --num-requests 100 --concurrency 8
@@ -61,77 +31,7 @@ Write JSON plus Prometheus text-format artifacts:
 python benchmark.py --mode mock --num-requests 500 --concurrency 32 --prometheus
 ```
 
-Attach a synthetic Triton/DCGM telemetry snapshot to the benchmark result:
-
-```bash
-python benchmark.py \
-  --mode mock \
-  --num-requests 500 \
-  --concurrency 32 \
-  --telemetry-prometheus sample_results/mock_telemetry.prom \
-  --prometheus
-```
-
-Check whether fixed inputs produce identical outputs when served alongside
-concurrent traffic:
-
-```bash
-python benchmark.py \
-  --mode mock \
-  --num-requests 100 \
-  --concurrency 8 \
-  --batch-invariance-probes 16 \
-  --fail-on-batch-variance \
-  --prometheus
-```
-
-Estimate token throughput, accelerator cost, energy, and normalized cost:
-
-```bash
-python benchmark.py \
-  --mode mock \
-  --num-requests 500 \
-  --concurrency 32 \
-  --input-tokens-per-request 1024 \
-  --output-tokens-per-request 256 \
-  --gpu-count 2 \
-  --gpu-hourly-cost-usd 4.50 \
-  --power-watts-per-gpu 600 \
-  --electricity-cost-usd-per-kwh 0.12 \
-  --prometheus
-```
-
-The estimate charges reserved GPU capacity for the full benchmark duration and
-normalizes cost by successful requests and tokens. Set electricity to zero when
-the hourly accelerator price already includes facility power.
-
-Attach LLM-specific decode measurements and quality context:
-
-```bash
-python benchmark.py \
-  --mode mock \
-  --num-requests 100 \
-  --concurrency 4 \
-  --input-tokens-per-request 2048 \
-  --output-tokens-per-request 128 \
-  --context-tokens-per-request 2048 \
-  --llm-batch-size 4 \
-  --time-to-first-token-ms 90.29 \
-  --inter-token-latency-ms 11.59 \
-  --kv-cache-bytes-per-request 117440512 \
-  --bytes-read-per-output-token 1554916608 \
-  --power-watts-per-gpu 165.6 \
-  --baseline-quality-score 0.800 \
-  --candidate-quality-score 0.780 \
-  --prometheus
-```
-
-TTFT and inter-token latency are supplied by the decode runner because the
-generic request client cannot infer token boundaries. Traffic is a logical
-model, energy uses configured board power without idle subtraction, and quality
-score semantics come from the named external evaluation.
-
-Compare a candidate run against a saved baseline:
+Compare a candidate run against a saved baseline and fail on regression:
 
 ```bash
 python benchmark.py \
@@ -141,25 +41,15 @@ python benchmark.py \
   --baseline sample_results/mock_run.json \
   --max-p95-regression-pct 10 \
   --max-success-rate-drop 0.01 \
-  --fail-on-regression \
-  --prometheus
+  --fail-on-regression
 ```
 
-Run against a live Triton endpoint:
+## Sample output (mock backend)
 
-```bash
-pip install -r requirements.txt
-python benchmark.py \
-  --mode triton \
-  --server-url localhost:8000 \
-  --model-name resnet50_trt_fp16 \
-  --input-name input \
-  --input-shape 1,3,224,224 \
-  --num-requests 500 \
-  --concurrency 32
-```
-
-## Example Output
+The mock backend generates synthetic latencies so the harness can run in CI
+without a server. The numbers below are illustrative mock output, not a
+measurement of any real model or hardware. The committed fixture is
+[sample_results/mock_run.json](sample_results/mock_run.json).
 
 ```json
 {
@@ -179,24 +69,41 @@ python benchmark.py \
 }
 ```
 
+## Run against a real endpoint
+
+Point the harness at a live Triton HTTP server to measure real latency:
+
+```bash
+pip install -r requirements.txt
+python benchmark.py \
+  --mode triton \
+  --server-url localhost:8000 \
+  --model-name resnet50_trt_fp16 \
+  --input-name input \
+  --input-shape 1,3,224,224 \
+  --num-requests 500 \
+  --concurrency 32 \
+  --prometheus
+```
+
+In this mode every latency, throughput, and success-rate value comes from the
+server under test rather than the mock generator.
+
 ## Test
 
 ```bash
 python -m unittest discover -s tests
 ```
 
-## Design Notes
+## More
 
-See `DESIGN.md` for the benchmark model, tradeoffs, and production extensions.
+- `DESIGN.md` covers the benchmark model and production extensions.
+- `docs/OPERATIONS.md` covers regression triage and Prometheus export usage.
+- `deploy/kubernetes/benchmark-job.yaml` shows a cluster-run shape.
 
-## Engineering Notes
+## Roadmap
 
-This project covers benchmarking discipline, model-serving concepts, latency percentiles, failure accounting, Prometheus-compatible artifacts, release regression checks, and a clean path from local mock testing to live inference measurement.
-
-## Gaps Worth Closing Next
-
-- Add warmup windows and separate cold-start metrics.
-- Add payload profiles for chat, embeddings, vision, and long-context workloads.
-- Add distributed load generation for multi-client benchmarking.
-- Add threshold checks for correlated GPU utilization, queue depth, and server-side error counters.
-- Add approximate numeric tolerance policies alongside the exact batch-invariance fingerprint check.
+- Warmup windows and separate cold-start metrics.
+- Payload profiles for chat, embeddings, vision, and long-context workloads.
+- Distributed load generation for multi-client benchmarking.
+- Threshold checks for GPU utilization, queue depth, and server-side errors.
