@@ -15,6 +15,8 @@ inference endpoint.
 - Latency metrics: average, p50, p95, p99, min, max, plus throughput and success rate.
 - JSON output and Prometheus text export for trend tracking.
 - Baseline-versus-candidate comparison with p95 and success-rate gates.
+- Named workload profiles for interactive, long-context, and throughput traffic;
+  each records context, output, batch, TTFT, decode, and KV-cache assumptions.
 - Dependency-free mock backend for CI, and an optional Triton HTTP mode.
 
 ## Quick Start
@@ -30,6 +32,22 @@ Write JSON plus Prometheus text-format artifacts:
 ```bash
 python benchmark.py --mode mock --num-requests 500 --concurrency 32 --prometheus
 ```
+
+Run a workload-shaped qualification with explicit LLM serving assumptions:
+
+```bash
+python benchmark.py \
+  --mode mock \
+  --workload-profile long-context \
+  --num-requests 200 \
+  --concurrency 16 \
+  --prometheus
+```
+
+The named profiles are `interactive`, `long-context`, and `throughput`. They
+are transparent starting points for repeatable comparisons, not universal SLOs
+or measurements of a particular model. Explicit token and latency flags can
+override profile values when an operator has measured workload data.
 
 Compare a candidate run against a saved baseline and fail on regression:
 
@@ -104,6 +122,5 @@ python -m unittest discover -s tests
 ## Roadmap
 
 - Warmup windows and separate cold-start metrics.
-- Payload profiles for chat, embeddings, vision, and long-context workloads.
 - Distributed load generation for multi-client benchmarking.
 - Threshold checks for GPU utilization, queue depth, and server-side errors.

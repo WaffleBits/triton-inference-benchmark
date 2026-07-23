@@ -12,6 +12,28 @@ This benchmark is intended to produce repeatable evidence for model-serving chan
 6. Review p95 latency, success rate, throughput, failure count, queue time, and GPU utilization before promoting the candidate.
 7. When capacity inputs are known, compare token throughput and normalized cost under identical workload assumptions.
 
+## Workload Profiles
+
+Use `--workload-profile` when a run needs an explicit, repeatable serving shape:
+
+```bash
+python benchmark.py \
+  --mode triton \
+  --workload-profile interactive \
+  --server-url localhost:8000 \
+  --model-name my-model \
+  --num-requests 500 \
+  --concurrency 32 \
+  --prometheus
+```
+
+The built-in profiles are `interactive`, `long-context`, and `throughput`.
+They attach context length, generated-token count, logical decode batch, TTFT,
+inter-token latency, KV-cache, and byte-read assumptions to the result. They
+make baseline and candidate comparisons comparable across serving shapes; they
+do not replace measurements from the model or platform under test. Supply an
+explicit token or latency flag when measured values are available.
+
 Example:
 
 ```bash

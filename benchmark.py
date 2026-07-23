@@ -64,8 +64,59 @@ class LlmMetricsConfig:
 
 
 @dataclass(frozen=True)
+class WorkloadProfile:
+    name: str
+    description: str
+    context_tokens_per_request: int
+    output_tokens_per_request: int
+    batch_size: int
+    time_to_first_token_ms: float
+    inter_token_latency_ms: float
+    kv_cache_bytes_per_request: int
+    bytes_read_per_output_token: int
+
+
+WORKLOAD_PROFILES = {
+    "interactive": WorkloadProfile(
+        name="interactive",
+        description="Short-context, latency-sensitive assistant traffic.",
+        context_tokens_per_request=512,
+        output_tokens_per_request=128,
+        batch_size=1,
+        time_to_first_token_ms=80.0,
+        inter_token_latency_ms=25.0,
+        kv_cache_bytes_per_request=4 * 1024 * 1024,
+        bytes_read_per_output_token=4096,
+    ),
+    "long-context": WorkloadProfile(
+        name="long-context",
+        description="Long-context requests that stress prefill and KV capacity.",
+        context_tokens_per_request=32768,
+        output_tokens_per_request=256,
+        batch_size=4,
+        time_to_first_token_ms=450.0,
+        inter_token_latency_ms=35.0,
+        kv_cache_bytes_per_request=256 * 1024 * 1024,
+        bytes_read_per_output_token=16384,
+    ),
+    "throughput": WorkloadProfile(
+        name="throughput",
+        description="Higher-batch decode traffic for capacity qualification.",
+        context_tokens_per_request=2048,
+        output_tokens_per_request=512,
+        batch_size=16,
+        time_to_first_token_ms=180.0,
+        inter_token_latency_ms=18.0,
+        kv_cache_bytes_per_request=32 * 1024 * 1024,
+        bytes_read_per_output_token=8192,
+    ),
+}
+
+
+@dataclass(frozen=True)
 class CliOptions:
     config: BenchmarkConfig
+    workload_profile: WorkloadProfile | None = None
     cost_model_config: CostModelConfig | None = None
     llm_metrics_config: LlmMetricsConfig | None = None
     export_prometheus: bool = False
@@ -1294,6 +1345,16 @@ def build_client(config: BenchmarkConfig) -> InferenceClient:
     raise ValueError(f"Unsupported mode: {config.mode}")
 
 
+def resolve_workload_profile(name: str | None) -> WorkloadProfile | None:
+    if name is None:
+        return None
+    try:
+        return WORKLOAD_PROFILES[name]
+    except KeyError as exc:
+        choices = ", ".join(sorted(WORKLOAD_PROFILES))
+        raise ValueError(f"Unknown workload profile {name!r}; choose from {choices}") from exc
+
+
 def parse_shape(raw_shape: str) -> tuple[int, ...]:
     return tuple(int(part.strip()) for part in raw_shape.split(",") if part.strip())
 
@@ -1310,6 +1371,14 @@ def parse_args() -> CliOptions:
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--output-dir", default="benchmark_results")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--workload-profile",
+        choices=sorted(WORKLOAD_PROFILES),
+        help=(
+            "Apply a named, workload-shaped LLM profile. Explicit token and "
+            "latency flags override the profile values."
+        ),
+    )
     parser.add_argument(
         "--input-tokens-per-request",
         type=int,
@@ -1474,7 +1543,71 @@ def parse_args() -> CliOptions:
     ):
         parser.error("baseline and candidate quality scores must be supplied together")
 
-    cost_model_enabled = any(
+    workload_profile = resolve_workload_profile(args.workload_profile)
+    profile_defaults = workload_profile or WorkloadProfile(
+        name="",
+        description="",
+        context_tokens_per_request=0,
+        output_tokens_per_request=0,
+        batch_size=1,
+        time_to_first_token_ms=0.0,
+        inter_token_latency_ms=0.0,
+        kv_cache_bytes_per_request=0,
+        bytes_read_per_output_token=0,
+    )
+
+    def profile_value(explicit: object, default_value: object) -> object:
+        if workload_profile is None:
+            return explicit
+        if explicit is None or explicit == 0:
+            return default_value
+        return explicit
+
+    input_tokens_per_request = int(
+        profile_value(
+            args.input_tokens_per_request,
+            profile_defaults.context_tokens_per_request,
+        )
+    )
+    output_tokens_per_request = int(
+        profile_value(
+            args.output_tokens_per_request,
+            profile_defaults.output_tokens_per_request,
+        )
+    )
+    context_tokens_per_request = int(
+        profile_value(
+            args.context_tokens_per_request,
+            profile_defaults.context_tokens_per_request,
+        )
+    )
+    llm_batch_size = int(
+        workload_profile.batch_size
+        if workload_profile is not None and args.llm_batch_size == 1
+        else args.llm_batch_size
+    )
+    time_to_first_token_ms = profile_value(
+        args.time_to_first_token_ms,
+        profile_defaults.time_to_first_token_ms,
+    )
+    inter_token_latency_ms = profile_value(
+        args.inter_token_latency_ms,
+        profile_defaults.inter_token_latency_ms,
+    )
+    kv_cache_bytes_per_request = int(
+        profile_value(
+            args.kv_cache_bytes_per_request,
+            profile_defaults.kv_cache_bytes_per_request,
+        )
+    )
+    bytes_read_per_output_token = int(
+        profile_value(
+            args.bytes_read_per_output_token,
+            profile_defaults.bytes_read_per_output_token,
+        )
+    )
+
+    cost_model_enabled = workload_profile is not None or any(
         (
             args.input_tokens_per_request,
             args.output_tokens_per_request,
@@ -1483,7 +1616,7 @@ def parse_args() -> CliOptions:
             args.electricity_cost_usd_per_kwh,
         )
     )
-    llm_metrics_enabled = any(
+    llm_metrics_enabled = workload_profile is not None or any(
         (
             args.context_tokens_per_request,
             args.time_to_first_token_ms is not None,
@@ -1508,8 +1641,8 @@ def parse_args() -> CliOptions:
             seed=args.seed,
         ),
         cost_model_config=CostModelConfig(
-            input_tokens_per_request=args.input_tokens_per_request,
-            output_tokens_per_request=args.output_tokens_per_request,
+            input_tokens_per_request=input_tokens_per_request,
+            output_tokens_per_request=output_tokens_per_request,
             gpu_count=args.gpu_count,
             gpu_hourly_cost_usd=args.gpu_hourly_cost_usd,
             power_watts_per_gpu=args.power_watts_per_gpu,
@@ -1518,17 +1651,18 @@ def parse_args() -> CliOptions:
         if cost_model_enabled
         else None,
         llm_metrics_config=LlmMetricsConfig(
-            context_tokens_per_request=args.context_tokens_per_request,
-            batch_size=args.llm_batch_size,
-            time_to_first_token_ms=args.time_to_first_token_ms,
-            inter_token_latency_ms=args.inter_token_latency_ms,
-            kv_cache_bytes_per_request=args.kv_cache_bytes_per_request,
-            bytes_read_per_output_token=args.bytes_read_per_output_token,
+            context_tokens_per_request=context_tokens_per_request,
+            batch_size=llm_batch_size,
+            time_to_first_token_ms=time_to_first_token_ms,
+            inter_token_latency_ms=inter_token_latency_ms,
+            kv_cache_bytes_per_request=kv_cache_bytes_per_request,
+            bytes_read_per_output_token=bytes_read_per_output_token,
             baseline_quality_score=args.baseline_quality_score,
             candidate_quality_score=args.candidate_quality_score,
         )
         if llm_metrics_enabled
         else None,
+        workload_profile=workload_profile,
         export_prometheus=args.prometheus,
         telemetry_prometheus_path=args.telemetry_prometheus,
         batch_invariance_probes=args.batch_invariance_probes,
@@ -1545,6 +1679,8 @@ def main() -> None:
     config = options.config
     client = build_client(config)
     metrics = run_benchmark(client, config)
+    if options.workload_profile:
+        metrics["workload_profile"] = asdict(options.workload_profile)
     if options.cost_model_config:
         metrics["cost_model"] = build_cost_model(metrics, options.cost_model_config)
     if options.llm_metrics_config:
