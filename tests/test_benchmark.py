@@ -19,11 +19,34 @@ from benchmark import (
     percentile,
     run_batch_invariance_probe,
     run_benchmark,
+    resolve_workload_profile,
     summarize_results,
 )
 
 
 class BenchmarkHarnessTest(unittest.TestCase):
+    def test_workload_profiles_are_explicit_and_distinct(self) -> None:
+        interactive = resolve_workload_profile("interactive")
+        long_context = resolve_workload_profile("long-context")
+        throughput = resolve_workload_profile("throughput")
+
+        self.assertIsNotNone(interactive)
+        self.assertIsNotNone(long_context)
+        self.assertIsNotNone(throughput)
+        self.assertLess(
+            interactive.context_tokens_per_request,
+            long_context.context_tokens_per_request,
+        )
+        self.assertLess(interactive.batch_size, throughput.batch_size)
+        self.assertGreater(
+            long_context.kv_cache_bytes_per_request,
+            interactive.kv_cache_bytes_per_request,
+        )
+
+    def test_unknown_workload_profile_reports_choices(self) -> None:
+        with self.assertRaisesRegex(ValueError, "interactive"):
+            resolve_workload_profile("unknown")
+
     def test_triton_output_fingerprint_is_stable_across_metadata_order(self) -> None:
         class FakeDtype:
             hasobject = False
