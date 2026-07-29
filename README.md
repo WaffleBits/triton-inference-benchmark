@@ -17,7 +17,10 @@ inference endpoint.
 - Baseline-versus-candidate comparison with p95 and success-rate gates.
 - Named workload profiles for interactive, long-context, and throughput traffic;
   each records context, output, batch, TTFT, decode, and KV-cache assumptions.
-- Dependency-free mock backend for CI, and an optional Triton HTTP mode.
+- Dependency-free mock backend for CI, an optional Triton HTTP mode, and an
+  OpenAI-compatible streaming mode for vLLM/SGLang-style endpoints.
+- Measured streaming TTFT, inter-chunk latency, output bytes, and server-reported
+  output-token throughput without treating transport chunks as tokens.
 
 ## Quick Start
 
@@ -86,6 +89,42 @@ measurement of any real model or hardware. The committed fixture is
   }
 }
 ```
+
+## Run against an OpenAI-compatible LLM endpoint
+
+The streaming mode works with authorized vLLM, SGLang, or other compatible
+`/v1/completions` servers. Pass a server root, `/v1` URL, or full completions
+URL; the client normalizes all three forms. Bearer authentication is opt-in:
+the benchmark sends no `Authorization` header unless `--openai-api-key-env`
+explicitly names an environment variable.
+
+```bash
+export OPENAI_API_KEY="..."
+python benchmark.py \
+  --mode openai \
+  --server-url http://localhost:8000/v1 \
+  --model-name local-model \
+  --workload-profile interactive \
+  --num-requests 100 \
+  --concurrency 8 \
+  --openai-max-tokens 128 \
+  --openai-api-key-env OPENAI_API_KEY \
+  --prometheus
+```
+
+For an unauthenticated local server, omit both the export and
+`--openai-api-key-env`.
+
+The JSON and Prometheus outputs keep observed transport chunks separate from
+server-reported output tokens. They report end-to-end latency, measured TTFT,
+measured inter-chunk latency, output bytes, and token throughput only when every
+successful streamed response supplies usage data. With complete usage coverage,
+server-reported output tokens also replace configured estimates in the cost and
+logical LLM summaries. This prevents profile assumptions from being presented as
+measured throughput.
+
+The default prompt is synthetic; do not put production prompts, outputs,
+endpoint credentials, or private URLs in committed artifacts.
 
 ## Run against a real endpoint
 

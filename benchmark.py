@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import random
 import statistics
 import threading
 import time
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -27,6 +30,34 @@ TRITON_QUEUE_DURATION_METRICS = {"nv_inference_queue_duration_us"}
 TRITON_COMPUTE_INFER_DURATION_METRICS = {"nv_inference_compute_infer_duration_us"}
 
 
+def normalize_openai_completions_url(server_url: str) -> str:
+    """Return the OpenAI-compatible streaming completions endpoint."""
+    normalized = server_url.rstrip("/")
+    if normalized.endswith("/v1/completions"):
+        return normalized
+    if normalized.endswith("/v1"):
+        return f"{normalized}/completions"
+    return f"{normalized}/v1/completions"
+
+
+def sanitize_server_url(server_url: str) -> str:
+    """Remove credentials, query parameters, and fragments from persisted URLs."""
+    has_scheme = "://" in server_url
+    parsed = urllib.parse.urlsplit(server_url if has_scheme else f"//{server_url}")
+    if parsed.hostname is None:
+        return server_url.split("?", 1)[0].split("#", 1)[0].rsplit("@", 1)[-1]
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = hostname
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    sanitized = urllib.parse.urlunsplit(
+        (parsed.scheme, netloc, parsed.path, "", "")
+    )
+    return sanitized if has_scheme else sanitized.removeprefix("//")
+
+
 @dataclass(frozen=True)
 class BenchmarkConfig:
     mode: str = "mock"
@@ -39,6 +70,10 @@ class BenchmarkConfig:
     retries: int = 2
     output_dir: str = "benchmark_results"
     seed: int = 7
+    openai_prompt: str = "Return a short deterministic benchmark response."
+    openai_max_tokens: int = 128
+    openai_timeout_seconds: float = 60.0
+    openai_api_key_env: str = ""
 
 
 @dataclass(frozen=True)
@@ -130,10 +165,20 @@ class CliOptions:
 
 
 @dataclass(frozen=True)
+class StreamingInferenceObservation:
+    time_to_first_token_ms: float
+    inter_chunk_latency_ms: float
+    observed_output_chunks: int
+    reported_output_tokens: int | None
+    output_bytes: int
+
+
+@dataclass(frozen=True)
 class InferenceResult:
     ok: bool
     latency_ms: float
     error: str | None = None
+    streaming: StreamingInferenceObservation | None = None
 
 
 @dataclass(frozen=True)
@@ -153,7 +198,7 @@ class PrometheusSample:
 
 
 class InferenceClient(Protocol):
-    def infer(self) -> None:
+    def infer(self) -> StreamingInferenceObservation | None:
         """Execute one inference request or raise an exception."""
 
 
@@ -291,6 +336,107 @@ class TritonHttpInferenceClient:
         return client.infer(self.model_name, [request_input])
 
 
+class OpenAICompatibleStreamingClient:
+    """Streaming client for OpenAI-compatible text completion endpoints."""
+
+    def __init__(
+        self,
+        server_url: str,
+        model_name: str,
+        prompt: str,
+        max_tokens: int,
+        timeout_seconds: float,
+        api_key: str | None = None,
+    ) -> None:
+        self.endpoint_url = normalize_openai_completions_url(server_url)
+        self.model_name = model_name
+        self.prompt = prompt
+        self.max_tokens = max_tokens
+        self.timeout_seconds = timeout_seconds
+        self.api_key = api_key
+
+    def infer(self) -> StreamingInferenceObservation:
+        payload = json.dumps(
+            {
+                "model": self.model_name,
+                "prompt": self.prompt,
+                "max_tokens": self.max_tokens,
+                "temperature": 0,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        headers = {
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+            "User-Agent": "triton-inference-benchmark/1.0",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        request = urllib.request.Request(
+            self.endpoint_url,
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
+        started = time.perf_counter()
+        first_chunk_at: float | None = None
+        previous_chunk_at: float | None = None
+        inter_chunk_gaps_ms: list[float] = []
+        observed_output_chunks = 0
+        reported_output_tokens: int | None = None
+        output_bytes = 0
+
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8").strip()
+                if not line.startswith("data:"):
+                    continue
+                raw_event = line.removeprefix("data:").strip()
+                if raw_event == "[DONE]":
+                    break
+                if not raw_event:
+                    continue
+                event = json.loads(raw_event)
+                usage = event.get("usage")
+                if isinstance(usage, dict) and isinstance(
+                    usage.get("completion_tokens"), int
+                ):
+                    reported_output_tokens = usage["completion_tokens"]
+
+                choices = event.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    continue
+                choice = choices[0]
+                text = choice.get("text") if isinstance(choice, dict) else None
+                if not isinstance(text, str) or not text:
+                    continue
+
+                now = time.perf_counter()
+                if first_chunk_at is None:
+                    first_chunk_at = now
+                elif previous_chunk_at is not None:
+                    inter_chunk_gaps_ms.append((now - previous_chunk_at) * 1000)
+                previous_chunk_at = now
+                observed_output_chunks += 1
+                output_bytes += len(text.encode("utf-8"))
+
+        if first_chunk_at is None:
+            raise RuntimeError("stream completed without a non-empty text event")
+
+        return StreamingInferenceObservation(
+            time_to_first_token_ms=(first_chunk_at - started) * 1000,
+            inter_chunk_latency_ms=(
+                statistics.fmean(inter_chunk_gaps_ms) if inter_chunk_gaps_ms else 0.0
+            ),
+            observed_output_chunks=observed_output_chunks,
+            reported_output_tokens=reported_output_tokens,
+            output_bytes=output_bytes,
+        )
+
+
 def percentile(values: list[float], percentile_rank: float) -> float:
     if not values:
         return 0.0
@@ -310,9 +456,17 @@ def execute_with_retries(client: InferenceClient, retries: int) -> InferenceResu
 
     for _ in range(retries + 1):
         try:
-            client.infer()
+            observation = client.infer()
             latency_ms = (time.perf_counter() - start) * 1000
-            return InferenceResult(ok=True, latency_ms=latency_ms)
+            return InferenceResult(
+                ok=True,
+                latency_ms=latency_ms,
+                streaming=(
+                    observation
+                    if isinstance(observation, StreamingInferenceObservation)
+                    else None
+                ),
+            )
         except Exception as exc:  # noqa: BLE001 - benchmark harness records client failures.
             last_error = str(exc)
 
@@ -473,10 +627,20 @@ def summarize_results(
     failures = [result for result in results if not result.ok]
     successes = len(latencies)
     total = len(results)
+    persisted_config = asdict(config)
+    prompt = str(persisted_config.pop("openai_prompt", ""))
+    persisted_config["openai_prompt_bytes"] = len(prompt.encode("utf-8"))
+    persisted_config["openai_prompt_sha256"] = hashlib.sha256(
+        prompt.encode("utf-8")
+    ).hexdigest()
+    sanitized_server_url = sanitize_server_url(config.server_url)
+    persisted_config["server_url"] = sanitized_server_url
 
-    return {
+    summary: dict[str, object] = {
         "mode": config.mode,
-        "server_url": config.server_url if config.mode == "triton" else None,
+        "server_url": (
+            sanitized_server_url if config.mode in {"triton", "openai"} else None
+        ),
         "model_name": config.model_name,
         "num_requests": total,
         "concurrency": config.concurrency,
@@ -495,8 +659,79 @@ def summarize_results(
             "min": round(min(latencies), 4) if latencies else 0,
             "max": round(max(latencies), 4) if latencies else 0,
         },
-        "config": asdict(config),
+        "config": persisted_config,
     }
+
+    streaming = [
+        result.streaming
+        for result in results
+        if result.ok and result.streaming is not None
+    ]
+    if streaming:
+        ttft_values = [item.time_to_first_token_ms for item in streaming]
+        inter_chunk_values = [item.inter_chunk_latency_ms for item in streaming]
+        reported_tokens = [
+            item.reported_output_tokens
+            for item in streaming
+            if item.reported_output_tokens is not None
+        ]
+
+        def distribution(values: list[float]) -> dict[str, float]:
+            return {
+                "avg": round(statistics.fmean(values), 4),
+                "p50": round(percentile(values, 50), 4),
+                "p95": round(percentile(values, 95), 4),
+                "p99": round(percentile(values, 99), 4),
+                "min": round(min(values), 4),
+                "max": round(max(values), 4),
+            }
+
+        complete_token_usage = len(reported_tokens) == len(streaming)
+        total_reported_tokens = sum(reported_tokens)
+        summary["streaming"] = {
+            "request_count": len(streaming),
+            "reported_token_request_count": len(reported_tokens),
+            "missing_token_usage_requests": len(streaming) - len(reported_tokens),
+            "reported_output_tokens": total_reported_tokens,
+            "observed_output_chunks": sum(
+                item.observed_output_chunks for item in streaming
+            ),
+            "output_bytes": sum(item.output_bytes for item in streaming),
+            "output_tokens_per_second": round(
+                total_reported_tokens / duration_seconds,
+                4,
+            )
+            if complete_token_usage and duration_seconds > 0
+            else None,
+            "time_to_first_token_ms": distribution(ttft_values),
+            "inter_chunk_latency_ms": distribution(inter_chunk_values),
+            "claim_scope": {
+                "ttft": "measured to first non-empty streamed text event",
+                "inter_chunk": "mean gap between non-empty streamed text events per request",
+                "tokens": "server-reported usage only",
+                "chunks": "transport events; not treated as tokens",
+            },
+        }
+
+    return summary
+
+
+def _complete_streaming_output_tokens(metrics: dict[str, object]) -> int | None:
+    streaming = metrics.get("streaming")
+    if not isinstance(streaming, dict):
+        return None
+    request_count = streaming.get("request_count")
+    reported_count = streaming.get("reported_token_request_count")
+    output_tokens = streaming.get("reported_output_tokens")
+    if (
+        isinstance(request_count, int)
+        and request_count > 0
+        and reported_count == request_count
+        and isinstance(output_tokens, int)
+        and output_tokens >= 0
+    ):
+        return output_tokens
+    return None
 
 
 def build_cost_model(
@@ -508,7 +743,22 @@ def build_cost_model(
     duration_hours = duration_seconds / 3600
 
     input_tokens = successful_requests * config.input_tokens_per_request
-    output_tokens = successful_requests * config.output_tokens_per_request
+    measured_output_tokens = _complete_streaming_output_tokens(metrics)
+    output_tokens = (
+        measured_output_tokens
+        if measured_output_tokens is not None
+        else successful_requests * config.output_tokens_per_request
+    )
+    output_tokens_per_request = (
+        round(output_tokens / successful_requests, 4)
+        if successful_requests
+        else 0.0
+    )
+    output_tokens_source = (
+        "server-reported streaming usage"
+        if measured_output_tokens is not None
+        else "configured estimate"
+    )
     total_tokens = input_tokens + output_tokens
 
     accelerator_cost_usd = (
@@ -534,7 +784,8 @@ def build_cost_model(
         "estimate": True,
         "workload": {
             "input_tokens_per_request": config.input_tokens_per_request,
-            "output_tokens_per_request": config.output_tokens_per_request,
+            "output_tokens_per_request": output_tokens_per_request,
+            "output_tokens_source": output_tokens_source,
             "successful_input_tokens": input_tokens,
             "successful_output_tokens": output_tokens,
             "successful_total_tokens": total_tokens,
@@ -597,11 +848,46 @@ def build_llm_metrics(
 ) -> dict[str, object]:
     successful_requests = int(_number(dict(metrics), "successful_requests"))
     duration_seconds = _number(dict(metrics), "duration_seconds")
+    measured_output_tokens = _complete_streaming_output_tokens(metrics)
     output_tokens = (
-        successful_requests * cost_config.output_tokens_per_request
+        measured_output_tokens
+        if measured_output_tokens is not None
+        else successful_requests * cost_config.output_tokens_per_request
         if cost_config
         else 0
     )
+    measured_ttft = None
+    measured_inter_chunk = None
+    streaming = metrics.get("streaming")
+    if isinstance(streaming, dict):
+        ttft = streaming.get("time_to_first_token_ms")
+        inter_chunk = streaming.get("inter_chunk_latency_ms")
+        if isinstance(ttft, dict) and isinstance(ttft.get("avg"), (int, float)):
+            measured_ttft = float(ttft["avg"])
+        if isinstance(inter_chunk, dict) and isinstance(
+            inter_chunk.get("avg"), (int, float)
+        ):
+            measured_inter_chunk = float(inter_chunk["avg"])
+    if measured_ttft is not None and measured_inter_chunk is not None:
+        latency_source = (
+            "measured TTFT and inter-chunk; caller-provided inter-token latency"
+        )
+    elif measured_ttft is not None:
+        latency_source = "measured TTFT; caller-provided inter-token latency"
+    elif measured_inter_chunk is not None:
+        latency_source = "measured inter-chunk; caller-provided decode latency"
+    else:
+        latency_source = "caller-provided decode measurements"
+    latency_metrics: dict[str, float] = {
+        "time_to_first_token": (
+            measured_ttft
+            if measured_ttft is not None
+            else config.time_to_first_token_ms
+        ),
+        "inter_token": config.inter_token_latency_ms,
+    }
+    if measured_inter_chunk is not None:
+        latency_metrics["inter_chunk"] = measured_inter_chunk
     gpu_count = cost_config.gpu_count if cost_config else 1
     power_watts = cost_config.power_watts_per_gpu if cost_config else 0.0
     board_joules = gpu_count * power_watts * duration_seconds
@@ -624,10 +910,7 @@ def build_llm_metrics(
     return {
         "context_tokens_per_request": config.context_tokens_per_request,
         "batch_size": config.batch_size,
-        "latency_ms": {
-            "time_to_first_token": config.time_to_first_token_ms,
-            "inter_token": config.inter_token_latency_ms,
-        },
+        "latency_ms": latency_metrics,
         "throughput": {
             "output_tokens_per_second": round(output_tokens / duration_seconds, 4)
             if duration_seconds > 0
@@ -659,7 +942,7 @@ def build_llm_metrics(
             "relative_degradation_percent": quality_degradation_pct,
         },
         "claim_scope": {
-            "latency_source": "caller-provided decode measurements",
+            "latency_source": latency_source,
             "traffic": "logical bytes supplied by the benchmark operator",
             "energy": "board-power estimate without idle-power subtraction",
             "quality": "metric semantics are defined by the supplied evaluation",
@@ -1104,6 +1387,65 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
                 ]
             )
 
+    streaming = typed_metrics.get("streaming")
+    if isinstance(streaming, dict):
+        distribution_specs = [
+            (
+                "time_to_first_token_ms",
+                "triton_benchmark_streaming_ttft_ms",
+                "Measured time to first non-empty streamed text event.",
+            ),
+            (
+                "inter_chunk_latency_ms",
+                "triton_benchmark_streaming_inter_chunk_latency_ms",
+                "Measured gap between non-empty streamed text events.",
+            ),
+        ]
+        for source_key, metric_name, help_text in distribution_specs:
+            values = streaming.get(source_key)
+            if not isinstance(values, dict):
+                continue
+            lines.extend([f"# HELP {metric_name} {help_text}", f"# TYPE {metric_name} gauge"])
+            for stat in ("avg", "min", "max"):
+                value = values.get(stat)
+                if isinstance(value, (int, float)):
+                    lines.append(f'{metric_name}{{{labels},stat="{stat}"}} {value:g}')
+            for stat, quantile in (("p50", "0.50"), ("p95", "0.95"), ("p99", "0.99")):
+                value = values.get(stat)
+                if isinstance(value, (int, float)):
+                    lines.append(
+                        f'{metric_name}{{{labels},quantile="{quantile}"}} {value:g}'
+                    )
+
+        scalar_specs = [
+            (
+                "reported_output_tokens",
+                "triton_benchmark_streaming_reported_output_tokens_total",
+                "Server-reported output tokens across successful streaming requests.",
+            ),
+            (
+                "observed_output_chunks",
+                "triton_benchmark_streaming_observed_output_chunks_total",
+                "Observed non-empty streamed text events; chunks are not tokens.",
+            ),
+            (
+                "output_bytes",
+                "triton_benchmark_streaming_output_bytes_total",
+                "UTF-8 output bytes observed across successful streaming requests.",
+            ),
+            (
+                "output_tokens_per_second",
+                "triton_benchmark_streaming_output_tokens_per_second",
+                "Server-reported output-token throughput when usage coverage is complete.",
+            ),
+        ]
+        for source_key, metric_name, help_text in scalar_specs:
+            value = streaming.get(source_key)
+            if not isinstance(value, (int, float)):
+                continue
+            lines.extend([f"# HELP {metric_name} {help_text}", f"# TYPE {metric_name} gauge"])
+            lines.append(f"{metric_name}{{{labels}}} {value:g}")
+
     cost_model = typed_metrics.get("cost_model")
     if isinstance(cost_model, dict):
         workload_specs = [
@@ -1342,6 +1684,19 @@ def build_client(config: BenchmarkConfig) -> InferenceClient:
             input_name=config.input_name,
             input_shape=config.input_shape,
         )
+    if config.mode == "openai":
+        return OpenAICompatibleStreamingClient(
+            server_url=config.server_url,
+            model_name=config.model_name,
+            prompt=config.openai_prompt,
+            max_tokens=config.openai_max_tokens,
+            timeout_seconds=config.openai_timeout_seconds,
+            api_key=(
+                os.environ.get(config.openai_api_key_env)
+                if config.openai_api_key_env
+                else None
+            ),
+        )
     raise ValueError(f"Unsupported mode: {config.mode}")
 
 
@@ -1361,7 +1716,7 @@ def parse_shape(raw_shape: str) -> tuple[int, ...]:
 
 def parse_args() -> CliOptions:
     parser = argparse.ArgumentParser(description="Benchmark Triton-style inference workloads.")
-    parser.add_argument("--mode", choices=["mock", "triton"], default="mock")
+    parser.add_argument("--mode", choices=["mock", "triton", "openai"], default="mock")
     parser.add_argument("--server-url", default="localhost:8000")
     parser.add_argument("--model-name", default="resnet50_trt_fp16")
     parser.add_argument("--input-name", default="input")
@@ -1371,6 +1726,28 @@ def parse_args() -> CliOptions:
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--output-dir", default="benchmark_results")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--openai-prompt",
+        default="Return a short deterministic benchmark response.",
+        help="Synthetic prompt used only by OpenAI-compatible streaming mode.",
+    )
+    parser.add_argument(
+        "--openai-max-tokens",
+        type=int,
+        default=0,
+        help="Maximum streamed output tokens; defaults to the workload profile or 128.",
+    )
+    parser.add_argument(
+        "--openai-timeout-seconds",
+        type=float,
+        default=60.0,
+        help="Per-request timeout for OpenAI-compatible streaming mode.",
+    )
+    parser.add_argument(
+        "--openai-api-key-env",
+        default="",
+        help="Optional environment variable containing a bearer token.",
+    )
     parser.add_argument(
         "--workload-profile",
         choices=sorted(WORKLOAD_PROFILES),
@@ -1513,6 +1890,14 @@ def parse_args() -> CliOptions:
         parser.error("--batch-invariance-probes requires --concurrency greater than one")
     if args.fail_on_batch_variance and not args.batch_invariance_probes:
         parser.error("--fail-on-batch-variance requires --batch-invariance-probes")
+    if args.mode == "openai" and args.batch_invariance_probes:
+        parser.error("batch-invariance probes are not supported in openai mode")
+    if not args.openai_prompt.strip():
+        parser.error("--openai-prompt must not be empty")
+    if args.openai_max_tokens < 0:
+        parser.error("--openai-max-tokens must be zero or greater")
+    if args.openai_timeout_seconds <= 0:
+        parser.error("--openai-timeout-seconds must be greater than zero")
     if args.input_tokens_per_request < 0 or args.output_tokens_per_request < 0:
         parser.error("token counts must be zero or greater")
     if args.gpu_count <= 0:
@@ -1606,6 +1991,9 @@ def parse_args() -> CliOptions:
             profile_defaults.bytes_read_per_output_token,
         )
     )
+    openai_max_tokens = (
+        args.openai_max_tokens or output_tokens_per_request or 128
+    )
 
     cost_model_enabled = workload_profile is not None or any(
         (
@@ -1639,6 +2027,10 @@ def parse_args() -> CliOptions:
             retries=args.retries,
             output_dir=args.output_dir,
             seed=args.seed,
+            openai_prompt=args.openai_prompt,
+            openai_max_tokens=openai_max_tokens,
+            openai_timeout_seconds=args.openai_timeout_seconds,
+            openai_api_key_env=args.openai_api_key_env,
         ),
         cost_model_config=CostModelConfig(
             input_tokens_per_request=input_tokens_per_request,

@@ -17,7 +17,8 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Latency percentile reporting for p50, p95, and p99.
 - Throughput and success-rate accounting under configurable concurrency.
 - A CI-friendly mock mode that keeps the repo reviewable without GPU hardware.
-- A live HTTP path that can be connected to real model-serving infrastructure.
+- A live Triton HTTP path and an OpenAI-compatible streaming path for authorized model-serving infrastructure.
+- Measured streaming TTFT, inter-chunk latency, output bytes, and server-reported token throughput with explicit usage coverage.
 - Prometheus-compatible benchmark artifacts for dashboard and CI ingestion.
 - Baseline-versus-candidate comparison with explicit regression reasons.
 - Correlated server telemetry for GPU utilization, memory pressure, queue time, and Triton counters.

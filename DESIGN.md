@@ -6,8 +6,9 @@ The benchmark separates the harness from the inference client:
 
 - `MockInferenceClient` provides a deterministic, dependency-free workload for CI.
 - `TritonHttpInferenceClient` calls a live Triton-compatible inference server over HTTP.
+- `OpenAICompatibleStreamingClient` calls an authorized OpenAI-compatible completion endpoint and measures streamed text events.
 - `run_benchmark` owns concurrency, retries, timing, and result collection.
-- `summarize_results` owns percentile, throughput, and success-rate calculation.
+- `summarize_results` owns percentile, throughput, success-rate, and streaming aggregation.
 
 This keeps the core logic testable without requiring a GPU, a running model server, or a CUDA runtime.
 Live HTTP workers use thread-local Triton clients because the upstream Python HTTP client is not thread-safe.
@@ -45,17 +46,24 @@ an accounting claim.
 
 ## LLM Decode Metrics
 
-The optional LLM record keeps model-serving metrics that cannot be derived from
-whole-request latency alone: time to first token, inter-token latency, logical
-context and batch size, KV-cache footprint, bytes read per output token,
-estimated joules per output token, and same-evaluation quality delta.
+OpenAI-compatible streaming mode measures time to the first non-empty text
+event, the gap between subsequent non-empty events, output bytes, and transport
+chunk count. It uses `usage.completion_tokens` when the server supplies it and
+only reports output-token throughput when every successful request includes
+usage. Chunks remain a separate transport metric because one SSE event is not
+necessarily one token.
+
+The optional logical LLM record remains available for values that cannot be
+inferred from a generic endpoint: context size, decode batch, KV-cache footprint,
+bytes read per output token, estimated joules per output token, and same-evaluation
+quality delta. Triton and mock runs may also accept caller-supplied TTFT and
+inter-token latency when an external measurement exists. Those values remain
+labeled as caller-provided rather than measured by the generic Triton client.
 
 Token throughput and requests per GPU-hour reuse the cost-model token counts and
 benchmark wall time. Energy uses configured average GPU board power multiplied
 by wall time; it does not subtract idle power. Memory traffic is caller-supplied
-logical traffic unless a separate hardware-counter artifact is attached. TTFT
-and inter-token latency are caller-supplied because the generic Triton request
-client does not observe per-token streaming events.
+logical traffic unless a separate hardware-counter artifact is attached.
 
 ## Batch-Invariance Probe
 

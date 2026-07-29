@@ -56,6 +56,34 @@ python benchmark.py \
   --prometheus
 ```
 
+## OpenAI-Compatible Streaming Runs
+
+Use `--mode openai` for an authorized vLLM, SGLang, or compatible completion
+endpoint. Authentication is opt-in: the API key is read only from the environment
+variable explicitly named by `--openai-api-key-env`; it is never accepted as a CLI
+value or written to the result. Omitting the flag sends no `Authorization` header.
+
+```bash
+export OPENAI_API_KEY="..."
+python benchmark.py \
+  --mode openai \
+  --server-url http://localhost:8000/v1 \
+  --model-name local-model \
+  --workload-profile interactive \
+  --num-requests 100 \
+  --concurrency 8 \
+  --openai-timeout-seconds 60 \
+  --prometheus
+```
+
+Review TTFT and inter-chunk p95/p99 alongside end-to-end latency and success
+rate. Output-token throughput is valid only when all successful requests return
+server usage. `observed_output_chunks` is diagnostic transport evidence and
+must not be interpreted as a token count.
+
+Do not run batch-invariance probes in this mode. The streaming client does not
+yet fingerprint deterministic outputs, and the CLI rejects that combination.
+
 ## SLO-Oriented Checks
 
 For a production-style inference service, the benchmark output should be reviewed against service goals such as:
