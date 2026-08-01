@@ -7,11 +7,24 @@ The benchmark separates the harness from the inference client:
 - `MockInferenceClient` provides a deterministic, dependency-free workload for CI.
 - `TritonHttpInferenceClient` calls a live Triton-compatible inference server over HTTP.
 - `OpenAICompatibleStreamingClient` calls an authorized OpenAI-compatible completion endpoint and measures streamed text events.
-- `run_benchmark` owns concurrency, retries, timing, and result collection.
+- `run_benchmark` owns phase ordering, concurrency, retries, timing, and result collection.
 - `summarize_results` owns percentile, throughput, success-rate, and streaming aggregation.
 
 This keeps the core logic testable without requiring a GPU, a running model server, or a CUDA runtime.
 Live HTTP workers use thread-local Triton clients because the upstream Python HTTP client is not thread-safe.
+
+## Measurement Phases
+
+`--warmup-requests` executes a complete pre-measurement phase through the same
+client, worker pool width, and retry policy as the measured phase. The JSON and
+Prometheus artifacts preserve warmup outcomes, duration, throughput, and latency
+separately. Existing top-level metrics, streaming aggregation, baseline gates,
+and cost models use only measured requests.
+
+The phase is deliberately named warmup rather than cold start. The harness does
+not restart a model server, reload weights, flush accelerator state, or prove
+that a remote endpoint was cold. A future controlled cold-start feature needs
+explicit server-lifecycle hooks instead of inferring state from request order.
 
 ## Metrics
 
@@ -34,11 +47,13 @@ The model records input/output tokens per successful request, token throughput,
 requests per GPU-hour, GPU-time cost, optional electricity cost, and normalized
 cost per million requests or tokens.
 
-GPU capacity is charged for the complete benchmark wall-clock duration, including
-time spent on failed requests. Token totals count successful requests only. This
-keeps failures visible as consumed capacity without crediting them as delivered
-work. GPU hourly price and electricity are separate inputs because cloud prices
-usually bundle facility power while owned-capacity models may not.
+GPU capacity is charged for the measured request-phase wall-clock duration,
+including time spent on failed measured requests. A configured warmup phase is
+reported separately and excluded. Token totals count successful measured
+requests only. This keeps measured failures visible as consumed capacity without
+crediting them as delivered work. GPU hourly price and electricity are separate
+inputs because cloud prices usually bundle facility power while owned-capacity
+models may not.
 
 The report excludes CPU, network, storage, idle fleet headroom, and engineering
 costs. It is a transparent scenario model for comparing like-for-like runs, not
@@ -96,7 +111,7 @@ AI infrastructure repos often fail basic review because they cannot run without 
 
 ## Production Extensions
 
-- Add warmup windows and separate cold-start metrics.
+- Add server-lifecycle hooks for controlled cold-start measurements.
 - Add request payload profiles by model family.
 - Add threshold checks for correlated GPU telemetry and queue depth.
 - Add distributed load generation across multiple clients.

@@ -11,6 +11,9 @@ inference endpoint.
 ## Features
 
 - Concurrent load generation with configurable request and worker counts.
+- Optional phase-separated warmup requests with their own outcomes, latency,
+  throughput, JSON, and Prometheus records; headline and cost metrics remain
+  scoped to the measured phase.
 - Retry-aware request execution with failure accounting.
 - Latency metrics: average, p50, p95, p99, min, max, plus throughput and success rate.
 - JSON output and Prometheus text export for trend tracking.
@@ -51,6 +54,23 @@ The named profiles are `interactive`, `long-context`, and `throughput`. They
 are transparent starting points for repeatable comparisons, not universal SLOs
 or measurements of a particular model. Explicit token and latency flags can
 override profile values when an operator has measured workload data.
+
+Precondition the serving path before the measured request window:
+
+```bash
+python benchmark.py \
+  --mode mock \
+  --warmup-requests 20 \
+  --num-requests 200 \
+  --concurrency 16 \
+  --prometheus
+```
+
+Warmup requests use the same client, concurrency, and retry policy, but their
+outcomes and latency distribution are reported under a separate `warmup`
+record. They do not contribute to headline latency, throughput, streaming-token,
+regression, or cost calculations. This phase preconditions a serving path; it
+does not prove a process, model, or accelerator cold start.
 
 Compare a candidate run against a saved baseline and fail on regression:
 
@@ -160,6 +180,6 @@ python -m unittest discover -s tests
 
 ## Roadmap
 
-- Warmup windows and separate cold-start metrics.
+- Server-lifecycle hooks for controlled cold-start measurements.
 - Distributed load generation for multi-client benchmarking.
 - Threshold checks for GPU utilization, queue depth, and server-side errors.

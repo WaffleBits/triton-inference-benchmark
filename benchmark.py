@@ -65,6 +65,7 @@ class BenchmarkConfig:
     model_name: str = "resnet50_trt_fp16"
     input_name: str = "input"
     input_shape: tuple[int, ...] = (1, 3, 224, 224)
+    warmup_requests: int = 0
     num_requests: int = 200
     concurrency: int = 10
     retries: int = 2
@@ -602,20 +603,86 @@ def run_batch_invariance_probe(
     }
 
 
-def run_benchmark(client: InferenceClient, config: BenchmarkConfig) -> dict[str, object]:
+def _run_request_phase(
+    client: InferenceClient,
+    request_count: int,
+    concurrency: int,
+    retries: int,
+) -> tuple[list[InferenceResult], float]:
     start = time.perf_counter()
     results: list[InferenceResult] = []
 
-    with ThreadPoolExecutor(max_workers=config.concurrency) as executor:
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = [
-            executor.submit(execute_with_retries, client, config.retries)
-            for _ in range(config.num_requests)
+            executor.submit(execute_with_retries, client, retries)
+            for _ in range(request_count)
         ]
         for future in as_completed(futures):
             results.append(future.result())
 
     duration_seconds = time.perf_counter() - start
-    return summarize_results(results, duration_seconds, config)
+    return results, duration_seconds
+
+
+def _summarize_request_phase(
+    results: list[InferenceResult],
+    duration_seconds: float,
+) -> dict[str, object]:
+    latencies = [result.latency_ms for result in results if result.ok]
+    successes = len(latencies)
+    total = len(results)
+    return {
+        "request_count": total,
+        "duration_seconds": round(duration_seconds, 4),
+        "successful_requests": successes,
+        "failed_requests": total - successes,
+        "success_rate": round(successes / total, 4) if total else 0,
+        "throughput_rps": round(successes / duration_seconds, 4)
+        if duration_seconds > 0
+        else 0,
+        "latency_ms": {
+            "avg": round(statistics.fmean(latencies), 4) if latencies else 0,
+            "p50": round(percentile(latencies, 50), 4),
+            "p95": round(percentile(latencies, 95), 4),
+            "p99": round(percentile(latencies, 99), 4),
+            "min": round(min(latencies), 4) if latencies else 0,
+            "max": round(max(latencies), 4) if latencies else 0,
+        },
+    }
+
+
+def run_benchmark(client: InferenceClient, config: BenchmarkConfig) -> dict[str, object]:
+    warmup_results: list[InferenceResult] = []
+    warmup_duration_seconds = 0.0
+    if config.warmup_requests:
+        warmup_results, warmup_duration_seconds = _run_request_phase(
+            client,
+            request_count=config.warmup_requests,
+            concurrency=config.concurrency,
+            retries=config.retries,
+        )
+
+    results, duration_seconds = _run_request_phase(
+        client,
+        request_count=config.num_requests,
+        concurrency=config.concurrency,
+        retries=config.retries,
+    )
+    summary = summarize_results(results, duration_seconds, config)
+    summary["measurement_scope"] = {
+        "headline_phase": "measured requests",
+        "warmup_excluded": bool(config.warmup_requests),
+        "note": (
+            "Warmup requests precondition the client and server path; they do not "
+            "establish a process, model, or accelerator cold-start measurement."
+        ),
+    }
+    if warmup_results:
+        summary["warmup"] = _summarize_request_phase(
+            warmup_results,
+            warmup_duration_seconds,
+        )
+    return summary
 
 
 def summarize_results(
@@ -833,7 +900,7 @@ def build_cost_model(
             ),
         },
         "assumptions": [
-            "GPU capacity is reserved for the full benchmark wall-clock duration.",
+            "GPU capacity is reserved for the measured request-phase wall-clock duration; configured warmup is excluded.",
             "Token counts describe successful requests only.",
             "GPU hourly price and electricity are additive when both are configured.",
             "Network, storage, CPU, idle fleet, and engineering costs are excluded.",
@@ -1270,6 +1337,56 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
         "# TYPE triton_benchmark_retries gauge",
         f"triton_benchmark_retries{{{labels}}} {_config_number(typed_metrics, 'retries'):g}",
     ]
+
+    warmup = typed_metrics.get("warmup")
+    if isinstance(warmup, dict):
+        warmup_labels = f'{labels},phase="warmup"'
+        lines.extend(
+            [
+                "# HELP triton_benchmark_warmup_requests_total Warmup requests by outcome; excluded from headline benchmark results.",
+                "# TYPE triton_benchmark_warmup_requests_total counter",
+                (
+                    f'triton_benchmark_warmup_requests_total{{{warmup_labels},outcome="success"}} '
+                    f'{_number(warmup, "successful_requests"):g}'
+                ),
+                (
+                    f'triton_benchmark_warmup_requests_total{{{warmup_labels},outcome="failure"}} '
+                    f'{_number(warmup, "failed_requests"):g}'
+                ),
+                "# HELP triton_benchmark_warmup_duration_seconds Warmup phase wall-clock duration.",
+                "# TYPE triton_benchmark_warmup_duration_seconds gauge",
+                (
+                    f"triton_benchmark_warmup_duration_seconds{{{warmup_labels}}} "
+                    f'{_number(warmup, "duration_seconds"):g}'
+                ),
+                "# HELP triton_benchmark_warmup_throughput_rps Successful warmup requests per second.",
+                "# TYPE triton_benchmark_warmup_throughput_rps gauge",
+                (
+                    f"triton_benchmark_warmup_throughput_rps{{{warmup_labels}}} "
+                    f'{_number(warmup, "throughput_rps"):g}'
+                ),
+                "# HELP triton_benchmark_warmup_latency_ms End-to-end successful warmup request latency.",
+                "# TYPE triton_benchmark_warmup_latency_ms gauge",
+            ]
+        )
+        warmup_latency = warmup.get("latency_ms")
+        if isinstance(warmup_latency, dict):
+            for stat in ("avg", "min", "max"):
+                value = warmup_latency.get(stat)
+                if isinstance(value, (int, float)):
+                    lines.append(
+                        f'triton_benchmark_warmup_latency_ms{{{warmup_labels},stat="{stat}"}} {value:g}'
+                    )
+            for stat, quantile in (
+                ("p50", "0.50"),
+                ("p95", "0.95"),
+                ("p99", "0.99"),
+            ):
+                value = warmup_latency.get(stat)
+                if isinstance(value, (int, float)):
+                    lines.append(
+                        f'triton_benchmark_warmup_latency_ms{{{warmup_labels},quantile="{quantile}"}} {value:g}'
+                    )
 
     telemetry = typed_metrics.get("telemetry")
     if isinstance(telemetry, dict):
@@ -1721,6 +1838,15 @@ def parse_args() -> CliOptions:
     parser.add_argument("--model-name", default="resnet50_trt_fp16")
     parser.add_argument("--input-name", default="input")
     parser.add_argument("--input-shape", default="1,3,224,224")
+    parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=0,
+        help=(
+            "Requests run before the measured phase and reported separately; "
+            "they are excluded from headline metrics and cost calculations."
+        ),
+    )
     parser.add_argument("--num-requests", type=int, default=200)
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--retries", type=int, default=2)
@@ -1884,6 +2010,8 @@ def parse_args() -> CliOptions:
         help="Exit with status 3 when any batch-invariance probe fails or changes output.",
     )
     args = parser.parse_args()
+    if args.warmup_requests < 0:
+        parser.error("--warmup-requests must be zero or greater")
     if args.batch_invariance_probes < 0:
         parser.error("--batch-invariance-probes must be zero or greater")
     if args.batch_invariance_probes and args.concurrency <= 1:
@@ -2022,6 +2150,7 @@ def parse_args() -> CliOptions:
             model_name=args.model_name,
             input_name=args.input_name,
             input_shape=parse_shape(args.input_shape),
+            warmup_requests=args.warmup_requests,
             num_requests=args.num_requests,
             concurrency=args.concurrency,
             retries=args.retries,

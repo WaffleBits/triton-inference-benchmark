@@ -25,6 +25,7 @@ jobs:
         run: >-
           python benchmark.py
           --mode mock
+          --warmup-requests 4
           --num-requests 20
           --concurrency 4
           --batch-invariance-probes 8

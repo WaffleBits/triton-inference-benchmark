@@ -6,7 +6,7 @@ This benchmark is intended to produce repeatable evidence for model-serving chan
 
 1. Run a baseline benchmark against the current model or serving image.
 2. Save the JSON result as the comparison baseline.
-3. Run the candidate benchmark with the same request count, concurrency, payload shape, and retry settings.
+3. Run the candidate benchmark with the same warmup count, measured request count, concurrency, payload shape, and retry settings.
 4. If available, scrape a Triton/DCGM Prometheus snapshot close to the run.
 5. Export JSON and Prometheus text artifacts.
 6. Review p95 latency, success rate, throughput, failure count, queue time, and GPU utilization before promoting the candidate.
@@ -40,6 +40,7 @@ Example:
 python benchmark.py --mode mock --num-requests 500 --concurrency 32 --prometheus
 python benchmark.py \
   --mode mock \
+  --warmup-requests 32 \
   --num-requests 500 \
   --concurrency 32 \
   --batch-invariance-probes 16 \
@@ -55,6 +56,26 @@ python benchmark.py \
   --fail-on-regression \
   --prometheus
 ```
+
+## Warmup Phase
+
+Use `--warmup-requests` to precondition the same request path before headline
+measurement begins. The warmup phase completes before measured work is
+submitted. Its success rate, throughput, and latency distribution are saved in
+the JSON `warmup` object and in `triton_benchmark_warmup_*` Prometheus metrics.
+
+Warmup requests are excluded from:
+
+- top-level latency, success rate, and throughput
+- streaming token and TTFT aggregation
+- cost and energy estimates
+- baseline regression comparisons
+
+Keep the warmup count identical between a baseline and candidate. Investigate
+warmup failures even though they do not contaminate the measured result. Do not
+call the first warmup request a cold-start measurement unless an external
+lifecycle controller actually restarts the server, reloads the model, and
+records that boundary.
 
 ## OpenAI-Compatible Streaming Runs
 
@@ -107,6 +128,7 @@ Use `--prometheus` to write a `.prom` file next to the JSON result. The text-for
 - throughput
 - latency gauges for average, min, max, p50, p95, and p99
 - configured concurrency and retry count
+- separate warmup outcomes, duration, throughput, and latency when configured
 
 The artifact can be pushed to a metrics gateway, archived by CI, or scraped from a shared results volume.
 

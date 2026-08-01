@@ -17,6 +17,8 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Latency percentile reporting for p50, p95, and p99.
 - Throughput and success-rate accounting under configurable concurrency.
 - A CI-friendly mock mode that keeps the repo reviewable without GPU hardware.
+- Phase-separated warmup evidence that is excluded from measured latency,
+  throughput, regression, streaming-token, and cost results.
 - A live Triton HTTP path and an OpenAI-compatible streaming path for authorized model-serving infrastructure.
 - Measured streaming TTFT, inter-chunk latency, output bytes, and server-reported token throughput with explicit usage coverage.
 - Prometheus-compatible benchmark artifacts for dashboard and CI ingestion.
@@ -35,7 +37,7 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 
 ## Gaps Worth Closing Next
 
-- Add warmup, cold-start, and steady-state separation.
+- Add controlled server-lifecycle hooks for defensible cold-start measurements.
 - Add distributed load generation across multiple clients.
 - Add saved benchmark reports with trend comparisons over time.
 - Add threshold checks for server-side telemetry and batching behavior.

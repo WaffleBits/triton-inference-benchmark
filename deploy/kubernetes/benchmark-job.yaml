@@ -25,6 +25,8 @@ spec:
             - "triton.default.svc.cluster.local:8000"
             - "--model-name"
             - "resnet50_trt_fp16"
+            - "--warmup-requests"
+            - "32"
             - "--input-name"
             - "input"
             - "--input-shape"

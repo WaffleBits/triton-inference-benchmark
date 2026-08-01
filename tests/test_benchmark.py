@@ -1,6 +1,7 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, local
+from unittest.mock import patch
 
 from benchmark import (
     BenchmarkConfig,
@@ -15,6 +16,7 @@ from benchmark import (
     build_telemetry_summary,
     fingerprint_triton_outputs,
     format_prometheus_metrics,
+    parse_args,
     parse_prometheus_samples,
     percentile,
     run_batch_invariance_probe,
@@ -179,6 +181,42 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertEqual(metrics["failed_requests"], 0)
         self.assertGreater(metrics["throughput_rps"], 0)
 
+    def test_warmup_requests_run_before_and_stay_out_of_measured_results(self) -> None:
+        class CountingClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def infer(self) -> None:
+                self.calls += 1
+
+        client = CountingClient()
+        config = BenchmarkConfig(
+            mode="mock",
+            warmup_requests=2,
+            num_requests=3,
+            concurrency=1,
+            retries=0,
+        )
+
+        metrics = run_benchmark(client, config)
+
+        self.assertEqual(client.calls, 5)
+        self.assertEqual(metrics["num_requests"], 3)
+        self.assertEqual(metrics["successful_requests"], 3)
+        self.assertEqual(metrics["warmup"]["request_count"], 2)
+        self.assertEqual(metrics["warmup"]["successful_requests"], 2)
+        self.assertTrue(metrics["measurement_scope"]["warmup_excluded"])
+
+    def test_parses_warmup_request_count(self) -> None:
+        with patch(
+            "sys.argv",
+            ["benchmark.py", "--warmup-requests", "7", "--num-requests", "3"],
+        ):
+            options = parse_args()
+
+        self.assertEqual(options.config.warmup_requests, 7)
+        self.assertEqual(options.config.num_requests, 3)
+
     def test_cost_model_normalizes_gpu_time_and_successful_tokens(self) -> None:
         cost_model = build_cost_model(
             {
@@ -335,6 +373,50 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertIn('outcome="success"} 1', output)
         self.assertIn('outcome="failure"} 1', output)
         self.assertIn('quantile="0.95"} 10', output)
+
+    def test_prometheus_export_keeps_warmup_metrics_separate(self) -> None:
+        metrics = {
+            "mode": "mock",
+            "model_name": "review-model",
+            "num_requests": 1,
+            "successful_requests": 1,
+            "failed_requests": 0,
+            "success_rate": 1.0,
+            "duration_seconds": 0.5,
+            "throughput_rps": 2.0,
+            "latency_ms": {
+                "avg": 10.0,
+                "p50": 10.0,
+                "p95": 10.0,
+                "p99": 10.0,
+                "min": 10.0,
+                "max": 10.0,
+            },
+            "config": {"concurrency": 1, "retries": 0, "warmup_requests": 2},
+            "warmup": {
+                "request_count": 2,
+                "successful_requests": 2,
+                "failed_requests": 0,
+                "success_rate": 1.0,
+                "duration_seconds": 0.25,
+                "throughput_rps": 8.0,
+                "latency_ms": {
+                    "avg": 4.0,
+                    "p50": 4.0,
+                    "p95": 5.0,
+                    "p99": 5.0,
+                    "min": 3.0,
+                    "max": 5.0,
+                },
+            },
+        }
+
+        output = format_prometheus_metrics(metrics)
+
+        self.assertIn("triton_benchmark_warmup_requests_total", output)
+        self.assertIn('phase="warmup",outcome="success"} 2', output)
+        self.assertIn("triton_benchmark_warmup_duration_seconds", output)
+        self.assertIn('phase="warmup",quantile="0.95"} 5', output)
 
     def test_prometheus_export_includes_batch_invariance_metrics(self) -> None:
         config = BenchmarkConfig(num_requests=1, concurrency=2)
