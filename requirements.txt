@@ -1,2 +1,7 @@
 numpy>=1.26.0
-tritonclient[http]>=2.44.0
+# Pin the signed upstream 2.7.0 wheel because the configured package index still
+# serves vulnerable 2.6.3; the URL hash matches the release asset digest.
+urllib3 @ https://github.com/urllib3/urllib3/releases/download/2.7.0/urllib3-2.7.0-py3-none-any.whl#sha256=9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
+# The harness uses tritonclient.http's synchronous path; avoid its unused aiohttp extra.
+tritonclient>=2.44.0
+geventhttpclient>=2.3.3

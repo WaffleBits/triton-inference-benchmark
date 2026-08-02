@@ -8,7 +8,8 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - `tests/`: validation for metrics, success accounting, and benchmark behavior.
 - `DESIGN.md`: benchmark model, tradeoffs, and production extension plan.
 - `docs/OPERATIONS.md`: regression triage, Prometheus artifact usage, and SLO-oriented review notes.
-- `sample_results/mock_telemetry.prom`: synthetic Triton/DCGM snapshot for telemetry-correlation review.
+- `sample_results/mock_telemetry_before.prom` and `mock_telemetry.prom`:
+  synthetic paired Triton/DCGM snapshots for counter-window review.
 - `deploy/kubernetes/benchmark-job.yaml`: cluster-local benchmark execution shape.
 
 ## What This Demonstrates
@@ -24,6 +25,8 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Prometheus-compatible benchmark artifacts for dashboard and CI ingestion.
 - Baseline-versus-candidate comparison with explicit regression reasons.
 - Correlated server telemetry for GPU utilization, memory pressure, queue time, and Triton counters.
+- Fail-closed server failure-rate and queue-fraction gates derived from paired
+  cumulative counters, with aggregate-decrease and missing-family detection.
 - Exact-output batch-invariance testing under concurrent noise traffic.
 - Token-throughput, GPU-capacity, energy, and normalized cost-to-serve estimates with explicit assumptions.
 - Kubernetes job posture with non-root runtime settings.
@@ -40,5 +43,5 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Add controlled server-lifecycle hooks for defensible cold-start measurements.
 - Add distributed load generation across multiple clients.
 - Add saved benchmark reports with trend comparisons over time.
-- Add threshold checks for server-side telemetry and batching behavior.
+- Add automated bracketed telemetry capture and GPU gauge-window aggregation.
 - Add model-aware numeric tolerance policies for outputs that do not promise bitwise determinism.

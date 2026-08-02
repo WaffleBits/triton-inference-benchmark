@@ -1,5 +1,8 @@
+import json
+import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Barrier, local
 from unittest.mock import patch
 
@@ -10,9 +13,12 @@ from benchmark import (
     LlmMetricsConfig,
     MockInferenceClient,
     TritonHttpInferenceClient,
+    attach_telemetry_summary,
     build_cost_model,
     build_llm_metrics,
     build_regression_report,
+    build_telemetry_counter_window,
+    build_telemetry_gate,
     build_telemetry_summary,
     fingerprint_triton_outputs,
     format_prometheus_metrics,
@@ -570,6 +576,135 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertEqual(summary["triton"]["queue_duration_us_total"], 4300.0)
         self.assertEqual(summary["triton"]["compute_infer_duration_us_total"], 0)
 
+    def test_telemetry_counter_window_derives_observed_window_rates(self) -> None:
+        before = build_telemetry_summary(
+            """
+            nv_inference_request_success{model="review-model"} 400
+            nv_inference_request_failure{model="review-model"} 0
+            nv_inference_request_duration_us{model="review-model"} 9400000
+            nv_inference_queue_duration_us{model="review-model"} 210000
+            nv_inference_compute_infer_duration_us{model="review-model"} 7600000
+            """,
+            model_name="review-model",
+        )
+        after = build_telemetry_summary(
+            """
+            nv_inference_request_success{model="review-model"} 500
+            nv_inference_request_failure{model="review-model"} 1
+            nv_inference_request_duration_us{model="review-model"} 18400000
+            nv_inference_queue_duration_us{model="review-model"} 710000
+            nv_inference_compute_infer_duration_us{model="review-model"} 15100000
+            nv_inference_request_success{model="other"} 9999
+            """,
+            model_name="review-model",
+        )
+
+        window = build_telemetry_counter_window(before, after)
+
+        self.assertTrue(window["valid"])
+        self.assertEqual(window["alignment"], "operator_supplied_unverified")
+        self.assertEqual(window["deltas"]["request_success"], 100.0)
+        self.assertEqual(window["deltas"]["request_failure"], 1.0)
+        self.assertEqual(window["deltas"]["request_duration_us"], 9000000.0)
+        self.assertEqual(window["deltas"]["queue_duration_us"], 500000.0)
+        self.assertEqual(window["derived"]["request_total"], 101.0)
+        self.assertEqual(window["derived"]["server_failure_rate"], 0.009901)
+        self.assertEqual(window["derived"]["server_queue_fraction"], 0.055556)
+
+    def test_telemetry_gate_reports_all_failed_thresholds(self) -> None:
+        gate = build_telemetry_gate(
+            {
+                "deltas": {},
+                "derived": {
+                    "server_failure_rate": 0.02,
+                    "server_queue_fraction": 0.15,
+                },
+            },
+            max_server_failure_rate=0.01,
+            max_server_queue_fraction=0.10,
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertFalse(gate["checks"]["server_failure_rate"]["passed"])
+        self.assertFalse(gate["checks"]["server_queue_fraction"]["passed"])
+        self.assertEqual(len(gate["failure_reasons"]), 2)
+
+    def test_telemetry_gate_fails_closed_on_counter_reset(self) -> None:
+        before = build_telemetry_summary(
+            """
+            nv_inference_request_success{model="review-model"} 100
+            nv_inference_request_failure{model="review-model"} 2
+            """,
+            model_name="review-model",
+        )
+        after = build_telemetry_summary(
+            """
+            nv_inference_request_success{model="review-model"} 3
+            nv_inference_request_failure{model="review-model"} 0
+            """,
+            model_name="review-model",
+        )
+
+        window = build_telemetry_counter_window(before, after)
+        gate = build_telemetry_gate(window, max_server_failure_rate=0.01)
+
+        self.assertFalse(window["valid"])
+        self.assertEqual(
+            window["counter_resets"],
+            ["request_failure", "request_success"],
+        )
+        self.assertIsNone(window["derived"]["server_failure_rate"])
+        self.assertFalse(gate["passed"])
+        self.assertFalse(gate["checks"]["server_failure_rate"]["evaluable"])
+
+    def test_telemetry_gate_fails_closed_when_duration_counter_is_missing(self) -> None:
+        before = build_telemetry_summary(
+            'nv_inference_queue_duration_us{model="review-model"} 100\n',
+            model_name="review-model",
+        )
+        after = build_telemetry_summary(
+            'nv_inference_queue_duration_us{model="review-model"} 200\n',
+            model_name="review-model",
+        )
+
+        window = build_telemetry_counter_window(before, after)
+        gate = build_telemetry_gate(window, max_server_queue_fraction=0.10)
+
+        self.assertIn("request_duration_us", window["unavailable_counters"])
+        self.assertIsNone(window["derived"]["server_queue_fraction"])
+        self.assertFalse(gate["passed"])
+        self.assertFalse(gate["checks"]["server_queue_fraction"]["evaluable"])
+
+    def test_attached_telemetry_does_not_persist_paths_or_raw_scrapes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            before_path = Path(directory) / "private-before.prom"
+            after_path = Path(directory) / "private-after.prom"
+            before_path.write_text(
+                'nv_inference_request_success{model="review-model"} 1\n'
+                'nv_inference_request_failure{model="review-model"} 0\n',
+                encoding="utf-8",
+            )
+            after_path.write_text(
+                'nv_inference_request_success{model="review-model"} 2\n'
+                'nv_inference_request_failure{model="review-model"} 0\n',
+                encoding="utf-8",
+            )
+
+            enriched = attach_telemetry_summary(
+                {"model_name": "review-model"},
+                after_path,
+                telemetry_baseline_prometheus_path=before_path,
+                max_server_failure_rate=0.01,
+            )
+            serialized = json.dumps(enriched)
+
+        self.assertNotIn(directory, serialized)
+        self.assertNotIn("private-before.prom", serialized)
+        self.assertNotIn("private-after.prom", serialized)
+        self.assertNotIn("nv_inference_request_success", serialized)
+        self.assertEqual(enriched["telemetry"]["source"], "prometheus_snapshot")
+        self.assertTrue(enriched["telemetry_gate"]["passed"])
+
     def test_prometheus_export_includes_correlated_telemetry(self) -> None:
         config = BenchmarkConfig()
         metrics = summarize_results(
@@ -599,6 +734,71 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertIn("triton_benchmark_gpu_memory_used_mib", output)
         self.assertIn("triton_benchmark_server_request_success_total", output)
         self.assertIn("triton_benchmark_server_queue_duration_us_total", output)
+
+    def test_prometheus_export_includes_telemetry_window_and_gate(self) -> None:
+        metrics = summarize_results(
+            [InferenceResult(ok=True, latency_ms=10.0)],
+            duration_seconds=1.0,
+            config=BenchmarkConfig(num_requests=1),
+        )
+        metrics["telemetry_window"] = {
+            "deltas": {
+                "request_success": 100.0,
+                "request_failure": 1.0,
+                "request_duration_us": 9000000.0,
+                "queue_duration_us": 500000.0,
+                "compute_infer_duration_us": 7500000.0,
+            },
+            "derived": {
+                "request_total": 101.0,
+                "server_failure_rate": 0.009901,
+                "server_queue_fraction": 0.055556,
+            },
+        }
+        metrics["telemetry_gate"] = {
+            "passed": True,
+            "checks": {},
+            "failure_reasons": [],
+        }
+
+        output = format_prometheus_metrics(metrics)
+
+        self.assertIn("triton_benchmark_server_counter_delta", output)
+        self.assertIn('counter="request_success"} 100', output)
+        self.assertIn("triton_benchmark_server_failure_rate", output)
+        self.assertIn("triton_benchmark_server_queue_duration_fraction", output)
+        self.assertIn("triton_benchmark_telemetry_gate_passed", output)
+
+    def test_parses_telemetry_gate_options(self) -> None:
+        with patch(
+            "sys.argv",
+            [
+                "benchmark.py",
+                "--telemetry-baseline-prometheus",
+                "before.prom",
+                "--telemetry-prometheus",
+                "after.prom",
+                "--max-server-failure-rate",
+                "0.01",
+                "--max-server-queue-fraction",
+                "0.20",
+                "--fail-on-telemetry-gate",
+            ],
+        ):
+            options = parse_args()
+
+        self.assertEqual(options.telemetry_baseline_prometheus_path, "before.prom")
+        self.assertEqual(options.max_server_failure_rate, 0.01)
+        self.assertEqual(options.max_server_queue_fraction, 0.20)
+        self.assertTrue(options.fail_on_telemetry_gate)
+
+    def test_telemetry_threshold_requires_paired_snapshots(self) -> None:
+        with patch(
+            "sys.argv",
+            ["benchmark.py", "--max-server-failure-rate", "0.01"],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
 
 
 if __name__ == "__main__":

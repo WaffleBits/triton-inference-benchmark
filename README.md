@@ -18,6 +18,8 @@ inference endpoint.
 - Latency metrics: average, p50, p95, p99, min, max, plus throughput and success rate.
 - JSON output and Prometheus text export for trend tracking.
 - Baseline-versus-candidate comparison with p95 and success-rate gates.
+- Paired before/after Triton counter windows with fail-closed server failure-rate
+  and queue-fraction gates; raw scrapes and operator paths stay out of artifacts.
 - Named workload profiles for interactive, long-context, and throughput traffic;
   each records context, output, batch, TTFT, decode, and KV-cache assumptions.
 - Dependency-free mock backend for CI, an optional Triton HTTP mode, and an
@@ -84,6 +86,30 @@ python benchmark.py \
   --max-success-rate-drop 0.01 \
   --fail-on-regression
 ```
+
+Gate on server counters from two operator-supplied Prometheus snapshots:
+
+```bash
+python benchmark.py \
+  --mode mock \
+  --num-requests 20 \
+  --concurrency 4 \
+  --telemetry-baseline-prometheus sample_results/mock_telemetry_before.prom \
+  --telemetry-prometheus sample_results/mock_telemetry.prom \
+  --max-server-failure-rate 0.02 \
+  --max-server-queue-fraction 0.10 \
+  --fail-on-telemetry-gate \
+  --prometheus
+```
+
+The committed snapshots are deterministic synthetic fixtures, not observations
+from the mock benchmark, a model, or a GPU. In an authorized environment, an
+operator or sidecar must capture the first snapshot before and the second after
+the intended observation window. The harness computes Triton counter deltas but
+cannot prove that supplied files bracket its own invocation. It fails a
+configured check when a required counter is missing, resets, or has a zero
+denominator. DCGM utilization and memory remain post-snapshot gauges rather than
+window averages.
 
 ## Sample output (mock backend)
 
@@ -182,4 +208,4 @@ python -m unittest discover -s tests
 
 - Server-lifecycle hooks for controlled cold-start measurements.
 - Distributed load generation for multi-client benchmarking.
-- Threshold checks for GPU utilization, queue depth, and server-side errors.
+- Automated bracketed telemetry capture and gauge-window aggregation.

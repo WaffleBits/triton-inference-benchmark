@@ -43,5 +43,10 @@ jobs:
           --bytes-read-per-output-token 777458304
           --baseline-quality-score 0.80
           --candidate-quality-score 0.79
+          --telemetry-baseline-prometheus sample_results/mock_telemetry_before.prom
+          --telemetry-prometheus sample_results/mock_telemetry.prom
+          --max-server-failure-rate 0.02
+          --max-server-queue-fraction 0.10
+          --fail-on-telemetry-gate
           --prometheus
           --output-dir benchmark_results
