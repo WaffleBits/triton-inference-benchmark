@@ -46,7 +46,11 @@ python benchmark.py \
   --batch-invariance-probes 16 \
   --fail-on-batch-variance \
   --baseline sample_results/mock_run.json \
+  --telemetry-baseline-prometheus sample_results/mock_telemetry_before.prom \
   --telemetry-prometheus sample_results/mock_telemetry.prom \
+  --max-server-failure-rate 0.02 \
+  --max-server-queue-fraction 0.10 \
+  --fail-on-telemetry-gate \
   --max-p95-regression-pct 10 \
   --max-success-rate-drop 0.01 \
   --input-tokens-per-request 1024 \
@@ -114,6 +118,8 @@ For a production-style inference service, the benchmark output should be reviewe
 - Throughput remains stable under the expected concurrency level.
 - Retry behavior and failure count are visible in the report, not hidden by averages.
 - GPU utilization and queue duration explain whether a latency change is client-side load, accelerator pressure, or server-side scheduling.
+- Paired Triton counters stay within the workload's accepted failure-rate and
+  queue-fraction thresholds.
 - Fixed probe inputs retain exact output fingerprints when mixed with concurrent traffic.
 
 This repo does not claim a universal SLO because real targets depend on model size, accelerator type, batch policy, and product latency budget.
@@ -134,7 +140,9 @@ The artifact can be pushed to a metrics gateway, archived by CI, or scraped from
 
 ## Telemetry Correlation
 
-Use `--telemetry-prometheus <path>` to attach a Prometheus text snapshot from Triton and DCGM exporter. The benchmark does not need scrape permissions itself; it consumes a file captured by CI, a sidecar, or an operator command.
+Use `--telemetry-prometheus <path>` to attach a Prometheus text snapshot from
+Triton and DCGM exporter. The benchmark does not need scrape permissions itself;
+it consumes a file captured by CI, a sidecar, or an operator command.
 
 The JSON result includes:
 
@@ -144,6 +152,29 @@ The JSON result includes:
 - Triton success, failure, request-duration, queue-duration, and compute-infer counters for the configured model.
 
 The Prometheus export mirrors the correlated values with `triton_benchmark_gpu_*` and `triton_benchmark_server_*` metrics so a benchmark artifact can be compared with server-side behavior in the same dashboard.
+
+### Paired counter window and release gate
+
+Triton request and duration metrics are cumulative counters. To evaluate an
+observation window, supply a before snapshot with
+`--telemetry-baseline-prometheus` and an after snapshot with
+`--telemetry-prometheus`. The tool emits counter deltas and derives:
+
+- server failure rate: failed-request delta divided by total-request delta
+- server queue fraction: queue-duration delta divided by request-duration delta
+
+Use `--max-server-failure-rate` and `--max-server-queue-fraction` to record
+explicit thresholds. Add `--fail-on-telemetry-gate` for exit status 4 when a
+threshold is exceeded or cannot be evaluated. Missing counters, counter resets,
+and zero denominators fail closed instead of being interpreted as zero.
+
+The files are operator-supplied. The harness cannot prove that they bracket its
+own request phase, so the artifact labels alignment as unverified. Capture them
+around the intended window with an authorized sidecar or operator workflow. The
+post-snapshot DCGM gauges are not window averages. Raw scrapes and source paths
+are not serialized into the shareable artifacts. The gate compares aggregate
+model counters, not per-replica series membership, so keep the scrape target set
+stable across the two snapshots.
 
 ## Cost-To-Serve Review
 

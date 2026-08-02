@@ -157,12 +157,16 @@ class CliOptions:
     llm_metrics_config: LlmMetricsConfig | None = None
     export_prometheus: bool = False
     telemetry_prometheus_path: str | None = None
+    telemetry_baseline_prometheus_path: str | None = None
+    max_server_failure_rate: float | None = None
+    max_server_queue_fraction: float | None = None
     batch_invariance_probes: int = 0
     baseline_path: str | None = None
     max_p95_regression_pct: float = 10.0
     max_success_rate_drop: float = 0.01
     fail_on_regression: bool = False
     fail_on_batch_variance: bool = False
+    fail_on_telemetry_gate: bool = False
 
 
 @dataclass(frozen=True)
@@ -1236,14 +1240,164 @@ def build_telemetry_summary(
             "request_duration_us_total": _sum_values(triton_request_duration),
             "queue_duration_us_total": _sum_values(triton_queue_duration),
             "compute_infer_duration_us_total": _sum_values(triton_compute_infer_duration),
+            "counter_sample_counts": {
+                "request_success": len(triton_success),
+                "request_failure": len(triton_failure),
+                "request_duration_us": len(triton_request_duration),
+                "queue_duration_us": len(triton_queue_duration),
+                "compute_infer_duration_us": len(triton_compute_infer_duration),
+            },
         },
         "notes": notes,
+    }
+
+
+TELEMETRY_COUNTER_KEYS = {
+    "request_success": "request_success_total",
+    "request_failure": "request_failure_total",
+    "request_duration_us": "request_duration_us_total",
+    "queue_duration_us": "queue_duration_us_total",
+    "compute_infer_duration_us": "compute_infer_duration_us_total",
+}
+
+
+def build_telemetry_counter_window(
+    baseline: dict[str, object],
+    candidate: dict[str, object],
+) -> dict[str, object]:
+    """Derive observed-window values from paired cumulative counter snapshots."""
+    baseline_triton = baseline.get("triton", {})
+    candidate_triton = candidate.get("triton", {})
+    if not isinstance(baseline_triton, dict) or not isinstance(candidate_triton, dict):
+        raise ValueError("telemetry summaries must include Triton counter records")
+
+    baseline_counts = baseline_triton.get("counter_sample_counts", {})
+    candidate_counts = candidate_triton.get("counter_sample_counts", {})
+    if not isinstance(baseline_counts, dict) or not isinstance(candidate_counts, dict):
+        raise ValueError("telemetry summaries must include counter sample counts")
+
+    deltas: dict[str, float | None] = {}
+    unavailable_counters: list[str] = []
+    counter_resets: list[str] = []
+    for logical_name, summary_key in TELEMETRY_COUNTER_KEYS.items():
+        if not baseline_counts.get(logical_name) or not candidate_counts.get(logical_name):
+            deltas[logical_name] = None
+            unavailable_counters.append(logical_name)
+            continue
+
+        before = baseline_triton.get(summary_key)
+        after = candidate_triton.get(summary_key)
+        if not isinstance(before, (int, float)) or not isinstance(after, (int, float)):
+            deltas[logical_name] = None
+            unavailable_counters.append(logical_name)
+            continue
+        if after < before:
+            deltas[logical_name] = None
+            counter_resets.append(logical_name)
+            continue
+        deltas[logical_name] = round(float(after) - float(before), 4)
+
+    success_delta = deltas["request_success"]
+    failure_delta = deltas["request_failure"]
+    request_total = (
+        round(success_delta + failure_delta, 4)
+        if success_delta is not None and failure_delta is not None
+        else None
+    )
+    server_failure_rate = (
+        round(failure_delta / request_total, 6)
+        if failure_delta is not None and request_total is not None and request_total > 0
+        else None
+    )
+
+    request_duration_delta = deltas["request_duration_us"]
+    queue_duration_delta = deltas["queue_duration_us"]
+    server_queue_fraction = (
+        round(queue_duration_delta / request_duration_delta, 6)
+        if queue_duration_delta is not None
+        and request_duration_delta is not None
+        and request_duration_delta > 0
+        else None
+    )
+
+    return {
+        "source": "paired_prometheus_counter_snapshots",
+        "alignment": "operator_supplied_unverified",
+        "valid": not unavailable_counters and not counter_resets,
+        "counter_resets": sorted(counter_resets),
+        "unavailable_counters": sorted(unavailable_counters),
+        "deltas": deltas,
+        "derived": {
+            "request_total": request_total,
+            "server_failure_rate": server_failure_rate,
+            "server_queue_fraction": server_queue_fraction,
+        },
+        "notes": [
+            "values are deltas between operator-supplied before/after Triton counters",
+            "the harness cannot prove that supplied snapshots bracket this invocation",
+            "DCGM gauges remain point-in-time values in the post-run telemetry summary",
+        ],
+    }
+
+
+def build_telemetry_gate(
+    counter_window: dict[str, object],
+    max_server_failure_rate: float | None = None,
+    max_server_queue_fraction: float | None = None,
+) -> dict[str, object]:
+    """Evaluate configured server-side thresholds and fail closed when unevaluable."""
+    derived = counter_window.get("derived", {})
+    if not isinstance(derived, dict):
+        derived = {}
+
+    checks: dict[str, dict[str, object]] = {}
+    failure_reasons: list[str] = []
+    specifications = (
+        (
+            "server_failure_rate",
+            max_server_failure_rate,
+            "server failure rate",
+        ),
+        (
+            "server_queue_fraction",
+            max_server_queue_fraction,
+            "server queue fraction",
+        ),
+    )
+    for key, maximum, label in specifications:
+        if maximum is None:
+            continue
+        observed = derived.get(key)
+        evaluable = isinstance(observed, (int, float))
+        passed = evaluable and float(observed) <= maximum
+        checks[key] = {
+            "observed": observed if evaluable else None,
+            "maximum": maximum,
+            "evaluable": evaluable,
+            "passed": passed,
+        }
+        if not evaluable:
+            failure_reasons.append(
+                f"{label} unavailable from paired Prometheus counter snapshots"
+            )
+        elif not passed:
+            failure_reasons.append(
+                f"{label} {float(observed):g} exceeded {maximum:g} threshold"
+            )
+
+    return {
+        "passed": bool(checks) and not failure_reasons,
+        "checks": checks,
+        "failure_reasons": failure_reasons,
     }
 
 
 def attach_telemetry_summary(
     metrics: dict[str, object],
     telemetry_prometheus_path: str | Path,
+    telemetry_baseline_prometheus_path: str | Path | None = None,
+    max_server_failure_rate: float | None = None,
+    max_server_queue_fraction: float | None = None,
 ) -> dict[str, object]:
     path = Path(telemetry_prometheus_path)
     enriched_metrics = dict(metrics)
@@ -1251,8 +1405,31 @@ def attach_telemetry_summary(
     enriched_metrics["telemetry"] = build_telemetry_summary(
         path.read_text(encoding="utf-8"),
         model_name=model_name,
-        source=str(path),
+        source="prometheus_snapshot",
     )
+    if telemetry_baseline_prometheus_path is not None:
+        baseline_path = Path(telemetry_baseline_prometheus_path)
+        baseline = build_telemetry_summary(
+            baseline_path.read_text(encoding="utf-8"),
+            model_name=model_name,
+            source="prometheus_snapshot",
+        )
+        counter_window = build_telemetry_counter_window(
+            baseline,
+            enriched_metrics["telemetry"],
+        )
+        enriched_metrics["telemetry_window"] = counter_window
+        if (
+            max_server_failure_rate is not None
+            or max_server_queue_fraction is not None
+        ):
+            enriched_metrics["telemetry_gate"] = build_telemetry_gate(
+                counter_window,
+                max_server_failure_rate=max_server_failure_rate,
+                max_server_queue_fraction=max_server_queue_fraction,
+            )
+    elif max_server_failure_rate is not None or max_server_queue_fraction is not None:
+        raise ValueError("telemetry thresholds require paired pre-run and post-run snapshots")
     return enriched_metrics
 
 
@@ -1454,6 +1631,60 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
                 continue
             lines.extend([f"# HELP {metric_name} {help_text}", f"# TYPE {metric_name} gauge"])
             lines.append(f"{metric_name}{{{labels}}} {value:g}")
+
+    telemetry_window = typed_metrics.get("telemetry_window")
+    if isinstance(telemetry_window, dict):
+        counter_deltas = telemetry_window.get("deltas")
+        if isinstance(counter_deltas, dict):
+            emitted_header = False
+            for counter_name in TELEMETRY_COUNTER_KEYS:
+                value = counter_deltas.get(counter_name)
+                if not isinstance(value, (int, float)):
+                    continue
+                if not emitted_header:
+                    lines.extend(
+                        [
+                            "# HELP triton_benchmark_server_counter_delta Triton counter increase between paired pre-run and post-run snapshots.",
+                            "# TYPE triton_benchmark_server_counter_delta gauge",
+                        ]
+                    )
+                    emitted_header = True
+                lines.append(
+                    f'triton_benchmark_server_counter_delta{{{labels},counter="{counter_name}"}} {value:g}'
+                )
+
+        derived_specs = (
+            (
+                "server_failure_rate",
+                "triton_benchmark_server_failure_rate",
+                "Failed Triton requests divided by all Triton requests in the paired counter window.",
+            ),
+            (
+                "server_queue_fraction",
+                "triton_benchmark_server_queue_duration_fraction",
+                "Triton queue-duration delta divided by request-duration delta in the paired counter window.",
+            ),
+        )
+        for source_key, metric_name, help_text in derived_specs:
+            value = _nested_number(telemetry_window, ("derived", source_key))
+            if value is None:
+                continue
+            lines.extend(
+                [f"# HELP {metric_name} {help_text}", f"# TYPE {metric_name} gauge"]
+            )
+            lines.append(f"{metric_name}{{{labels}}} {value:g}")
+
+    telemetry_gate = typed_metrics.get("telemetry_gate")
+    if isinstance(telemetry_gate, dict):
+        passed = telemetry_gate.get("passed")
+        if isinstance(passed, bool):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_telemetry_gate_passed Whether every configured paired-counter telemetry check passed.",
+                    "# TYPE triton_benchmark_telemetry_gate_passed gauge",
+                    f"triton_benchmark_telemetry_gate_passed{{{labels}}} {int(passed)}",
+                ]
+            )
 
     batch_invariance = typed_metrics.get("batch_invariance")
     if isinstance(batch_invariance, dict):
@@ -1970,9 +2201,34 @@ def parse_args() -> CliOptions:
     parser.add_argument(
         "--telemetry-prometheus",
         help=(
-            "Optional Prometheus text snapshot from Triton/DCGM scraped near the run; "
-            "a correlated telemetry summary is attached to the JSON and .prom outputs."
+            "Optional post-run Prometheus text snapshot from Triton/DCGM; a correlated "
+            "telemetry summary is attached to the JSON and .prom outputs."
         ),
+    )
+    parser.add_argument(
+        "--telemetry-baseline-prometheus",
+        help=(
+            "Optional pre-run Prometheus snapshot paired with --telemetry-prometheus "
+            "to derive operator-supplied observed-window Triton counter deltas."
+        ),
+    )
+    parser.add_argument(
+        "--max-server-failure-rate",
+        type=float,
+        help="Maximum failed-request fraction in the paired Triton counter window.",
+    )
+    parser.add_argument(
+        "--max-server-queue-fraction",
+        type=float,
+        help=(
+            "Maximum queue-duration delta divided by request-duration delta in the "
+            "paired Triton counter window."
+        ),
+    )
+    parser.add_argument(
+        "--fail-on-telemetry-gate",
+        action="store_true",
+        help="Exit with status 4 when a configured telemetry check fails or is unavailable.",
     )
     parser.add_argument(
         "--batch-invariance-probes",
@@ -2018,6 +2274,30 @@ def parse_args() -> CliOptions:
         parser.error("--batch-invariance-probes requires --concurrency greater than one")
     if args.fail_on_batch_variance and not args.batch_invariance_probes:
         parser.error("--fail-on-batch-variance requires --batch-invariance-probes")
+    telemetry_thresholds = (
+        args.max_server_failure_rate,
+        args.max_server_queue_fraction,
+    )
+    if any(value is not None for value in telemetry_thresholds) and not (
+        args.telemetry_baseline_prometheus and args.telemetry_prometheus
+    ):
+        parser.error(
+            "telemetry thresholds require --telemetry-baseline-prometheus and "
+            "--telemetry-prometheus"
+        )
+    if args.telemetry_baseline_prometheus and not args.telemetry_prometheus:
+        parser.error(
+            "--telemetry-baseline-prometheus requires --telemetry-prometheus"
+        )
+    if args.fail_on_telemetry_gate and not any(
+        value is not None for value in telemetry_thresholds
+    ):
+        parser.error("--fail-on-telemetry-gate requires a telemetry threshold")
+    if any(
+        value is not None and not 0 <= value <= 1
+        for value in telemetry_thresholds
+    ):
+        parser.error("telemetry rate and fraction thresholds must be between zero and one")
     if args.mode == "openai" and args.batch_invariance_probes:
         parser.error("batch-invariance probes are not supported in openai mode")
     if not args.openai_prompt.strip():
@@ -2186,12 +2466,16 @@ def parse_args() -> CliOptions:
         workload_profile=workload_profile,
         export_prometheus=args.prometheus,
         telemetry_prometheus_path=args.telemetry_prometheus,
+        telemetry_baseline_prometheus_path=args.telemetry_baseline_prometheus,
+        max_server_failure_rate=args.max_server_failure_rate,
+        max_server_queue_fraction=args.max_server_queue_fraction,
         batch_invariance_probes=args.batch_invariance_probes,
         baseline_path=args.baseline,
         max_p95_regression_pct=args.max_p95_regression_pct,
         max_success_rate_drop=args.max_success_rate_drop,
         fail_on_regression=args.fail_on_regression,
         fail_on_batch_variance=args.fail_on_batch_variance,
+        fail_on_telemetry_gate=args.fail_on_telemetry_gate,
     )
 
 
@@ -2211,7 +2495,15 @@ def main() -> None:
             options.cost_model_config,
         )
     if options.telemetry_prometheus_path:
-        metrics = attach_telemetry_summary(metrics, options.telemetry_prometheus_path)
+        metrics = attach_telemetry_summary(
+            metrics,
+            options.telemetry_prometheus_path,
+            telemetry_baseline_prometheus_path=(
+                options.telemetry_baseline_prometheus_path
+            ),
+            max_server_failure_rate=options.max_server_failure_rate,
+            max_server_queue_fraction=options.max_server_queue_fraction,
+        )
     if options.batch_invariance_probes:
         metrics["batch_invariance"] = run_batch_invariance_probe(
             client,
@@ -2252,6 +2544,15 @@ def main() -> None:
         and exit_code == 0
     ):
         exit_code = 3
+
+    telemetry_gate = metrics.get("telemetry_gate")
+    if (
+        options.fail_on_telemetry_gate
+        and isinstance(telemetry_gate, dict)
+        and not telemetry_gate.get("passed", False)
+        and exit_code == 0
+    ):
+        exit_code = 4
 
     if exit_code:
         raise SystemExit(exit_code)

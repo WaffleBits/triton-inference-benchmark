@@ -1,0 +1,14 @@
+# Synthetic pre-run Triton/DCGM telemetry fixture for paired-counter demos.
+# Counters are lower than sample_results/mock_telemetry.prom; gauges are
+# point-in-time values and are not differenced.
+DCGM_FI_DEV_GPU_UTIL{gpu="0",uuid="GPU-synthetic-0"} 71
+DCGM_FI_DEV_GPU_UTIL{gpu="1",uuid="GPU-synthetic-1"} 80
+DCGM_FI_DEV_MEM_COPY_UTIL{gpu="0",uuid="GPU-synthetic-0"} 17
+DCGM_FI_DEV_MEM_COPY_UTIL{gpu="1",uuid="GPU-synthetic-1"} 22
+DCGM_FI_DEV_FB_USED{gpu="0",uuid="GPU-synthetic-0"} 8960
+DCGM_FI_DEV_FB_USED{gpu="1",uuid="GPU-synthetic-1"} 9216
+nv_inference_request_success{model="resnet50_trt_fp16",version="1"} 400
+nv_inference_request_failure{model="resnet50_trt_fp16",version="1"} 0
+nv_inference_request_duration_us{model="resnet50_trt_fp16",version="1"} 9400000
+nv_inference_queue_duration_us{model="resnet50_trt_fp16",version="1"} 210000
+nv_inference_compute_infer_duration_us{model="resnet50_trt_fp16",version="1"} 7600000

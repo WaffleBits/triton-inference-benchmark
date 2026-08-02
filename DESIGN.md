@@ -38,7 +38,27 @@ The tool reports:
 
 When `--prometheus` is enabled, the same core measurements are written as Prometheus text-format gauges and counters beside the JSON result. This keeps the harness dependency-free while making the output easy to archive in CI, push to a metrics gateway, or ingest into a dashboarding workflow.
 
-When `--telemetry-prometheus` is provided, the benchmark attaches a correlated summary from a Triton/DCGM Prometheus text snapshot. The summary keeps server-side GPU utilization, memory use, queue duration, request duration, and inference-duration counters beside the client-side benchmark result. The parser is dependency-free so CI can validate the behavior with synthetic fixtures while live runs can still consume real scrape artifacts.
+When `--telemetry-prometheus` is provided, the benchmark attaches a correlated
+summary from a Triton/DCGM Prometheus text snapshot. The summary keeps
+server-side GPU utilization, memory use, queue duration, request duration, and
+inference-duration counters beside the client-side benchmark result. The parser
+is dependency-free so CI can validate the behavior with synthetic fixtures while
+live runs can still consume real scrape artifacts.
+
+An optional `--telemetry-baseline-prometheus` snapshot turns cumulative Triton
+counters into an observed window. The tool subtracts matching, model-filtered
+before values from after values, detects aggregate counter decreases and missing
+metric families, and derives failure rate plus queue-duration fraction.
+Configured telemetry gates fail closed when a derived value is unavailable. The
+JSON and Prometheus outputs contain summaries and deltas, not raw scrape text or
+operator filesystem paths.
+
+Snapshot alignment is explicitly operator-supplied and unverified. The harness
+does not capture either scrape itself, so it cannot prove that the files bracket
+the current invocation. DCGM values are gauges from the post snapshot and are
+not subtracted or presented as averages over the counter window. Per-replica
+series membership is not persisted or compared; operators must keep the scrape
+target set stable across both snapshots.
 
 ## Cost-To-Serve Model
 
@@ -113,6 +133,6 @@ AI infrastructure repos often fail basic review because they cannot run without 
 
 - Add server-lifecycle hooks for controlled cold-start measurements.
 - Add request payload profiles by model family.
-- Add threshold checks for correlated GPU telemetry and queue depth.
+- Add automated bracketed telemetry capture and GPU gauge-window aggregation.
 - Add distributed load generation across multiple clients.
 - Add model-aware numeric tolerance policies for batch-invariance probes.
