@@ -20,6 +20,8 @@ inference endpoint.
 - Baseline-versus-candidate comparison with p95 and success-rate gates.
 - Paired before/after Triton counter windows with fail-closed server failure-rate
   and queue-fraction gates; raw scrapes and operator paths stay out of artifacts.
+- Opt-in HTTP(S) Prometheus capture that scrapes after warmup and immediately
+  around the measured request phase without sending ambient credentials.
 - Named workload profiles for interactive, long-context, and throughput traffic;
   each records context, output, batch, TTFT, decode, and KV-cache assumptions.
 - Dependency-free mock backend for CI, an optional Triton HTTP mode, and an
@@ -110,6 +112,38 @@ cannot prove that supplied files bracket its own invocation. It fails a
 configured check when a required counter is missing, resets, or has a zero
 denominator. DCGM utilization and memory remain post-snapshot gauges rather than
 window averages.
+
+Capture the same counter window directly from an authorized Prometheus endpoint:
+
+```bash
+export TELEMETRY_TOKEN="..."
+python benchmark.py \
+  --mode triton \
+  --server-url localhost:8000 \
+  --model-name resnet50_trt_fp16 \
+  --warmup-requests 20 \
+  --num-requests 200 \
+  --concurrency 16 \
+  --telemetry-url http://prometheus.monitoring.svc:9090/federate \
+  --telemetry-api-key-env TELEMETRY_TOKEN \
+  --max-server-failure-rate 0.02 \
+  --max-server-queue-fraction 0.10 \
+  --fail-on-telemetry-gate \
+  --prometheus
+```
+
+The first HTTP scrape runs after warmup and immediately before measured work is
+submitted. The second runs immediately after all measured requests finish.
+Authentication is opt-in: omit `--telemetry-api-key-env` for an unauthenticated
+endpoint, and no ambient API key is sent. The bearer token, endpoint URL, raw
+scrapes, and authorization header are not written to JSON or Prometheus
+artifacts. The endpoint must be an absolute HTTP(S) URL without embedded
+credentials, and each response is bounded to 10 MiB.
+
+`harness_bracketed_measured_phase` describes process ordering, not server
+isolation. Counter deltas can still include unrelated traffic, and the scrape
+target membership must remain stable. Post-run DCGM values remain point-in-time
+gauges rather than window averages.
 
 ## Sample output (mock backend)
 
@@ -208,4 +242,4 @@ python -m unittest discover -s tests
 
 - Server-lifecycle hooks for controlled cold-start measurements.
 - Distributed load generation for multi-client benchmarking.
-- Automated bracketed telemetry capture and gauge-window aggregation.
+- GPU gauge-window aggregation over repeated in-window scrapes.
