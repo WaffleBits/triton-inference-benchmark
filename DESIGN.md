@@ -53,12 +53,20 @@ Configured telemetry gates fail closed when a derived value is unavailable. The
 JSON and Prometheus outputs contain summaries and deltas, not raw scrape text or
 operator filesystem paths.
 
-Snapshot alignment is explicitly operator-supplied and unverified. The harness
-does not capture either scrape itself, so it cannot prove that the files bracket
-the current invocation. DCGM values are gauges from the post snapshot and are
-not subtracted or presented as averages over the counter window. Per-replica
-series membership is not persisted or compared; operators must keep the scrape
-target set stable across both snapshots.
+File snapshot alignment is explicitly operator-supplied and unverified. With
+`--telemetry-url`, the harness instead fetches one bounded HTTP(S) snapshot after
+warmup and immediately before measured requests, then another after the measured
+phase completes. This alignment is labeled
+`harness_bracketed_measured_phase`; scrape time is excluded from the request
+phase duration. The URL, optional bearer token, authorization header, and raw
+responses are not serialized.
+
+Harness bracketing does not isolate the server. Counter deltas can include
+unrelated traffic, and per-replica series membership is not persisted or
+compared, so operators must keep the scrape target set stable. DCGM values are
+gauges from the post snapshot and are not subtracted or presented as averages
+over the counter window. Authentication is opt-in through an explicitly named
+environment variable; ambient API keys are not sent.
 
 ## Cost-To-Serve Model
 
@@ -133,6 +141,6 @@ AI infrastructure repos often fail basic review because they cannot run without 
 
 - Add server-lifecycle hooks for controlled cold-start measurements.
 - Add request payload profiles by model family.
-- Add automated bracketed telemetry capture and GPU gauge-window aggregation.
+- Add GPU gauge-window aggregation over repeated in-window scrapes.
 - Add distributed load generation across multiple clients.
 - Add model-aware numeric tolerance policies for batch-invariance probes.

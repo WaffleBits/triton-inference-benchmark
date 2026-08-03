@@ -21,32 +21,68 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -s tests
 
-      - name: Run mock benchmark
-        run: >-
-          python benchmark.py
-          --mode mock
-          --warmup-requests 4
-          --num-requests 20
-          --concurrency 4
-          --batch-invariance-probes 8
-          --fail-on-batch-variance
-          --input-tokens-per-request 1024
-          --output-tokens-per-request 256
-          --gpu-count 2
-          --gpu-hourly-cost-usd 4.50
-          --power-watts-per-gpu 600
-          --context-tokens-per-request 1024
-          --llm-batch-size 4
-          --time-to-first-token-ms 25
-          --inter-token-latency-ms 10
-          --kv-cache-bytes-per-request 58720256
-          --bytes-read-per-output-token 777458304
-          --baseline-quality-score 0.80
-          --candidate-quality-score 0.79
-          --telemetry-baseline-prometheus sample_results/mock_telemetry_before.prom
-          --telemetry-prometheus sample_results/mock_telemetry.prom
-          --max-server-failure-rate 0.02
-          --max-server-queue-fraction 0.10
-          --fail-on-telemetry-gate
-          --prometheus
-          --output-dir benchmark_results
+      - name: Run bracketed-telemetry mock benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT_FILE=$(mktemp)
+          python tests/telemetry_fixture_server.py --port-file "$PORT_FILE" &
+          FIXTURE_PID=$!
+          trap 'kill "$FIXTURE_PID" 2>/dev/null || true; rm -f "$PORT_FILE"' EXIT
+          for _ in {1..100}; do
+            if [ -s "$PORT_FILE" ]; then
+              break
+            fi
+            if ! kill -0 "$FIXTURE_PID" 2>/dev/null; then
+              echo "telemetry fixture exited before becoming ready" >&2
+              exit 1
+            fi
+            sleep 0.1
+          done
+          test -s "$PORT_FILE"
+          PORT=$(<"$PORT_FILE")
+
+          python benchmark.py \
+            --mode mock \
+            --warmup-requests 4 \
+            --num-requests 20 \
+            --concurrency 4 \
+            --batch-invariance-probes 8 \
+            --fail-on-batch-variance \
+            --input-tokens-per-request 1024 \
+            --output-tokens-per-request 256 \
+            --gpu-count 2 \
+            --gpu-hourly-cost-usd 4.50 \
+            --power-watts-per-gpu 600 \
+            --context-tokens-per-request 1024 \
+            --llm-batch-size 4 \
+            --time-to-first-token-ms 25 \
+            --inter-token-latency-ms 10 \
+            --kv-cache-bytes-per-request 58720256 \
+            --bytes-read-per-output-token 777458304 \
+            --baseline-quality-score 0.80 \
+            --candidate-quality-score 0.79 \
+            --telemetry-url "http://127.0.0.1:${PORT}/metrics" \
+            --max-server-failure-rate 0.02 \
+            --max-server-queue-fraction 0.10 \
+            --fail-on-telemetry-gate \
+            --prometheus \
+            --output-dir benchmark_results
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          results = sorted(Path("benchmark_results").glob("benchmark_*.json"))
+          assert len(results) == 1, results
+          metrics = json.loads(results[0].read_text(encoding="utf-8"))
+          assert metrics["telemetry"]["source"] == "http_prometheus_snapshot"
+          assert metrics["telemetry_window"]["source"] == "paired_http_prometheus_scrapes"
+          assert metrics["telemetry_window"]["alignment"] == "harness_bracketed_measured_phase"
+          assert metrics["telemetry_window"]["derived"]["request_total"] == 101
+          assert metrics["telemetry_gate"]["passed"] is True
+          assert results[0].with_suffix(".prom").is_file()
+          serialized = json.dumps(metrics)
+          assert "127.0.0.1" not in serialized
+          assert "nv_inference_request_success" not in serialized
+          PY

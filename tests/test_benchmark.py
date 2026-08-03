@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -7,13 +8,16 @@ from threading import Barrier, local
 from unittest.mock import patch
 
 from benchmark import (
+    MAX_TELEMETRY_RESPONSE_BYTES,
     BenchmarkConfig,
     CostModelConfig,
+    HttpPrometheusTelemetryClient,
     InferenceResult,
     LlmMetricsConfig,
     MockInferenceClient,
     TritonHttpInferenceClient,
     attach_telemetry_summary,
+    build_http_telemetry_client,
     build_cost_model,
     build_llm_metrics,
     build_regression_report,
@@ -186,6 +190,190 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertEqual(metrics["num_requests"], 12)
         self.assertEqual(metrics["failed_requests"], 0)
         self.assertGreater(metrics["throughput_rps"], 0)
+
+    def test_http_telemetry_brackets_only_the_measured_request_phase(self) -> None:
+        events: list[str] = []
+
+        class RecordingClient:
+            def infer(self) -> None:
+                events.append("infer")
+
+        class RecordingTelemetryClient:
+            def __init__(self) -> None:
+                self.scrape_count = 0
+
+            def scrape(self) -> str:
+                events.append("scrape")
+                self.scrape_count += 1
+                successful = 100 if self.scrape_count == 1 else 103
+                request_duration = 1000 if self.scrape_count == 1 else 4000
+                queue_duration = 100 if self.scrape_count == 1 else 250
+                compute_duration = 800 if self.scrape_count == 1 else 3300
+                return (
+                    f'nv_inference_request_success{{model="review-model"}} {successful}\n'
+                    'nv_inference_request_failure{model="review-model"} 0\n'
+                    f'nv_inference_request_duration_us{{model="review-model"}} {request_duration}\n'
+                    f'nv_inference_queue_duration_us{{model="review-model"}} {queue_duration}\n'
+                    f'nv_inference_compute_infer_duration_us{{model="review-model"}} {compute_duration}\n'
+                )
+
+        metrics = run_benchmark(
+            RecordingClient(),
+            BenchmarkConfig(
+                model_name="review-model",
+                warmup_requests=2,
+                num_requests=3,
+                concurrency=1,
+                retries=0,
+            ),
+            telemetry_client=RecordingTelemetryClient(),
+            max_server_failure_rate=0.01,
+            max_server_queue_fraction=0.10,
+        )
+
+        self.assertEqual(
+            events,
+            ["infer", "infer", "scrape", "infer", "infer", "infer", "scrape"],
+        )
+        self.assertEqual(
+            metrics["telemetry_window"]["alignment"],
+            "harness_bracketed_measured_phase",
+        )
+        self.assertEqual(metrics["telemetry_window"]["derived"]["request_total"], 3)
+        self.assertTrue(metrics["telemetry_gate"]["passed"])
+
+    def test_http_telemetry_client_sends_only_explicit_authentication(self) -> None:
+        requests = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback) -> None:
+                return None
+
+            def read(self, size: int) -> bytes:
+                self.read_size = size
+                return b'metric_total 1\n'
+
+        def fake_urlopen(request, timeout):
+            requests.append((request, timeout))
+            return FakeResponse()
+
+        with (
+            patch.dict(os.environ, {"AMBIENT_API_KEY": "must-not-be-sent"}, clear=True),
+            patch("benchmark.urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            unauthenticated = build_http_telemetry_client(
+                "https://metrics.example.test/metrics",
+                timeout_seconds=3.5,
+                api_key_env="",
+            )
+            self.assertEqual(unauthenticated.scrape(), "metric_total 1\n")
+
+        self.assertIsNone(requests[0][0].get_header("Authorization"))
+        self.assertEqual(requests[0][1], 3.5)
+
+        with (
+            patch.dict(os.environ, {"TELEMETRY_TOKEN": "explicit-secret"}, clear=True),
+            patch("benchmark.urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            authenticated = build_http_telemetry_client(
+                "https://metrics.example.test/metrics",
+                timeout_seconds=2,
+                api_key_env="TELEMETRY_TOKEN",
+            )
+            authenticated.scrape()
+
+        self.assertEqual(
+            requests[1][0].get_header("Authorization"),
+            "Bearer explicit-secret",
+        )
+
+    def test_http_telemetry_client_rejects_missing_explicit_token(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "TELEMETRY_TOKEN"):
+                build_http_telemetry_client(
+                    "https://metrics.example.test/metrics",
+                    timeout_seconds=2,
+                    api_key_env="TELEMETRY_TOKEN",
+                )
+
+    def test_http_telemetry_client_rejects_unsafe_urls_and_large_responses(self) -> None:
+        for endpoint in (
+            "file:///tmp/private.prom",
+            "https://operator:secret@metrics.example.test/metrics",
+            "metrics.example.test/metrics",
+        ):
+            with self.subTest(endpoint=endpoint):
+                with self.assertRaises(ValueError):
+                    HttpPrometheusTelemetryClient(endpoint)
+
+        class LargeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback) -> None:
+                return None
+
+            def read(self, size: int) -> bytes:
+                return b"x" * size
+
+        client = HttpPrometheusTelemetryClient("https://metrics.example.test/metrics")
+        with patch("benchmark.urllib.request.urlopen", return_value=LargeResponse()):
+            with self.assertRaisesRegex(ValueError, "exceeded"):
+                client.scrape()
+
+        self.assertGreater(MAX_TELEMETRY_RESPONSE_BYTES, 0)
+
+    def test_bracketed_http_telemetry_artifact_omits_endpoint_token_and_raw_scrape(self) -> None:
+        responses = iter(
+            [
+                b'nv_inference_request_success{model="review-model"} 10\n'
+                b'nv_inference_request_failure{model="review-model"} 0\n',
+                b'nv_inference_request_success{model="review-model"} 11\n'
+                b'nv_inference_request_failure{model="review-model"} 0\n',
+            ]
+        )
+
+        class FakeResponse:
+            def __init__(self, payload: bytes) -> None:
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback) -> None:
+                return None
+
+            def read(self, size: int) -> bytes:
+                return self.payload
+
+        endpoint = "https://private.example.test/metrics?tenant=secret-tenant"
+        token = "private-bearer-token"
+        telemetry_client = HttpPrometheusTelemetryClient(endpoint, bearer_token=token)
+        with patch(
+            "benchmark.urllib.request.urlopen",
+            side_effect=lambda request, timeout: FakeResponse(next(responses)),
+        ):
+            metrics = run_benchmark(
+                MockInferenceClient(seed=11, failure_rate=0),
+                BenchmarkConfig(
+                    model_name="review-model",
+                    num_requests=1,
+                    concurrency=1,
+                    retries=0,
+                ),
+                telemetry_client=telemetry_client,
+                max_server_failure_rate=0.01,
+            )
+
+        serialized = json.dumps(metrics)
+        self.assertNotIn(endpoint, serialized)
+        self.assertNotIn("secret-tenant", serialized)
+        self.assertNotIn(token, serialized)
+        self.assertNotIn("nv_inference_request_success", serialized)
+        self.assertEqual(metrics["telemetry"]["source"], "http_prometheus_snapshot")
 
     def test_warmup_requests_run_before_and_stay_out_of_measured_results(self) -> None:
         class CountingClient:
@@ -792,7 +980,56 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertEqual(options.max_server_queue_fraction, 0.20)
         self.assertTrue(options.fail_on_telemetry_gate)
 
-    def test_telemetry_threshold_requires_paired_snapshots(self) -> None:
+    def test_parses_bracketed_http_telemetry_options(self) -> None:
+        with patch(
+            "sys.argv",
+            [
+                "benchmark.py",
+                "--telemetry-url",
+                "https://metrics.example.test/metrics",
+                "--telemetry-timeout-seconds",
+                "3.5",
+                "--telemetry-api-key-env",
+                "TELEMETRY_TOKEN",
+                "--max-server-failure-rate",
+                "0.01",
+                "--fail-on-telemetry-gate",
+            ],
+        ):
+            options = parse_args()
+
+        self.assertEqual(
+            options.telemetry_url,
+            "https://metrics.example.test/metrics",
+        )
+        self.assertEqual(options.telemetry_timeout_seconds, 3.5)
+        self.assertEqual(options.telemetry_api_key_env, "TELEMETRY_TOKEN")
+        self.assertEqual(options.max_server_failure_rate, 0.01)
+        self.assertTrue(options.fail_on_telemetry_gate)
+
+    def test_telemetry_url_is_mutually_exclusive_with_snapshot_files(self) -> None:
+        with patch(
+            "sys.argv",
+            [
+                "benchmark.py",
+                "--telemetry-url",
+                "https://metrics.example.test/metrics",
+                "--telemetry-prometheus",
+                "after.prom",
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+
+    def test_telemetry_api_key_env_requires_telemetry_url(self) -> None:
+        with patch(
+            "sys.argv",
+            ["benchmark.py", "--telemetry-api-key-env", "TELEMETRY_TOKEN"],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+
+    def test_telemetry_threshold_requires_paired_snapshots_or_url(self) -> None:
         with patch(
             "sys.argv",
             ["benchmark.py", "--max-server-failure-rate", "0.01"],

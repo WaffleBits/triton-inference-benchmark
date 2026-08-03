@@ -7,7 +7,8 @@ This benchmark is intended to produce repeatable evidence for model-serving chan
 1. Run a baseline benchmark against the current model or serving image.
 2. Save the JSON result as the comparison baseline.
 3. Run the candidate benchmark with the same warmup count, measured request count, concurrency, payload shape, and retry settings.
-4. If available, scrape a Triton/DCGM Prometheus snapshot close to the run.
+4. If available, scrape Triton/DCGM Prometheus counters around the measured
+   phase with `--telemetry-url`, or supply operator-captured files.
 5. Export JSON and Prometheus text artifacts.
 6. Review p95 latency, success rate, throughput, failure count, queue time, and GPU utilization before promoting the candidate.
 7. When capacity inputs are known, compare token throughput and normalized cost under identical workload assumptions.
@@ -175,6 +176,43 @@ post-snapshot DCGM gauges are not window averages. Raw scrapes and source paths
 are not serialized into the shareable artifacts. The gate compares aggregate
 model counters, not per-replica series membership, so keep the scrape target set
 stable across the two snapshots.
+
+### Harness-bracketed HTTP capture
+
+Use `--telemetry-url <http-or-https-url>` instead of the two file options when
+the benchmark process is authorized to read the Prometheus endpoint. The
+harness fetches the baseline after warmup and immediately before measured work,
+then fetches the candidate immediately after the measured futures complete.
+
+```bash
+export TELEMETRY_TOKEN="..."
+python benchmark.py \
+  --mode triton \
+  --server-url localhost:8000 \
+  --model-name my-model \
+  --warmup-requests 32 \
+  --num-requests 500 \
+  --concurrency 32 \
+  --telemetry-url http://prometheus.monitoring.svc:9090/federate \
+  --telemetry-timeout-seconds 10 \
+  --telemetry-api-key-env TELEMETRY_TOKEN \
+  --max-server-failure-rate 0.02 \
+  --max-server-queue-fraction 0.10 \
+  --fail-on-telemetry-gate \
+  --prometheus
+```
+
+Authentication is disabled unless `--telemetry-api-key-env` explicitly names a
+non-empty environment variable. The client does not inspect ambient API-key
+variables. URLs containing user information are rejected. Each UTF-8 response
+is capped at 10 MiB, and a failed scrape aborts the qualification instead of
+silently producing an unbracketed artifact.
+
+Artifacts contain only parsed summaries, deltas, and gates. They exclude the
+endpoint URL, environment-variable name, bearer token, authorization header,
+and raw response. The alignment label proves only this process's phase order;
+unrelated server traffic and scrape-target changes remain external controls,
+and the post-run DCGM values are still point-in-time gauges.
 
 ## Cost-To-Serve Review
 
