@@ -63,10 +63,15 @@ responses are not serialized.
 
 Harness bracketing does not isolate the server. Counter deltas can include
 unrelated traffic, and per-replica series membership is not persisted or
-compared, so operators must keep the scrape target set stable. DCGM values are
-gauges from the post snapshot and are not subtracted or presented as averages
-over the counter window. Authentication is opt-in through an explicitly named
-environment variable; ambient API keys are not sent.
+compared, so operators must keep the scrape target set stable. By default, DCGM
+values are gauges from the post snapshot. A positive
+`--telemetry-sample-interval-seconds` starts a separate sampler after measured
+requests are submitted. The sampler stops when the request phase completes and
+any failed scrape aborts the qualification. Its DCGM values are combined with
+the boundary scrapes into sample average, p50, p95, min, and max records with
+explicit scrape/value coverage. These are sample statistics, not a time-weighted
+integral, and no target identity is persisted. Authentication is opt-in through
+an explicitly named environment variable; ambient API keys are not sent.
 
 ## Cost-To-Serve Model
 
@@ -141,6 +146,5 @@ AI infrastructure repos often fail basic review because they cannot run without 
 
 - Add server-lifecycle hooks for controlled cold-start measurements.
 - Add request payload profiles by model family.
-- Add GPU gauge-window aggregation over repeated in-window scrapes.
 - Add distributed load generation across multiple clients.
 - Add model-aware numeric tolerance policies for batch-invariance probes.

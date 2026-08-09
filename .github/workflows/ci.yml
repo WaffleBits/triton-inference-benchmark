@@ -63,6 +63,7 @@ jobs:
             --baseline-quality-score 0.80 \
             --candidate-quality-score 0.79 \
             --telemetry-url "http://127.0.0.1:${PORT}/metrics" \
+            --telemetry-sample-interval-seconds 0.01 \
             --max-server-failure-rate 0.02 \
             --max-server-queue-fraction 0.10 \
             --fail-on-telemetry-gate \
@@ -81,6 +82,13 @@ jobs:
           assert metrics["telemetry_window"]["alignment"] == "harness_bracketed_measured_phase"
           assert metrics["telemetry_window"]["derived"]["request_total"] == 101
           assert metrics["telemetry_gate"]["passed"] is True
+          gauge_window = metrics["telemetry_gauge_window"]
+          assert gauge_window["in_window_scrape_count"] >= 2
+          assert (
+              gauge_window["scrape_count"]
+              == gauge_window["in_window_scrape_count"] + 2
+          )
+          assert gauge_window["gpu"]["utilization_pct"]["sample_count"] >= 4
           assert results[0].with_suffix(".prom").is_file()
           serialized = json.dumps(metrics)
           assert "127.0.0.1" not in serialized

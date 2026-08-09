@@ -161,6 +161,7 @@ class CliOptions:
     telemetry_baseline_prometheus_path: str | None = None
     telemetry_url: str | None = None
     telemetry_timeout_seconds: float = 10.0
+    telemetry_sample_interval_seconds: float = 0.0
     telemetry_api_key_env: str = ""
     max_server_failure_rate: float | None = None
     max_server_queue_fraction: float | None = None
@@ -690,6 +691,7 @@ def _run_request_phase(
     request_count: int,
     concurrency: int,
     retries: int,
+    phase_started: threading.Event | None = None,
 ) -> tuple[list[InferenceResult], float]:
     start = time.perf_counter()
     results: list[InferenceResult] = []
@@ -699,11 +701,33 @@ def _run_request_phase(
             executor.submit(execute_with_retries, client, retries)
             for _ in range(request_count)
         ]
+        if phase_started is not None:
+            phase_started.set()
         for future in as_completed(futures):
             results.append(future.result())
 
     duration_seconds = time.perf_counter() - start
     return results, duration_seconds
+
+
+def _sample_telemetry_during_phase(
+    telemetry_client: TelemetrySnapshotClient,
+    interval_seconds: float,
+    phase_started: threading.Event,
+    stop_requested: threading.Event,
+    snapshots: list[dict[str, list[float]]],
+    errors: list[Exception],
+) -> None:
+    phase_started.wait()
+    while not stop_requested.is_set():
+        try:
+            snapshots.append(_extract_gpu_gauge_values(telemetry_client.scrape()))
+        except Exception as exc:  # noqa: BLE001 - propagated on the benchmark thread.
+            errors.append(exc)
+            stop_requested.set()
+            return
+        if stop_requested.wait(interval_seconds):
+            return
 
 
 def _summarize_request_phase(
@@ -739,7 +763,13 @@ def run_benchmark(
     telemetry_client: TelemetrySnapshotClient | None = None,
     max_server_failure_rate: float | None = None,
     max_server_queue_fraction: float | None = None,
+    telemetry_sample_interval_seconds: float = 0.0,
 ) -> dict[str, object]:
+    if telemetry_sample_interval_seconds < 0:
+        raise ValueError("telemetry sample interval must be zero or greater")
+    if telemetry_sample_interval_seconds and telemetry_client is None:
+        raise ValueError("telemetry sampling requires a telemetry client")
+
     warmup_results: list[InferenceResult] = []
     warmup_duration_seconds = 0.0
     if config.warmup_requests:
@@ -751,12 +781,44 @@ def run_benchmark(
         )
 
     telemetry_before = telemetry_client.scrape() if telemetry_client else None
-    results, duration_seconds = _run_request_phase(
-        client,
-        request_count=config.num_requests,
-        concurrency=config.concurrency,
-        retries=config.retries,
-    )
+    in_window_telemetry: list[dict[str, list[float]]] = []
+    telemetry_errors: list[Exception] = []
+    phase_started = threading.Event()
+    stop_sampling = threading.Event()
+    sampler: threading.Thread | None = None
+    if telemetry_client is not None and telemetry_sample_interval_seconds:
+        sampler = threading.Thread(
+            target=_sample_telemetry_during_phase,
+            args=(
+                telemetry_client,
+                telemetry_sample_interval_seconds,
+                phase_started,
+                stop_sampling,
+                in_window_telemetry,
+                telemetry_errors,
+            ),
+            name="benchmark-telemetry-sampler",
+            daemon=True,
+        )
+        sampler.start()
+
+    try:
+        results, duration_seconds = _run_request_phase(
+            client,
+            request_count=config.num_requests,
+            concurrency=config.concurrency,
+            retries=config.retries,
+            phase_started=phase_started if sampler is not None else None,
+        )
+    finally:
+        stop_sampling.set()
+        if sampler is not None:
+            sampler.join()
+
+    if telemetry_errors:
+        raise RuntimeError("in-window telemetry scrape failed") from telemetry_errors[0]
+    if sampler is not None and not in_window_telemetry:
+        raise RuntimeError("telemetry sampling produced no in-window scrapes")
     telemetry_after = telemetry_client.scrape() if telemetry_client else None
     summary = summarize_results(results, duration_seconds, config)
     summary["measurement_scope"] = {
@@ -783,6 +845,16 @@ def run_benchmark(
             max_server_failure_rate=max_server_failure_rate,
             max_server_queue_fraction=max_server_queue_fraction,
         )
+        if telemetry_sample_interval_seconds:
+            summary["telemetry_gauge_window"] = _build_gpu_gauge_window(
+                [
+                    _extract_gpu_gauge_values(telemetry_before),
+                    *in_window_telemetry,
+                    _extract_gpu_gauge_values(telemetry_after),
+                ],
+                in_window_scrape_count=len(in_window_telemetry),
+                configured_interval_seconds=telemetry_sample_interval_seconds,
+            )
     return summary
 
 
@@ -1270,6 +1342,106 @@ def _stat_summary(values: list[float]) -> dict[str, float]:
 
 def _sum_values(values: list[float]) -> float:
     return round(sum(values), 4)
+
+
+def _gauge_window_stat_summary(
+    values: list[float],
+    matched_scrape_count: int,
+) -> dict[str, float | int]:
+    if not values:
+        return {}
+    return {
+        "sample_count": len(values),
+        "matched_scrape_count": matched_scrape_count,
+        "avg": round(statistics.fmean(values), 4),
+        "min": round(min(values), 4),
+        "p50": round(percentile(values, 50), 4),
+        "p95": round(percentile(values, 95), 4),
+        "max": round(max(values), 4),
+    }
+
+
+def _extract_gpu_gauge_values(prometheus_text: str) -> dict[str, list[float]]:
+    samples = parse_prometheus_samples(prometheus_text)
+    return {
+        "utilization_pct": _values_for_metrics(samples, GPU_UTILIZATION_METRICS),
+        "memory_copy_utilization_pct": _values_for_metrics(
+            samples,
+            GPU_MEMORY_COPY_METRICS,
+        ),
+        "memory_used_mib": _values_for_metrics(samples, GPU_MEMORY_USED_METRICS),
+    }
+
+
+def _build_gpu_gauge_window(
+    gauge_captures: list[dict[str, list[float]]],
+    *,
+    in_window_scrape_count: int,
+    configured_interval_seconds: float,
+) -> dict[str, object]:
+    if len(gauge_captures) < 3:
+        raise ValueError("sampled GPU gauge windows require at least three scrapes")
+    if not 0 < in_window_scrape_count <= len(gauge_captures) - 2:
+        raise ValueError("in-window scrape count must match the sampled gauge window")
+    if configured_interval_seconds <= 0:
+        raise ValueError("configured telemetry sample interval must be greater than zero")
+
+    gauge_names = (
+        "utilization_pct",
+        "memory_copy_utilization_pct",
+        "memory_used_mib",
+    )
+    values_by_metric: dict[str, list[float]] = {name: [] for name in gauge_names}
+    matched_scrapes = {name: 0 for name in gauge_names}
+    for capture in gauge_captures:
+        for logical_name in gauge_names:
+            values = capture.get(logical_name, [])
+            if values:
+                matched_scrapes[logical_name] += 1
+                values_by_metric[logical_name].extend(values)
+
+    notes = [
+        "GPU values are sample statistics across bounded scrapes and are not time-weighted",
+        (
+            "the pre-boundary and post-boundary scrapes are included with samples "
+            "initiated during measured work"
+        ),
+        "changing scrape targets can change sample membership; target identity is not persisted",
+        "a shared telemetry endpoint can include activity unrelated to this benchmark",
+    ]
+    if not any(values_by_metric.values()):
+        notes.append("no GPU telemetry samples matched known DCGM metric names")
+
+    return {
+        "source": "sampled_http_prometheus_scrapes",
+        "alignment": "harness_bracketed_measured_phase",
+        "scrape_count": len(gauge_captures),
+        "boundary_scrape_count": 2,
+        "in_window_scrape_count": in_window_scrape_count,
+        "configured_interval_seconds": configured_interval_seconds,
+        "gpu": {
+            name: _gauge_window_stat_summary(
+                values_by_metric[name],
+                matched_scrapes[name],
+            )
+            for name in gauge_names
+        },
+        "notes": notes,
+    }
+
+
+def build_gpu_gauge_window(
+    prometheus_snapshots: list[str],
+    *,
+    in_window_scrape_count: int,
+    configured_interval_seconds: float,
+) -> dict[str, object]:
+    """Aggregate DCGM gauges across bounded pre, in-window, and post scrapes."""
+    return _build_gpu_gauge_window(
+        [_extract_gpu_gauge_values(text) for text in prometheus_snapshots],
+        in_window_scrape_count=in_window_scrape_count,
+        configured_interval_seconds=configured_interval_seconds,
+    )
 
 
 def build_telemetry_summary(
@@ -1767,6 +1939,72 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
                 continue
             lines.extend([f"# HELP {metric_name} {help_text}", f"# TYPE {metric_name} gauge"])
             lines.append(f"{metric_name}{{{labels}}} {value:g}")
+
+    telemetry_gauge_window = typed_metrics.get("telemetry_gauge_window")
+    if isinstance(telemetry_gauge_window, dict):
+        scrape_specs = (
+            ("scrape_count", "window"),
+            ("in_window_scrape_count", "in_window"),
+        )
+        emitted_scrape_header = False
+        for source_key, scope in scrape_specs:
+            value = telemetry_gauge_window.get(source_key)
+            if not isinstance(value, (int, float)):
+                continue
+            if not emitted_scrape_header:
+                lines.extend(
+                    [
+                        (
+                            "# HELP triton_benchmark_gpu_window_scrapes Prometheus "
+                            "scrapes used for the sampled GPU gauge window."
+                        ),
+                        "# TYPE triton_benchmark_gpu_window_scrapes gauge",
+                    ]
+                )
+                emitted_scrape_header = True
+            lines.append(
+                "triton_benchmark_gpu_window_scrapes"
+                f'{{{labels},phase="measured",scope="{scope}"}} {value:g}'
+            )
+
+        gauge_specs = (
+            (
+                "utilization_pct",
+                "triton_benchmark_gpu_window_utilization_percent",
+                "Sampled GPU utilization across the bracketed request window.",
+            ),
+            (
+                "memory_copy_utilization_pct",
+                "triton_benchmark_gpu_window_memory_copy_utilization_percent",
+                "Sampled GPU memory-copy utilization across the bracketed request window.",
+            ),
+            (
+                "memory_used_mib",
+                "triton_benchmark_gpu_window_memory_used_mib",
+                "Sampled GPU memory use across the bracketed request window.",
+            ),
+        )
+        gpu_window = telemetry_gauge_window.get("gpu")
+        if isinstance(gpu_window, dict):
+            for source_key, metric_name, help_text in gauge_specs:
+                distribution = gpu_window.get(source_key)
+                if not isinstance(distribution, dict) or not distribution:
+                    continue
+                lines.extend(
+                    [f"# HELP {metric_name} {help_text}", f"# TYPE {metric_name} gauge"]
+                )
+                for stat in ("avg", "min", "max"):
+                    value = distribution.get(stat)
+                    if isinstance(value, (int, float)):
+                        lines.append(
+                            f'{metric_name}{{{labels},stat="{stat}"}} {value:g}'
+                        )
+                for stat, quantile in (("p50", "0.50"), ("p95", "0.95")):
+                    value = distribution.get(stat)
+                    if isinstance(value, (int, float)):
+                        lines.append(
+                            f'{metric_name}{{{labels},quantile="{quantile}"}} {value:g}'
+                        )
 
     telemetry_window = typed_metrics.get("telemetry_window")
     if isinstance(telemetry_window, dict):
@@ -2362,6 +2600,15 @@ def parse_args() -> CliOptions:
         help="Timeout for each opt-in --telemetry-url scrape.",
     )
     parser.add_argument(
+        "--telemetry-sample-interval-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Sample GPU gauges at this interval while measured requests are in flight; "
+            "zero disables in-window sampling."
+        ),
+    )
+    parser.add_argument(
         "--telemetry-api-key-env",
         default="",
         help=(
@@ -2446,6 +2693,10 @@ def parse_args() -> CliOptions:
         )
     if args.telemetry_api_key_env and not args.telemetry_url:
         parser.error("--telemetry-api-key-env requires --telemetry-url")
+    if args.telemetry_sample_interval_seconds < 0:
+        parser.error("--telemetry-sample-interval-seconds must be zero or greater")
+    if args.telemetry_sample_interval_seconds and not args.telemetry_url:
+        parser.error("--telemetry-sample-interval-seconds requires --telemetry-url")
     if args.telemetry_timeout_seconds <= 0:
         parser.error("--telemetry-timeout-seconds must be greater than zero")
     if args.telemetry_url:
@@ -2646,6 +2897,7 @@ def parse_args() -> CliOptions:
         telemetry_baseline_prometheus_path=args.telemetry_baseline_prometheus,
         telemetry_url=args.telemetry_url,
         telemetry_timeout_seconds=args.telemetry_timeout_seconds,
+        telemetry_sample_interval_seconds=args.telemetry_sample_interval_seconds,
         telemetry_api_key_env=args.telemetry_api_key_env,
         max_server_failure_rate=args.max_server_failure_rate,
         max_server_queue_fraction=args.max_server_queue_fraction,
@@ -2676,6 +2928,7 @@ def main() -> None:
         client,
         config,
         telemetry_client=telemetry_client,
+        telemetry_sample_interval_seconds=options.telemetry_sample_interval_seconds,
         max_server_failure_rate=options.max_server_failure_rate,
         max_server_queue_fraction=options.max_server_queue_fraction,
     )
