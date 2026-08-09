@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -19,6 +20,7 @@ from benchmark import (
     attach_telemetry_summary,
     build_http_telemetry_client,
     build_cost_model,
+    build_gpu_gauge_window,
     build_llm_metrics,
     build_regression_report,
     build_telemetry_counter_window,
@@ -241,6 +243,79 @@ class BenchmarkHarnessTest(unittest.TestCase):
         )
         self.assertEqual(metrics["telemetry_window"]["derived"]["request_total"], 3)
         self.assertTrue(metrics["telemetry_gate"]["passed"])
+
+    def test_http_telemetry_samples_gpu_gauges_during_measured_phase(self) -> None:
+        class SlowClient:
+            def infer(self) -> None:
+                time.sleep(0.04)
+
+        class SamplingTelemetryClient:
+            def __init__(self) -> None:
+                self.scrape_count = 0
+
+            def scrape(self) -> str:
+                self.scrape_count += 1
+                value = self.scrape_count * 10
+                return (
+                    f'DCGM_FI_DEV_GPU_UTIL{{gpu="0"}} {value}\n'
+                    f'DCGM_FI_DEV_MEM_COPY_UTIL{{gpu="0"}} {value / 2}\n'
+                    f'DCGM_FI_DEV_FB_USED{{gpu="0"}} {1024 + value}\n'
+                    f'nv_inference_request_success{{model="review-model"}} {100 + value}\n'
+                    'nv_inference_request_failure{model="review-model"} 0\n'
+                    f'nv_inference_request_duration_us{{model="review-model"}} {1000 + value}\n'
+                    f'nv_inference_queue_duration_us{{model="review-model"}} {100 + value}\n'
+                    "nv_inference_compute_infer_duration_us"
+                    f'{{model="review-model"}} {800 + value}\n'
+                )
+
+        telemetry_client = SamplingTelemetryClient()
+        metrics = run_benchmark(
+            SlowClient(),
+            BenchmarkConfig(
+                model_name="review-model",
+                num_requests=4,
+                concurrency=2,
+                retries=0,
+            ),
+            telemetry_client=telemetry_client,
+            telemetry_sample_interval_seconds=0.005,
+        )
+
+        window = metrics["telemetry_gauge_window"]
+        self.assertGreaterEqual(window["in_window_scrape_count"], 2)
+        self.assertEqual(
+            window["scrape_count"],
+            window["in_window_scrape_count"] + 2,
+        )
+        self.assertEqual(window["alignment"], "harness_bracketed_measured_phase")
+        self.assertGreater(window["gpu"]["utilization_pct"]["sample_count"], 2)
+        self.assertIn("p95", window["gpu"]["utilization_pct"])
+        serialized = json.dumps(metrics)
+        self.assertNotIn("DCGM_FI_DEV_GPU_UTIL", serialized)
+        self.assertNotIn("nv_inference_request_success", serialized)
+
+    def test_in_window_telemetry_scrape_failure_aborts_qualification(self) -> None:
+        class SlowClient:
+            def infer(self) -> None:
+                time.sleep(0.04)
+
+        class FailingTelemetryClient:
+            def __init__(self) -> None:
+                self.scrape_count = 0
+
+            def scrape(self) -> str:
+                self.scrape_count += 1
+                if self.scrape_count > 1:
+                    raise RuntimeError("fixture scrape failed")
+                return 'DCGM_FI_DEV_GPU_UTIL{gpu="0"} 20\n'
+
+        with self.assertRaisesRegex(RuntimeError, "in-window telemetry scrape failed"):
+            run_benchmark(
+                SlowClient(),
+                BenchmarkConfig(num_requests=2, concurrency=1, retries=0),
+                telemetry_client=FailingTelemetryClient(),
+                telemetry_sample_interval_seconds=0.005,
+            )
 
     def test_http_telemetry_client_sends_only_explicit_authentication(self) -> None:
         requests = []
@@ -764,6 +839,40 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertEqual(summary["triton"]["queue_duration_us_total"], 4300.0)
         self.assertEqual(summary["triton"]["compute_infer_duration_us_total"], 0)
 
+    def test_gpu_gauge_window_aggregates_repeated_bounded_scrapes(self) -> None:
+        window = build_gpu_gauge_window(
+            [
+                """
+                DCGM_FI_DEV_GPU_UTIL{gpu="0"} 20
+                DCGM_FI_DEV_GPU_UTIL{gpu="1"} 40
+                DCGM_FI_DEV_MEM_COPY_UTIL{gpu="0"} 10
+                DCGM_FI_DEV_FB_USED{gpu="0"} 1024
+                """,
+                """
+                DCGM_FI_DEV_GPU_UTIL{gpu="0"} 60
+                DCGM_FI_DEV_GPU_UTIL{gpu="1"} 80
+                DCGM_FI_DEV_MEM_COPY_UTIL{gpu="0"} 30
+                dcgm_gpu_memory_used_bytes{gpu="0"} 2147483648
+                """,
+                """
+                DCGM_FI_DEV_GPU_UTIL{gpu="0"} 100
+                DCGM_FI_DEV_MEM_COPY_UTIL{gpu="0"} 50
+                DCGM_FI_DEV_FB_USED{gpu="0"} 3072
+                """,
+            ],
+            in_window_scrape_count=1,
+            configured_interval_seconds=0.25,
+        )
+
+        self.assertEqual(window["scrape_count"], 3)
+        self.assertEqual(window["in_window_scrape_count"], 1)
+        self.assertEqual(window["gpu"]["utilization_pct"]["sample_count"], 5)
+        self.assertEqual(window["gpu"]["utilization_pct"]["avg"], 60.0)
+        self.assertEqual(window["gpu"]["utilization_pct"]["p50"], 60.0)
+        self.assertEqual(window["gpu"]["utilization_pct"]["p95"], 100.0)
+        self.assertEqual(window["gpu"]["memory_used_mib"]["max"], 3072.0)
+        self.assertIn("not time-weighted", " ".join(window["notes"]))
+
     def test_telemetry_counter_window_derives_observed_window_rates(self) -> None:
         before = build_telemetry_summary(
             """
@@ -957,6 +1066,36 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertIn("triton_benchmark_server_queue_duration_fraction", output)
         self.assertIn("triton_benchmark_telemetry_gate_passed", output)
 
+    def test_prometheus_export_includes_sampled_gpu_gauge_window(self) -> None:
+        metrics = summarize_results(
+            [InferenceResult(ok=True, latency_ms=10.0)],
+            duration_seconds=1.0,
+            config=BenchmarkConfig(num_requests=1),
+        )
+        metrics["telemetry_gauge_window"] = {
+            "scrape_count": 5,
+            "in_window_scrape_count": 3,
+            "gpu": {
+                "utilization_pct": {
+                    "sample_count": 10,
+                    "avg": 70.0,
+                    "min": 40.0,
+                    "p50": 72.0,
+                    "p95": 91.0,
+                    "max": 95.0,
+                },
+                "memory_copy_utilization_pct": {},
+                "memory_used_mib": {},
+            },
+        }
+
+        output = format_prometheus_metrics(metrics)
+
+        self.assertIn("triton_benchmark_gpu_window_scrapes", output)
+        self.assertIn('phase="measured",scope="in_window"} 3', output)
+        self.assertIn("triton_benchmark_gpu_window_utilization_percent", output)
+        self.assertIn('quantile="0.95"} 91', output)
+
     def test_parses_telemetry_gate_options(self) -> None:
         with patch(
             "sys.argv",
@@ -989,6 +1128,8 @@ class BenchmarkHarnessTest(unittest.TestCase):
                 "https://metrics.example.test/metrics",
                 "--telemetry-timeout-seconds",
                 "3.5",
+                "--telemetry-sample-interval-seconds",
+                "0.25",
                 "--telemetry-api-key-env",
                 "TELEMETRY_TOKEN",
                 "--max-server-failure-rate",
@@ -1003,6 +1144,7 @@ class BenchmarkHarnessTest(unittest.TestCase):
             "https://metrics.example.test/metrics",
         )
         self.assertEqual(options.telemetry_timeout_seconds, 3.5)
+        self.assertEqual(options.telemetry_sample_interval_seconds, 0.25)
         self.assertEqual(options.telemetry_api_key_env, "TELEMETRY_TOKEN")
         self.assertEqual(options.max_server_failure_rate, 0.01)
         self.assertTrue(options.fail_on_telemetry_gate)
@@ -1025,6 +1167,14 @@ class BenchmarkHarnessTest(unittest.TestCase):
         with patch(
             "sys.argv",
             ["benchmark.py", "--telemetry-api-key-env", "TELEMETRY_TOKEN"],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+
+    def test_telemetry_sampling_interval_requires_telemetry_url(self) -> None:
+        with patch(
+            "sys.argv",
+            ["benchmark.py", "--telemetry-sample-interval-seconds", "0.25"],
         ):
             with self.assertRaises(SystemExit):
                 parse_args()

@@ -195,6 +195,7 @@ python benchmark.py \
   --concurrency 32 \
   --telemetry-url http://prometheus.monitoring.svc:9090/federate \
   --telemetry-timeout-seconds 10 \
+  --telemetry-sample-interval-seconds 1 \
   --telemetry-api-key-env TELEMETRY_TOKEN \
   --max-server-failure-rate 0.02 \
   --max-server-queue-fraction 0.10 \
@@ -212,7 +213,18 @@ Artifacts contain only parsed summaries, deltas, and gates. They exclude the
 endpoint URL, environment-variable name, bearer token, authorization header,
 and raw response. The alignment label proves only this process's phase order;
 unrelated server traffic and scrape-target changes remain external controls,
-and the post-run DCGM values are still point-in-time gauges.
+and the post-run DCGM values are still point-in-time gauges unless sampling is
+explicitly enabled.
+
+With `--telemetry-sample-interval-seconds`, the harness also samples known DCGM
+gauges after measured requests have been submitted and until the measured phase
+completes. The JSON and Prometheus artifacts report the number of boundary and
+in-window scrapes, matched-value coverage, and sample average, p50, p95, min,
+and max for GPU utilization, memory-copy utilization, and memory used. The two
+boundary scrapes are included in the distribution. These values are not
+time-weighted, target identities are not persisted, and a shared scrape can
+include unrelated activity. A failed in-window scrape aborts the qualification
+rather than publishing a partial sampled window.
 
 ## Cost-To-Serve Review
 

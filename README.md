@@ -22,6 +22,9 @@ inference endpoint.
   and queue-fraction gates; raw scrapes and operator paths stay out of artifacts.
 - Opt-in HTTP(S) Prometheus capture that scrapes after warmup and immediately
   around the measured request phase without sending ambient credentials.
+- Optional repeated DCGM gauge sampling across that bracketed window, reporting
+  scrape/value coverage plus sample average, p50, p95, min, and max without
+  calling the result a time-weighted measurement.
 - Named workload profiles for interactive, long-context, and throughput traffic;
   each records context, output, batch, TTFT, decode, and KV-cache assumptions.
 - Dependency-free mock backend for CI, an optional Triton HTTP mode, and an
@@ -126,6 +129,7 @@ python benchmark.py \
   --concurrency 16 \
   --telemetry-url http://prometheus.monitoring.svc:9090/federate \
   --telemetry-api-key-env TELEMETRY_TOKEN \
+  --telemetry-sample-interval-seconds 1 \
   --max-server-failure-rate 0.02 \
   --max-server-queue-fraction 0.10 \
   --fail-on-telemetry-gate \
@@ -142,8 +146,14 @@ credentials, and each response is bounded to 10 MiB.
 
 `harness_bracketed_measured_phase` describes process ordering, not server
 isolation. Counter deltas can still include unrelated traffic, and the scrape
-target membership must remain stable. Post-run DCGM values remain point-in-time
-gauges rather than window averages.
+target membership must remain stable. With no sampling interval, DCGM values
+remain post-run point gauges. With an explicit positive interval, a sampler
+starts after measured requests are submitted and adds GPU utilization,
+memory-copy utilization, and memory-use samples until measured work completes.
+The artifact combines those values with the two boundary scrapes and labels the
+distribution as sampled rather than time-weighted. It records coverage but not
+target identity, so target churn and unrelated activity remain external
+controls.
 
 ## Sample output (mock backend)
 
@@ -242,4 +252,3 @@ python -m unittest discover -s tests
 
 - Server-lifecycle hooks for controlled cold-start measurements.
 - Distributed load generation for multi-client benchmarking.
-- GPU gauge-window aggregation over repeated in-window scrapes.
