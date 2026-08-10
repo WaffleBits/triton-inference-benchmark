@@ -167,15 +167,18 @@ observation window, supply a before snapshot with
 Use `--max-server-failure-rate` and `--max-server-queue-fraction` to record
 explicit thresholds. Add `--fail-on-telemetry-gate` for exit status 4 when a
 threshold is exceeded or cannot be evaluated. Missing counters, counter resets,
-and zero denominators fail closed instead of being interpreted as zero.
+zero denominators, and changed selected-series membership fail closed instead of
+being interpreted as zero.
 
 The files are operator-supplied. The harness cannot prove that they bracket its
 own request phase, so the artifact labels alignment as unverified. Capture them
 around the intended window with an authorized sidecar or operator workflow. The
 post-snapshot DCGM gauges are not window averages. Raw scrapes and source paths
-are not serialized into the shareable artifacts. The gate compares aggregate
-model counters, not per-replica series membership, so keep the scrape target set
-stable across the two snapshots.
+are not serialized into the shareable artifacts. The harness fingerprints the
+logical counter metric names and sorted labels, then persists only the digest and
+series count. A changed fingerprint invalidates the window. A matching fingerprint
+does not prove that labels map honestly to physical targets or exclude unrelated
+traffic.
 
 ### Harness-bracketed HTTP capture
 
@@ -212,9 +215,10 @@ silently producing an unbracketed artifact.
 Artifacts contain only parsed summaries, deltas, and gates. They exclude the
 endpoint URL, environment-variable name, bearer token, authorization header,
 and raw response. The alignment label proves only this process's phase order;
-unrelated server traffic and scrape-target changes remain external controls,
-and the post-run DCGM values are still point-in-time gauges unless sampling is
-explicitly enabled.
+unrelated server traffic remains an external control, and the post-run DCGM
+values are still point-in-time gauges unless sampling is explicitly enabled.
+Selected counter-series churn is detected by a label-derived SHA-256 fingerprint,
+without publishing the labels.
 
 With `--telemetry-sample-interval-seconds`, the harness also samples known DCGM
 gauges after measured requests have been submitted and until the measured phase
@@ -222,9 +226,12 @@ completes. The JSON and Prometheus artifacts report the number of boundary and
 in-window scrapes, matched-value coverage, and sample average, p50, p95, min,
 and max for GPU utilization, memory-copy utilization, and memory used. The two
 boundary scrapes are included in the distribution. These values are not
-time-weighted, target identities are not persisted, and a shared scrape can
-include unrelated activity. A failed in-window scrape aborts the qualification
-rather than publishing a partial sampled window.
+time-weighted, and a shared scrape can include unrelated activity. The harness
+normalizes supported exporter aliases and verifies the known GPU-series
+fingerprint across every scrape. A changed fingerprint or failed in-window scrape
+aborts the qualification rather than publishing a mixed-membership or partial
+sampled window. Only the stable fingerprint and series count are persisted; raw
+labels are not.
 
 ## Cost-To-Serve Review
 

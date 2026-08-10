@@ -30,6 +30,22 @@ TRITON_QUEUE_DURATION_METRICS = {"nv_inference_queue_duration_us"}
 TRITON_COMPUTE_INFER_DURATION_METRICS = {"nv_inference_compute_infer_duration_us"}
 MAX_TELEMETRY_RESPONSE_BYTES = 10 * 1024 * 1024
 
+GPU_GAUGE_METRIC_ALIASES = {
+    **{name: "utilization_pct" for name in GPU_UTILIZATION_METRICS},
+    **{name: "memory_copy_utilization_pct" for name in GPU_MEMORY_COPY_METRICS},
+    **{name: "memory_used_mib" for name in GPU_MEMORY_USED_METRICS},
+}
+TRITON_COUNTER_METRIC_ALIASES = {
+    **{name: "request_success" for name in TRITON_REQUEST_SUCCESS_METRICS},
+    **{name: "request_failure" for name in TRITON_REQUEST_FAILURE_METRICS},
+    **{name: "request_duration_us" for name in TRITON_REQUEST_DURATION_METRICS},
+    **{name: "queue_duration_us" for name in TRITON_QUEUE_DURATION_METRICS},
+    **{
+        name: "compute_infer_duration_us"
+        for name in TRITON_COMPUTE_INFER_DURATION_METRICS
+    },
+}
+
 
 def normalize_openai_completions_url(server_url: str) -> str:
     """Return the OpenAI-compatible streaming completions endpoint."""
@@ -205,6 +221,12 @@ class PrometheusSample:
     metric: str
     labels: dict[str, str]
     value: float
+
+
+@dataclass(frozen=True)
+class GpuGaugeCapture:
+    values: dict[str, list[float]]
+    series_membership: dict[str, object]
 
 
 class TelemetrySnapshotClient(Protocol):
@@ -715,13 +737,13 @@ def _sample_telemetry_during_phase(
     interval_seconds: float,
     phase_started: threading.Event,
     stop_requested: threading.Event,
-    snapshots: list[dict[str, list[float]]],
+    snapshots: list[GpuGaugeCapture],
     errors: list[Exception],
 ) -> None:
     phase_started.wait()
     while not stop_requested.is_set():
         try:
-            snapshots.append(_extract_gpu_gauge_values(telemetry_client.scrape()))
+            snapshots.append(_build_gpu_gauge_capture(telemetry_client.scrape()))
         except Exception as exc:  # noqa: BLE001 - propagated on the benchmark thread.
             errors.append(exc)
             stop_requested.set()
@@ -781,7 +803,7 @@ def run_benchmark(
         )
 
     telemetry_before = telemetry_client.scrape() if telemetry_client else None
-    in_window_telemetry: list[dict[str, list[float]]] = []
+    in_window_telemetry: list[GpuGaugeCapture] = []
     telemetry_errors: list[Exception] = []
     phase_started = threading.Event()
     stop_sampling = threading.Event()
@@ -846,12 +868,14 @@ def run_benchmark(
             max_server_queue_fraction=max_server_queue_fraction,
         )
         if telemetry_sample_interval_seconds:
+            gauge_captures = [
+                _build_gpu_gauge_capture(telemetry_before),
+                *in_window_telemetry,
+                _build_gpu_gauge_capture(telemetry_after),
+            ]
             summary["telemetry_gauge_window"] = _build_gpu_gauge_window(
-                [
-                    _extract_gpu_gauge_values(telemetry_before),
-                    *in_window_telemetry,
-                    _extract_gpu_gauge_values(telemetry_after),
-                ],
+                [capture.values for capture in gauge_captures],
+                [capture.series_membership for capture in gauge_captures],
                 in_window_scrape_count=len(in_window_telemetry),
                 configured_interval_seconds=telemetry_sample_interval_seconds,
             )
@@ -1331,6 +1355,49 @@ def _values_for_metrics(
     return values
 
 
+def _build_series_membership(
+    samples: list[PrometheusSample],
+    metric_aliases: dict[str, str],
+    model_name: str | None = None,
+) -> dict[str, object]:
+    """Hash selected Prometheus series identities without retaining raw labels."""
+    identities: set[str] = set()
+    for sample in samples:
+        logical_metric = metric_aliases.get(sample.metric)
+        if logical_metric is None:
+            continue
+        if model_name and not _sample_matches_model(sample, model_name):
+            continue
+        identities.add(
+            json.dumps(
+                [logical_metric, sorted(sample.labels.items())],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+
+    ordered_identities = sorted(identities)
+    fingerprint = (
+        hashlib.sha256(
+            json.dumps(
+                ordered_identities,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if ordered_identities
+        else None
+    )
+    return {
+        "series_count": len(ordered_identities),
+        "fingerprint_sha256": fingerprint,
+        "fingerprint_scope": (
+            "logical metric names and sorted labels; sample values excluded; "
+            "raw series identities not persisted"
+        ),
+    }
+
+
 def _stat_summary(values: list[float]) -> dict[str, float]:
     if not values:
         return {}
@@ -1363,6 +1430,12 @@ def _gauge_window_stat_summary(
 
 def _extract_gpu_gauge_values(prometheus_text: str) -> dict[str, list[float]]:
     samples = parse_prometheus_samples(prometheus_text)
+    return _extract_gpu_gauge_values_from_samples(samples)
+
+
+def _extract_gpu_gauge_values_from_samples(
+    samples: list[PrometheusSample],
+) -> dict[str, list[float]]:
     return {
         "utilization_pct": _values_for_metrics(samples, GPU_UTILIZATION_METRICS),
         "memory_copy_utilization_pct": _values_for_metrics(
@@ -1373,8 +1446,20 @@ def _extract_gpu_gauge_values(prometheus_text: str) -> dict[str, list[float]]:
     }
 
 
+def _build_gpu_gauge_capture(prometheus_text: str) -> GpuGaugeCapture:
+    samples = parse_prometheus_samples(prometheus_text)
+    return GpuGaugeCapture(
+        values=_extract_gpu_gauge_values_from_samples(samples),
+        series_membership=_build_series_membership(
+            samples,
+            GPU_GAUGE_METRIC_ALIASES,
+        ),
+    )
+
+
 def _build_gpu_gauge_window(
     gauge_captures: list[dict[str, list[float]]],
+    series_memberships: list[dict[str, object]],
     *,
     in_window_scrape_count: int,
     configured_interval_seconds: float,
@@ -1385,6 +1470,30 @@ def _build_gpu_gauge_window(
         raise ValueError("in-window scrape count must match the sampled gauge window")
     if configured_interval_seconds <= 0:
         raise ValueError("configured telemetry sample interval must be greater than zero")
+    if len(series_memberships) != len(gauge_captures):
+        raise ValueError("every GPU gauge scrape requires a series-membership summary")
+
+    fingerprints = [
+        membership.get("fingerprint_sha256") for membership in series_memberships
+    ]
+    present_fingerprints = [
+        fingerprint for fingerprint in fingerprints if isinstance(fingerprint, str)
+    ]
+    if present_fingerprints and (
+        len(present_fingerprints) != len(fingerprints)
+        or len(set(present_fingerprints)) != 1
+    ):
+        raise ValueError("GPU telemetry series membership changed across sampled window")
+
+    membership_evaluable = len(present_fingerprints) == len(fingerprints)
+    membership_fingerprint = (
+        present_fingerprints[0] if membership_evaluable else None
+    )
+    membership_series_count = (
+        int(series_memberships[0].get("series_count", 0))
+        if membership_evaluable
+        else 0
+    )
 
     gauge_names = (
         "utilization_pct",
@@ -1406,7 +1515,7 @@ def _build_gpu_gauge_window(
             "the pre-boundary and post-boundary scrapes are included with samples "
             "initiated during measured work"
         ),
-        "changing scrape targets can change sample membership; target identity is not persisted",
+        "known GPU series membership is fingerprinted without persisting raw labels",
         "a shared telemetry endpoint can include activity unrelated to this benchmark",
     ]
     if not any(values_by_metric.values()):
@@ -1419,6 +1528,16 @@ def _build_gpu_gauge_window(
         "boundary_scrape_count": 2,
         "in_window_scrape_count": in_window_scrape_count,
         "configured_interval_seconds": configured_interval_seconds,
+        "series_membership": {
+            "evaluable": membership_evaluable,
+            "stable": True if membership_evaluable else None,
+            "series_count": membership_series_count,
+            "fingerprint_sha256": membership_fingerprint,
+            "fingerprint_scope": (
+                "logical metric names and sorted labels; sample values excluded; "
+                "raw series identities not persisted"
+            ),
+        },
         "gpu": {
             name: _gauge_window_stat_summary(
                 values_by_metric[name],
@@ -1437,8 +1556,10 @@ def build_gpu_gauge_window(
     configured_interval_seconds: float,
 ) -> dict[str, object]:
     """Aggregate DCGM gauges across bounded pre, in-window, and post scrapes."""
+    captures = [_build_gpu_gauge_capture(text) for text in prometheus_snapshots]
     return _build_gpu_gauge_window(
-        [_extract_gpu_gauge_values(text) for text in prometheus_snapshots],
+        [capture.values for capture in captures],
+        [capture.series_membership for capture in captures],
         in_window_scrape_count=in_window_scrape_count,
         configured_interval_seconds=configured_interval_seconds,
     )
@@ -1479,6 +1600,17 @@ def build_telemetry_summary(
         TRITON_COMPUTE_INFER_DURATION_METRICS,
         model_name=model_name,
     )
+    series_membership = {
+        "gpu_gauges": _build_series_membership(
+            samples,
+            GPU_GAUGE_METRIC_ALIASES,
+        ),
+        "triton_counters": _build_series_membership(
+            samples,
+            TRITON_COUNTER_METRIC_ALIASES,
+            model_name=model_name,
+        ),
+    }
 
     notes: list[str] = []
     if not any((gpu_utilization, gpu_memory_copy, gpu_memory_used)):
@@ -1497,6 +1629,7 @@ def build_telemetry_summary(
     return {
         "source": source,
         "sample_count": len(samples),
+        "series_membership": series_membership,
         "gpu": {
             "utilization_pct": _stat_summary(gpu_utilization),
             "memory_copy_utilization_pct": _stat_summary(gpu_memory_copy),
@@ -1548,6 +1681,45 @@ def build_telemetry_counter_window(
     if not isinstance(baseline_counts, dict) or not isinstance(candidate_counts, dict):
         raise ValueError("telemetry summaries must include counter sample counts")
 
+    baseline_memberships = baseline.get("series_membership", {})
+    candidate_memberships = candidate.get("series_membership", {})
+    if not isinstance(baseline_memberships, dict):
+        baseline_memberships = {}
+    if not isinstance(candidate_memberships, dict):
+        candidate_memberships = {}
+    baseline_membership = baseline_memberships.get("triton_counters", {})
+    candidate_membership = candidate_memberships.get("triton_counters", {})
+    if not isinstance(baseline_membership, dict):
+        baseline_membership = {}
+    if not isinstance(candidate_membership, dict):
+        candidate_membership = {}
+    before_fingerprint = baseline_membership.get("fingerprint_sha256")
+    after_fingerprint = candidate_membership.get("fingerprint_sha256")
+    membership_evaluable = isinstance(before_fingerprint, str) and isinstance(
+        after_fingerprint,
+        str,
+    )
+    membership_stable = (
+        membership_evaluable and before_fingerprint == after_fingerprint
+    )
+    before_series_count = int(baseline_membership.get("series_count", 0))
+    after_series_count = int(candidate_membership.get("series_count", 0))
+    series_membership: dict[str, object] = {
+        "evaluable": membership_evaluable,
+        "stable": membership_stable,
+        "before_series_count": before_series_count,
+        "after_series_count": after_series_count,
+        "series_count": before_series_count if membership_stable else None,
+        "fingerprint_sha256": before_fingerprint if membership_stable else None,
+        "fingerprint_scope": (
+            "logical metric names and sorted labels; sample values excluded; "
+            "raw series identities not persisted"
+        ),
+    }
+    if membership_evaluable and not membership_stable:
+        series_membership["before_fingerprint_sha256"] = before_fingerprint
+        series_membership["after_fingerprint_sha256"] = after_fingerprint
+
     deltas: dict[str, float | None] = {}
     unavailable_counters: list[str] = []
     counter_resets: list[str] = []
@@ -1594,7 +1766,8 @@ def build_telemetry_counter_window(
 
     notes = [
         "DCGM gauges remain point-in-time values in the post-run telemetry summary",
-        "counter deltas may include unrelated server traffic and require stable scrape target membership",
+        "counter-series membership is compared by a privacy-preserving fingerprint",
+        "counter deltas may include unrelated server traffic even when membership is stable",
     ]
     if alignment == "harness_bracketed_measured_phase":
         notes.insert(
@@ -1610,7 +1783,12 @@ def build_telemetry_counter_window(
     return {
         "source": source,
         "alignment": alignment,
-        "valid": not unavailable_counters and not counter_resets,
+        "valid": (
+            not unavailable_counters
+            and not counter_resets
+            and membership_stable
+        ),
+        "series_membership": series_membership,
         "counter_resets": sorted(counter_resets),
         "unavailable_counters": sorted(unavailable_counters),
         "deltas": deltas,
@@ -1635,6 +1813,16 @@ def build_telemetry_gate(
 
     checks: dict[str, dict[str, object]] = {}
     failure_reasons: list[str] = []
+    series_membership = counter_window.get("series_membership")
+    if isinstance(series_membership, dict):
+        if not series_membership.get("evaluable"):
+            failure_reasons.append(
+                "telemetry series membership unavailable from paired counter snapshots"
+            )
+        elif series_membership.get("stable") is not True:
+            failure_reasons.append(
+                "telemetry series membership changed between paired counter snapshots"
+            )
     specifications = (
         (
             "server_failure_rate",
@@ -1967,6 +2155,30 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
                 f'{{{labels},phase="measured",scope="{scope}"}} {value:g}'
             )
 
+        gauge_membership = telemetry_gauge_window.get("series_membership")
+        if isinstance(gauge_membership, dict):
+            stable = gauge_membership.get("stable")
+            if isinstance(stable, bool):
+                lines.extend(
+                    [
+                        "# HELP triton_benchmark_gpu_window_series_membership_stable Whether known GPU series membership stayed stable across every sampled scrape.",
+                        "# TYPE triton_benchmark_gpu_window_series_membership_stable gauge",
+                        (
+                            "triton_benchmark_gpu_window_series_membership_stable"
+                            f"{{{labels}}} {int(stable)}"
+                        ),
+                    ]
+                )
+            series_count = gauge_membership.get("series_count")
+            if isinstance(series_count, int) and not isinstance(series_count, bool):
+                lines.extend(
+                    [
+                        "# HELP triton_benchmark_gpu_window_series_count Known GPU series represented by each stable scrape.",
+                        "# TYPE triton_benchmark_gpu_window_series_count gauge",
+                        f"triton_benchmark_gpu_window_series_count{{{labels}}} {series_count}",
+                    ]
+                )
+
         gauge_specs = (
             (
                 "utilization_pct",
@@ -2008,6 +2220,42 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
 
     telemetry_window = typed_metrics.get("telemetry_window")
     if isinstance(telemetry_window, dict):
+        counter_membership = telemetry_window.get("series_membership")
+        if isinstance(counter_membership, dict):
+            stable = counter_membership.get("stable")
+            if isinstance(stable, bool):
+                lines.extend(
+                    [
+                        "# HELP triton_benchmark_server_series_membership_stable Whether Triton counter series membership matched across paired snapshots.",
+                        "# TYPE triton_benchmark_server_series_membership_stable gauge",
+                        (
+                            "triton_benchmark_server_series_membership_stable"
+                            f"{{{labels}}} {int(stable)}"
+                        ),
+                    ]
+                )
+            membership_counts = (
+                ("before_series_count", "before"),
+                ("after_series_count", "after"),
+            )
+            emitted_count_header = False
+            for source_key, snapshot in membership_counts:
+                series_count = counter_membership.get(source_key)
+                if not isinstance(series_count, int) or isinstance(series_count, bool):
+                    continue
+                if not emitted_count_header:
+                    lines.extend(
+                        [
+                            "# HELP triton_benchmark_server_series_count Triton counter series represented by each paired snapshot.",
+                            "# TYPE triton_benchmark_server_series_count gauge",
+                        ]
+                    )
+                    emitted_count_header = True
+                lines.append(
+                    "triton_benchmark_server_series_count"
+                    f'{{{labels},snapshot="{snapshot}"}} {series_count}'
+                )
+
         counter_deltas = telemetry_window.get("deltas")
         if isinstance(counter_deltas, dict):
             emitted_header = False

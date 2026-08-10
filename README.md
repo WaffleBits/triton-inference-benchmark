@@ -19,12 +19,13 @@ inference endpoint.
 - JSON output and Prometheus text export for trend tracking.
 - Baseline-versus-candidate comparison with p95 and success-rate gates.
 - Paired before/after Triton counter windows with fail-closed server failure-rate
-  and queue-fraction gates; raw scrapes and operator paths stay out of artifacts.
+  and queue-fraction gates plus hashed series-membership validation; raw scrapes,
+  labels, and operator paths stay out of artifacts.
 - Opt-in HTTP(S) Prometheus capture that scrapes after warmup and immediately
   around the measured request phase without sending ambient credentials.
 - Optional repeated DCGM gauge sampling across that bracketed window, reporting
   scrape/value coverage plus sample average, p50, p95, min, and max without
-  calling the result a time-weighted measurement.
+  calling the result a time-weighted measurement; target churn rejects the window.
 - Named workload profiles for interactive, long-context, and throughput traffic;
   each records context, output, batch, TTFT, decode, and KV-cache assumptions.
 - Dependency-free mock backend for CI, an optional Triton HTTP mode, and an
@@ -113,7 +114,8 @@ operator or sidecar must capture the first snapshot before and the second after
 the intended observation window. The harness computes Triton counter deltas but
 cannot prove that supplied files bracket its own invocation. It fails a
 configured check when a required counter is missing, resets, or has a zero
-denominator. DCGM utilization and memory remain post-snapshot gauges rather than
+denominator, and fails configured counter gates if the selected series membership
+changes. DCGM utilization and memory remain post-snapshot gauges rather than
 window averages.
 
 Capture the same counter window directly from an authorized Prometheus endpoint:
@@ -145,15 +147,17 @@ artifacts. The endpoint must be an absolute HTTP(S) URL without embedded
 credentials, and each response is bounded to 10 MiB.
 
 `harness_bracketed_measured_phase` describes process ordering, not server
-isolation. Counter deltas can still include unrelated traffic, and the scrape
-target membership must remain stable. With no sampling interval, DCGM values
-remain post-run point gauges. With an explicit positive interval, a sampler
-starts after measured requests are submitted and adds GPU utilization,
-memory-copy utilization, and memory-use samples until measured work completes.
-The artifact combines those values with the two boundary scrapes and labels the
-distribution as sampled rather than time-weighted. It records coverage but not
-target identity, so target churn and unrelated activity remain external
-controls.
+isolation. Counter deltas can still include unrelated traffic. The harness hashes
+logical metric names and sorted labels, persists only the SHA-256 fingerprint and
+series count, and invalidates a paired counter window if membership changes. With
+no sampling interval, DCGM values remain post-run point gauges. With an explicit
+positive interval, a sampler starts after measured requests are submitted and
+adds GPU utilization, memory-copy utilization, and memory-use samples until
+measured work completes. The artifact combines those values with the two boundary
+scrapes and labels the distribution as sampled rather than time-weighted. A
+membership change rejects that sampled window. Matching hashes do not prove
+physical target identity, target health, isolation from unrelated activity, or
+clock synchronization.
 
 ## Sample output (mock backend)
 
