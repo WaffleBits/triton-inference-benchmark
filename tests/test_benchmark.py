@@ -856,6 +856,7 @@ class BenchmarkHarnessTest(unittest.TestCase):
                 """,
                 """
                 DCGM_FI_DEV_GPU_UTIL{gpu="0"} 100
+                dcgm_gpu_utilization{gpu="1"} 120
                 DCGM_FI_DEV_MEM_COPY_UTIL{gpu="0"} 50
                 DCGM_FI_DEV_FB_USED{gpu="0"} 3072
                 """,
@@ -866,12 +867,35 @@ class BenchmarkHarnessTest(unittest.TestCase):
 
         self.assertEqual(window["scrape_count"], 3)
         self.assertEqual(window["in_window_scrape_count"], 1)
-        self.assertEqual(window["gpu"]["utilization_pct"]["sample_count"], 5)
-        self.assertEqual(window["gpu"]["utilization_pct"]["avg"], 60.0)
+        self.assertEqual(window["gpu"]["utilization_pct"]["sample_count"], 6)
+        self.assertEqual(window["gpu"]["utilization_pct"]["avg"], 70.0)
         self.assertEqual(window["gpu"]["utilization_pct"]["p50"], 60.0)
-        self.assertEqual(window["gpu"]["utilization_pct"]["p95"], 100.0)
+        self.assertEqual(window["gpu"]["utilization_pct"]["p95"], 120.0)
         self.assertEqual(window["gpu"]["memory_used_mib"]["max"], 3072.0)
+        self.assertTrue(window["series_membership"]["stable"])
+        self.assertEqual(window["series_membership"]["series_count"], 4)
+        self.assertEqual(
+            len(window["series_membership"]["fingerprint_sha256"]),
+            64,
+        )
         self.assertIn("not time-weighted", " ".join(window["notes"]))
+
+    def test_gpu_gauge_window_rejects_target_churn_without_exposing_labels(self) -> None:
+        private_before = 'DCGM_FI_DEV_GPU_UTIL{gpu="private-gpu-a"} 20\n'
+        private_after = 'DCGM_FI_DEV_GPU_UTIL{gpu="private-gpu-b"} 30\n'
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "GPU telemetry series membership changed",
+        ) as context:
+            build_gpu_gauge_window(
+                [private_before, private_before, private_after],
+                in_window_scrape_count=1,
+                configured_interval_seconds=0.25,
+            )
+
+        self.assertNotIn("private-gpu-a", str(context.exception))
+        self.assertNotIn("private-gpu-b", str(context.exception))
 
     def test_telemetry_counter_window_derives_observed_window_rates(self) -> None:
         before = build_telemetry_summary(
@@ -907,6 +931,46 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertEqual(window["derived"]["request_total"], 101.0)
         self.assertEqual(window["derived"]["server_failure_rate"], 0.009901)
         self.assertEqual(window["derived"]["server_queue_fraction"], 0.055556)
+        self.assertTrue(window["series_membership"]["stable"])
+        self.assertEqual(window["series_membership"]["series_count"], 5)
+        self.assertEqual(
+            len(window["series_membership"]["fingerprint_sha256"]),
+            64,
+        )
+
+    def test_telemetry_gate_fails_closed_on_series_membership_churn(self) -> None:
+        def snapshot(instance: str, increment: int) -> str:
+            labels = f'model="review-model",instance="{instance}"'
+            return (
+                f"nv_inference_request_success{{{labels}}} {400 + increment}\n"
+                f"nv_inference_request_failure{{{labels}}} {increment}\n"
+                f"nv_inference_request_duration_us{{{labels}}} {9400000 + increment}\n"
+                f"nv_inference_queue_duration_us{{{labels}}} {210000 + increment}\n"
+                f"nv_inference_compute_infer_duration_us{{{labels}}} {7600000 + increment}\n"
+            )
+
+        before = build_telemetry_summary(
+            snapshot("private-node-a", 0),
+            model_name="review-model",
+        )
+        after = build_telemetry_summary(
+            snapshot("private-node-b", 100),
+            model_name="review-model",
+        )
+
+        window = build_telemetry_counter_window(before, after)
+        gate = build_telemetry_gate(window, max_server_failure_rate=1.0)
+
+        self.assertFalse(window["valid"])
+        self.assertFalse(window["series_membership"]["stable"])
+        self.assertEqual(window["series_membership"]["before_series_count"], 5)
+        self.assertEqual(window["series_membership"]["after_series_count"], 5)
+        self.assertFalse(gate["passed"])
+        self.assertIn("series membership changed", " ".join(gate["failure_reasons"]))
+        serialized = json.dumps({"window": window, "gate": gate})
+        self.assertNotIn("private-node-a", serialized)
+        self.assertNotIn("private-node-b", serialized)
+        self.assertNotIn("nv_inference_request_success", serialized)
 
     def test_telemetry_gate_reports_all_failed_thresholds(self) -> None:
         gate = build_telemetry_gate(
@@ -1039,6 +1103,11 @@ class BenchmarkHarnessTest(unittest.TestCase):
             config=BenchmarkConfig(num_requests=1),
         )
         metrics["telemetry_window"] = {
+            "series_membership": {
+                "stable": True,
+                "before_series_count": 5,
+                "after_series_count": 5,
+            },
             "deltas": {
                 "request_success": 100.0,
                 "request_failure": 1.0,
@@ -1064,6 +1133,8 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertIn('counter="request_success"} 100', output)
         self.assertIn("triton_benchmark_server_failure_rate", output)
         self.assertIn("triton_benchmark_server_queue_duration_fraction", output)
+        self.assertIn("triton_benchmark_server_series_membership_stable", output)
+        self.assertIn('snapshot="before"} 5', output)
         self.assertIn("triton_benchmark_telemetry_gate_passed", output)
 
     def test_prometheus_export_includes_sampled_gpu_gauge_window(self) -> None:
@@ -1075,6 +1146,10 @@ class BenchmarkHarnessTest(unittest.TestCase):
         metrics["telemetry_gauge_window"] = {
             "scrape_count": 5,
             "in_window_scrape_count": 3,
+            "series_membership": {
+                "stable": True,
+                "series_count": 2,
+            },
             "gpu": {
                 "utilization_pct": {
                     "sample_count": 10,
@@ -1093,6 +1168,8 @@ class BenchmarkHarnessTest(unittest.TestCase):
 
         self.assertIn("triton_benchmark_gpu_window_scrapes", output)
         self.assertIn('phase="measured",scope="in_window"} 3', output)
+        self.assertIn("triton_benchmark_gpu_window_series_membership_stable", output)
+        self.assertIn("triton_benchmark_gpu_window_series_count", output)
         self.assertIn("triton_benchmark_gpu_window_utilization_percent", output)
         self.assertIn('quantile="0.95"} 91', output)
 

@@ -26,9 +26,12 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Baseline-versus-candidate comparison with explicit regression reasons.
 - Correlated server telemetry for GPU utilization, memory pressure, queue time, and Triton counters.
 - Fail-closed server failure-rate and queue-fraction gates derived from paired
-  cumulative counters, with aggregate-decrease and missing-family detection.
+  cumulative counters, with aggregate-decrease, missing-family, and hashed
+  series-membership validation.
 - Opt-in HTTP(S) telemetry capture bracketed around the measured request phase,
   with explicit authentication and artifact privacy boundaries.
+- Sampled GPU gauge windows that reject target churn while persisting only a
+  series-membership hash and count rather than raw Prometheus labels.
 - Exact-output batch-invariance testing under concurrent noise traffic.
 - Token-throughput, GPU-capacity, energy, and normalized cost-to-serve estimates with explicit assumptions.
 - Kubernetes job posture with non-root runtime settings.
@@ -45,5 +48,4 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Add controlled server-lifecycle hooks for defensible cold-start measurements.
 - Add distributed load generation across multiple clients.
 - Add saved benchmark reports with trend comparisons over time.
-- Add GPU gauge-window aggregation over repeated in-window scrapes.
 - Add model-aware numeric tolerance policies for outputs that do not promise bitwise determinism.

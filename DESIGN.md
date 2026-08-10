@@ -62,16 +62,20 @@ phase duration. The URL, optional bearer token, authorization header, and raw
 responses are not serialized.
 
 Harness bracketing does not isolate the server. Counter deltas can include
-unrelated traffic, and per-replica series membership is not persisted or
-compared, so operators must keep the scrape target set stable. By default, DCGM
-values are gauges from the post snapshot. A positive
+unrelated traffic. The harness canonicalizes logical metric names and sorted
+labels in memory, persists only a SHA-256 series-membership fingerprint plus a
+count, and invalidates paired counter evidence when the selected series set
+changes. By default, DCGM values are gauges from the post snapshot. A positive
 `--telemetry-sample-interval-seconds` starts a separate sampler after measured
 requests are submitted. The sampler stops when the request phase completes and
 any failed scrape aborts the qualification. Its DCGM values are combined with
 the boundary scrapes into sample average, p50, p95, min, and max records with
 explicit scrape/value coverage. These are sample statistics, not a time-weighted
-integral, and no target identity is persisted. Authentication is opt-in through
-an explicitly named environment variable; ambient API keys are not sent.
+integral. Any known GPU-series membership change across those scrapes aborts the
+window. Raw label keys and values are not persisted. Matching fingerprints do not
+prove physical target identity, health, isolation, or time synchronization.
+Authentication is opt-in through an explicitly named environment variable;
+ambient API keys are not sent.
 
 ## Cost-To-Serve Model
 

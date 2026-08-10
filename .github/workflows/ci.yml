@@ -81,6 +81,10 @@ jobs:
           assert metrics["telemetry_window"]["source"] == "paired_http_prometheus_scrapes"
           assert metrics["telemetry_window"]["alignment"] == "harness_bracketed_measured_phase"
           assert metrics["telemetry_window"]["derived"]["request_total"] == 101
+          assert metrics["telemetry_window"]["series_membership"]["stable"] is True
+          assert len(
+              metrics["telemetry_window"]["series_membership"]["fingerprint_sha256"]
+          ) == 64
           assert metrics["telemetry_gate"]["passed"] is True
           gauge_window = metrics["telemetry_gauge_window"]
           assert gauge_window["in_window_scrape_count"] >= 2
@@ -89,8 +93,14 @@ jobs:
               == gauge_window["in_window_scrape_count"] + 2
           )
           assert gauge_window["gpu"]["utilization_pct"]["sample_count"] >= 4
+          assert gauge_window["series_membership"]["stable"] is True
+          assert len(gauge_window["series_membership"]["fingerprint_sha256"]) == 64
           assert results[0].with_suffix(".prom").is_file()
+          prometheus = results[0].with_suffix(".prom").read_text(encoding="utf-8")
+          assert "triton_benchmark_server_series_membership_stable" in prometheus
+          assert "triton_benchmark_gpu_window_series_membership_stable" in prometheus
           serialized = json.dumps(metrics)
           assert "127.0.0.1" not in serialized
           assert "nv_inference_request_success" not in serialized
+          assert '"version"' not in serialized
           PY
