@@ -99,6 +99,7 @@ python benchmark.py \
   --num-requests 100 \
   --concurrency 8 \
   --openai-timeout-seconds 60 \
+  --propagate-trace-context \
   --prometheus
 ```
 
@@ -109,6 +110,20 @@ must not be interpreted as a token count.
 
 Do not run batch-invariance probes in this mode. The streaming client does not
 yet fingerprint deterministic outputs, and the CLI rejects that combination.
+
+### Trace correlation
+
+Use `--propagate-trace-context` only when the authorized live endpoint is
+configured to consume W3C Trace Context. The flag adds a fresh sampled
+`traceparent` to each physical OpenAI-compatible or Triton HTTP attempt. It is
+off by default, does not read ambient tracing configuration, and does not add
+`tracestate`.
+
+The JSON and Prometheus artifacts record that propagation was configured but do
+not retain trace IDs, parent IDs, or header values. Correlate downstream spans
+inside the authorized collector rather than copying traces into public benchmark
+artifacts. A configured flag is not proof that the server accepted the context,
+exported spans, respected sampling, or synchronized clocks.
 
 ## SLO-Oriented Checks
 
@@ -278,4 +293,5 @@ When a candidate run is marked as a regression:
 
 ## Public-Safe Boundaries
 
-Do not commit production prompts, customer payloads, model weights, secrets, traces, or logs. Keep benchmark samples synthetic or generated.
+Do not commit production prompts, customer payloads, model weights, secrets,
+trace identifiers, traces, or logs. Keep benchmark samples synthetic or generated.

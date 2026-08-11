@@ -32,6 +32,8 @@ inference endpoint.
   OpenAI-compatible streaming mode for vLLM/SGLang-style endpoints.
 - Measured streaming TTFT, inter-chunk latency, output bytes, and server-reported
   output-token throughput without treating transport chunks as tokens.
+- Opt-in W3C `traceparent` propagation for live Triton and OpenAI-compatible
+  requests, with fresh identifiers per HTTP attempt and no identifiers in artifacts.
 
 ## Quick Start
 
@@ -203,6 +205,7 @@ python benchmark.py \
   --concurrency 8 \
   --openai-max-tokens 128 \
   --openai-api-key-env OPENAI_API_KEY \
+  --propagate-trace-context \
   --prometheus
 ```
 
@@ -219,6 +222,14 @@ measured throughput.
 
 The default prompt is synthetic; do not put production prompts, outputs,
 endpoint credentials, or private URLs in committed artifacts.
+
+`--propagate-trace-context` adds a fresh sampled W3C `traceparent` to every
+physical HTTP attempt, including retries, in `openai` and `triton` modes. The
+flag is off by default and is rejected in mock mode. The generated trace ID,
+parent ID, and full header are never written to JSON or Prometheus output. This
+allows a trace-enabled server to continue request context, but the benchmark
+does not verify that the server accepted the header, created or exported spans,
+honored the sampling bit, or synchronized clocks.
 
 ## Run against a real endpoint
 

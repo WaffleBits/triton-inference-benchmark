@@ -61,6 +61,7 @@ class OpenAIStreamingClientTest(unittest.TestCase):
         self.assertEqual(client.max_tokens, 32)
         self.assertEqual(client.timeout_seconds, 9.0)
         self.assertEqual(client.api_key, "test-secret")
+        self.assertFalse(client.propagate_trace_context)
 
     def test_does_not_send_ambient_api_key_without_explicit_opt_in(self) -> None:
         config = BenchmarkConfig(
@@ -277,6 +278,7 @@ class OpenAIStreamingClientTest(unittest.TestCase):
     def test_measures_streaming_completion_events(self) -> None:
         class Handler(BaseHTTPRequestHandler):
             payload = None
+            traceparent = None
 
             def log_message(self, format: str, *args: object) -> None:
                 return
@@ -284,6 +286,7 @@ class OpenAIStreamingClientTest(unittest.TestCase):
             def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
                 length = int(self.headers["Content-Length"])
                 Handler.payload = json.loads(self.rfile.read(length))
+                Handler.traceparent = self.headers.get("traceparent")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
@@ -311,6 +314,7 @@ class OpenAIStreamingClientTest(unittest.TestCase):
                 prompt="synthetic benchmark prompt",
                 max_tokens=8,
                 timeout_seconds=5.0,
+                propagate_trace_context=True,
             )
             observation = client.infer()
         finally:
@@ -328,6 +332,75 @@ class OpenAIStreamingClientTest(unittest.TestCase):
         self.assertTrue(Handler.payload["stream"])
         self.assertEqual(Handler.payload["stream_options"], {"include_usage": True})
         self.assertEqual(Handler.payload["temperature"], 0)
+        self.assertIsNotNone(Handler.traceparent)
+        self.assertRegex(
+            Handler.traceparent,
+            r"^00-(?!0{32})[0-9a-f]{32}-(?!0{16})[0-9a-f]{16}-01$",
+        )
+
+    def test_openai_trace_context_is_disabled_by_default(self) -> None:
+        client = OpenAICompatibleStreamingClient(
+            server_url="http://127.0.0.1:8000",
+            model_name="review-model",
+            prompt="synthetic prompt",
+            max_tokens=8,
+            timeout_seconds=5.0,
+        )
+
+        self.assertFalse(client.propagate_trace_context)
+
+    def test_retry_uses_a_fresh_trace_context_for_each_http_attempt(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            traceparents: list[str] = []
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+            def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+                length = int(self.headers["Content-Length"])
+                self.rfile.read(length)
+                Handler.traceparents.append(self.headers["traceparent"])
+                if len(Handler.traceparents) == 1:
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b'data: {"choices":[{"text":"ok"}]}\n\n')
+                self.wfile.write(
+                    b'data: {"choices":[],"usage":{"completion_tokens":1}}\n\n'
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = OpenAICompatibleStreamingClient(
+                server_url=f"http://127.0.0.1:{server.server_port}",
+                model_name="review-model",
+                prompt="synthetic prompt",
+                max_tokens=8,
+                timeout_seconds=5.0,
+                propagate_trace_context=True,
+            )
+            result = execute_with_retries(client, retries=1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(Handler.traceparents), 2)
+        self.assertEqual(len(set(Handler.traceparents)), 2)
+        for traceparent in Handler.traceparents:
+            self.assertRegex(
+                traceparent,
+                r"^00-(?!0{32})[0-9a-f]{32}-(?!0{16})[0-9a-f]{16}-01$",
+            )
 
 
 if __name__ == "__main__":

@@ -22,6 +22,8 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
   throughput, regression, streaming-token, and cost results.
 - A live Triton HTTP path and an OpenAI-compatible streaming path for authorized model-serving infrastructure.
 - Measured streaming TTFT, inter-chunk latency, output bytes, and server-reported token throughput with explicit usage coverage.
+- Opt-in W3C trace-context propagation on both live HTTP clients, with a real
+  local SSE fixture proving header wiring and identifier-free artifacts.
 - Prometheus-compatible benchmark artifacts for dashboard and CI ingestion.
 - Baseline-versus-candidate comparison with explicit regression reasons.
 - Correlated server telemetry for GPU utilization, memory pressure, queue time, and Triton counters.
@@ -40,7 +42,7 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 
 - AI infrastructure: model-serving reliability, benchmark methodology, latency analysis, and regression tracking.
 - Platform engineering: CLI ergonomics, JSON outputs, testable boundaries, and live-service extension points.
-- Performance engineering: concurrency sweeps, percentile metrics, retry behavior, token throughput, cost modeling, and reproducible reports.
+- Performance engineering: concurrency sweeps, percentile metrics, retry behavior, request trace continuity, token throughput, cost modeling, and reproducible reports.
 - Infrastructure/SRE: operational runbooks, release regression thresholds, deterministic serving checks, Prometheus output, telemetry correlation, and Kubernetes execution shape.
 
 ## Gaps Worth Closing Next

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -20,6 +21,7 @@ from benchmark import (
     attach_telemetry_summary,
     build_http_telemetry_client,
     build_cost_model,
+    build_traceparent,
     build_gpu_gauge_window,
     build_llm_metrics,
     build_regression_report,
@@ -39,6 +41,16 @@ from benchmark import (
 
 
 class BenchmarkHarnessTest(unittest.TestCase):
+    def test_build_traceparent_returns_unique_w3c_sampled_contexts(self) -> None:
+        traceparents = {build_traceparent() for _ in range(32)}
+
+        self.assertEqual(len(traceparents), 32)
+        for traceparent in traceparents:
+            self.assertRegex(
+                traceparent,
+                r"^00-(?!0{32})[0-9a-f]{32}-(?!0{16})[0-9a-f]{16}-01$",
+            )
+
     def test_workload_profiles_are_explicit_and_distinct(self) -> None:
         interactive = resolve_workload_profile("interactive")
         long_context = resolve_workload_profile("long-context")
@@ -122,10 +134,18 @@ class BenchmarkHarnessTest(unittest.TestCase):
                 self.input_data = input_data
 
         class FakeServerClient:
+            headers: list[object] = []
+
             def __init__(self, url: str) -> None:
                 self.url = url
 
-            def infer(self, model_name: str, inputs: list[FakeInferInput]) -> object:
+            def infer(
+                self,
+                model_name: str,
+                inputs: list[FakeInferInput],
+                headers=None,
+            ) -> object:
+                self.headers.append(headers)
                 return self
 
         class FakeHttpClient:
@@ -139,6 +159,7 @@ class BenchmarkHarnessTest(unittest.TestCase):
         client.thread_local = local()
         client.model_name = "model"
         client.input_name = "input"
+        client.propagate_trace_context = True
         barrier = Barrier(2)
 
         def run_worker() -> tuple[int, int]:
@@ -153,6 +174,54 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertEqual(worker_results[0][0], worker_results[0][1])
         self.assertEqual(worker_results[1][0], worker_results[1][1])
         self.assertNotEqual(worker_results[0][0], worker_results[1][0])
+        self.assertEqual(len(FakeServerClient.headers), 4)
+        traceparents = {
+            headers["traceparent"]
+            for headers in FakeServerClient.headers
+            if headers is not None
+        }
+        self.assertEqual(len(traceparents), 4)
+        for traceparent in traceparents:
+            self.assertRegex(traceparent, r"^00-[0-9a-f]{32}-[0-9a-f]{16}-01$")
+
+    def test_triton_http_client_does_not_add_trace_context_by_default(self) -> None:
+        class FakeInputData:
+            shape = (1,)
+            dtype = "float32"
+
+        class FakeInferInput:
+            def __init__(self, name: str, shape: tuple[int, ...], dtype: str) -> None:
+                return None
+
+            def set_data_from_numpy(self, input_data: FakeInputData) -> None:
+                return None
+
+        class FakeServerClient:
+            headers = "not-called"
+
+            def __init__(self, url: str) -> None:
+                return None
+
+            def infer(self, model_name, inputs, headers=None):
+                FakeServerClient.headers = headers
+                return self
+
+        class FakeHttpClient:
+            InferInput = FakeInferInput
+            InferenceServerClient = FakeServerClient
+
+        client = TritonHttpInferenceClient.__new__(TritonHttpInferenceClient)
+        client.httpclient = FakeHttpClient
+        client.np_to_triton_dtype = str
+        client.server_url = "localhost:8000"
+        client.thread_local = local()
+        client.model_name = "model"
+        client.input_name = "input"
+        client.propagate_trace_context = False
+
+        client._infer(FakeInputData())
+
+        self.assertIsNone(FakeServerClient.headers)
 
     def test_percentile_handles_boundaries(self) -> None:
         values = [10.0, 20.0, 30.0, 40.0, 50.0]
@@ -177,6 +246,30 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertEqual(metrics["success_rate"], 0.75)
         self.assertEqual(metrics["throughput_rps"], 6.0)
         self.assertEqual(metrics["latency_ms"]["p50"], 20.0)
+
+    def test_trace_context_summary_and_prometheus_omit_identifiers(self) -> None:
+        metrics = summarize_results(
+            [InferenceResult(ok=True, latency_ms=10.0)],
+            duration_seconds=1.0,
+            config=BenchmarkConfig(
+                mode="openai",
+                num_requests=1,
+                propagate_trace_context=True,
+            ),
+        )
+
+        self.assertEqual(metrics["trace_context"]["propagation"], "w3c_traceparent")
+        self.assertFalse(metrics["trace_context"]["identifiers_persisted"])
+        self.assertEqual(metrics["trace_context"]["server_acceptance"], "not verified")
+        serialized = json.dumps(metrics)
+        self.assertIsNone(re.search(r"00-[0-9a-f]{32}-[0-9a-f]{16}-01", serialized))
+
+        prometheus = format_prometheus_metrics(metrics)
+        self.assertIn("triton_benchmark_trace_context_enabled", prometheus)
+        self.assertIn('model="resnet50_trt_fp16"} 1', prometheus)
+        self.assertIsNone(
+            re.search(r"00-[0-9a-f]{32}-[0-9a-f]{16}-01", prometheus)
+        )
 
     def test_mock_benchmark_runs_without_triton_dependencies(self) -> None:
         config = BenchmarkConfig(
@@ -485,6 +578,20 @@ class BenchmarkHarnessTest(unittest.TestCase):
 
         self.assertEqual(options.config.warmup_requests, 7)
         self.assertEqual(options.config.num_requests, 3)
+
+    def test_parses_trace_context_opt_in_for_live_mode(self) -> None:
+        with patch(
+            "sys.argv",
+            ["benchmark.py", "--mode", "openai", "--propagate-trace-context"],
+        ):
+            options = parse_args()
+
+        self.assertTrue(options.config.propagate_trace_context)
+
+    def test_trace_context_opt_in_rejects_mock_mode(self) -> None:
+        with patch("sys.argv", ["benchmark.py", "--propagate-trace-context"]):
+            with self.assertRaises(SystemExit):
+                parse_args()
 
     def test_cost_model_normalizes_gpu_time_and_successful_tokens(self) -> None:
         cost_model = build_cost_model(

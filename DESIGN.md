@@ -117,6 +117,22 @@ benchmark wall time. Energy uses configured average GPU board power multiplied
 by wall time; it does not subtract idle power. Memory traffic is caller-supplied
 logical traffic unless a separate hardware-counter artifact is attached.
 
+## Live Request Trace Context
+
+`--propagate-trace-context` is an explicit opt-in for the Triton and
+OpenAI-compatible HTTP clients. Every physical request attempt receives a new
+sampled W3C `traceparent` containing a non-zero random 128-bit trace ID and
+non-zero random 64-bit parent ID. A retry receives a new context rather than
+reusing the failed attempt's identifiers. The benchmark does not read ambient
+OpenTelemetry configuration or add `tracestate`.
+
+Artifacts record only that propagation was configured. Trace IDs, parent IDs,
+and full header values are not retained in request results, JSON, or Prometheus
+text. Header injection permits downstream context continuation; it does not
+prove server acceptance, span creation/export, sampling behavior, request-to-GPU
+attribution, or clock synchronization. The deterministic local SSE fixture
+verifies outbound HTTP wiring and artifact privacy, not production tracing.
+
 ## Batch-Invariance Probe
 
 `--batch-invariance-probes` checks whether infrastructure scheduling changes model
