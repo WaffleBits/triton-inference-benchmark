@@ -21,6 +21,82 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -s tests
 
+      - name: Run traced OpenAI-compatible fixture benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT_FILE=$(mktemp)
+          TRACE_FILE=$(mktemp)
+          RESULT_DIR=$(mktemp -d)
+          python tests/openai_fixture_server.py \
+            --port-file "$PORT_FILE" \
+            --trace-file "$TRACE_FILE" &
+          FIXTURE_PID=$!
+          trap 'kill "$FIXTURE_PID" 2>/dev/null || true; rm -rf "$PORT_FILE" "$TRACE_FILE" "$RESULT_DIR"' EXIT
+          for _ in {1..100}; do
+            if [ -s "$PORT_FILE" ]; then
+              break
+            fi
+            if ! kill -0 "$FIXTURE_PID" 2>/dev/null; then
+              echo "OpenAI fixture exited before becoming ready" >&2
+              exit 1
+            fi
+            sleep 0.1
+          done
+          test -s "$PORT_FILE"
+          PORT=$(<"$PORT_FILE")
+
+          python benchmark.py \
+            --mode openai \
+            --server-url "http://127.0.0.1:${PORT}" \
+            --model-name fixture-model \
+            --warmup-requests 2 \
+            --num-requests 6 \
+            --concurrency 3 \
+            --retries 0 \
+            --propagate-trace-context \
+            --prometheus \
+            --output-dir "$RESULT_DIR"
+
+          python - "$TRACE_FILE" "$RESULT_DIR" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          trace_path = Path(sys.argv[1])
+          result_dir = Path(sys.argv[2])
+          traceparents = trace_path.read_text(encoding="utf-8").splitlines()
+          pattern = re.compile(
+              r"^00-(?!0{32})[0-9a-f]{32}-(?!0{16})[0-9a-f]{16}-01$"
+          )
+          assert len(traceparents) == 8, traceparents
+          assert len(set(traceparents)) == 8, traceparents
+          assert all(pattern.fullmatch(value) for value in traceparents)
+
+          results = sorted(result_dir.glob("benchmark_*.json"))
+          assert len(results) == 1, results
+          prometheus_path = results[0].with_suffix(".prom")
+          metrics = json.loads(results[0].read_text(encoding="utf-8"))
+          serialized = results[0].read_text(encoding="utf-8") + prometheus_path.read_text(
+              encoding="utf-8"
+          )
+          assert metrics["trace_context"] == {
+              "propagation": "w3c_traceparent",
+              "scope": "fresh context for each physical live HTTP request attempt",
+              "identifiers_persisted": False,
+              "server_acceptance": "not verified",
+              "note": (
+                  "Header injection does not prove server span creation, export, "
+                  "sampling behavior, or clock synchronization."
+              ),
+          }
+          assert metrics["warmup"]["request_count"] == 2
+          assert metrics["num_requests"] == 6
+          assert "triton_benchmark_trace_context_enabled" in serialized
+          assert all(value not in serialized for value in traceparents)
+          PY
+
       - name: Run bracketed-telemetry mock benchmark
         shell: bash
         run: |

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import random
+import secrets
 import statistics
 import threading
 import time
@@ -75,6 +76,20 @@ def sanitize_server_url(server_url: str) -> str:
     return sanitized if has_scheme else sanitized.removeprefix("//")
 
 
+def _nonzero_random_hex(byte_count: int) -> str:
+    while True:
+        value = secrets.token_hex(byte_count)
+        if int(value, 16) != 0:
+            return value
+
+
+def build_traceparent() -> str:
+    """Create a sampled W3C Trace Context header without retaining identifiers."""
+    trace_id = _nonzero_random_hex(16)
+    parent_id = _nonzero_random_hex(8)
+    return f"00-{trace_id}-{parent_id}-01"
+
+
 @dataclass(frozen=True)
 class BenchmarkConfig:
     mode: str = "mock"
@@ -86,6 +101,7 @@ class BenchmarkConfig:
     num_requests: int = 200
     concurrency: int = 10
     retries: int = 2
+    propagate_trace_context: bool = False
     output_dir: str = "benchmark_results"
     seed: int = 7
     openai_prompt: str = "Return a short deterministic benchmark response."
@@ -398,6 +414,7 @@ class TritonHttpInferenceClient:
         model_name: str,
         input_name: str,
         input_shape: tuple[int, ...],
+        propagate_trace_context: bool = False,
     ) -> None:
         try:
             import numpy as np
@@ -417,6 +434,7 @@ class TritonHttpInferenceClient:
         self.model_name = model_name
         self.input_name = input_name
         self.input_shape = input_shape
+        self.propagate_trace_context = propagate_trace_context
 
     def infer(self) -> None:
         input_data = self.np.random.rand(*self.input_shape).astype(self.np.float32)
@@ -439,7 +457,12 @@ class TritonHttpInferenceClient:
         if client is None:
             client = self.httpclient.InferenceServerClient(url=self.server_url)
             self.thread_local.client = client
-        return client.infer(self.model_name, [request_input])
+        headers = (
+            {"traceparent": build_traceparent()}
+            if self.propagate_trace_context
+            else None
+        )
+        return client.infer(self.model_name, [request_input], headers=headers)
 
 
 class OpenAICompatibleStreamingClient:
@@ -453,6 +476,7 @@ class OpenAICompatibleStreamingClient:
         max_tokens: int,
         timeout_seconds: float,
         api_key: str | None = None,
+        propagate_trace_context: bool = False,
     ) -> None:
         self.endpoint_url = normalize_openai_completions_url(server_url)
         self.model_name = model_name
@@ -460,6 +484,7 @@ class OpenAICompatibleStreamingClient:
         self.max_tokens = max_tokens
         self.timeout_seconds = timeout_seconds
         self.api_key = api_key
+        self.propagate_trace_context = propagate_trace_context
 
     def infer(self) -> StreamingInferenceObservation:
         payload = json.dumps(
@@ -480,6 +505,8 @@ class OpenAICompatibleStreamingClient:
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.propagate_trace_context:
+            headers["traceparent"] = build_traceparent()
 
         request = urllib.request.Request(
             self.endpoint_url,
@@ -925,6 +952,18 @@ def summarize_results(
         },
         "config": persisted_config,
     }
+
+    if config.propagate_trace_context:
+        summary["trace_context"] = {
+            "propagation": "w3c_traceparent",
+            "scope": "fresh context for each physical live HTTP request attempt",
+            "identifiers_persisted": False,
+            "server_acceptance": "not verified",
+            "note": (
+                "Header injection does not prove server span creation, export, "
+                "sampling behavior, or clock synchronization."
+            ),
+        }
 
     streaming = [
         result.streaming
@@ -2011,6 +2050,16 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
         f"triton_benchmark_retries{{{labels}}} {_config_number(typed_metrics, 'retries'):g}",
     ]
 
+    trace_context = typed_metrics.get("trace_context")
+    if isinstance(trace_context, dict):
+        lines.extend(
+            [
+                "# HELP triton_benchmark_trace_context_enabled Whether outbound live requests were configured to carry fresh W3C traceparent headers.",
+                "# TYPE triton_benchmark_trace_context_enabled gauge",
+                f"triton_benchmark_trace_context_enabled{{{labels}}} 1",
+            ]
+        )
+
     warmup = typed_metrics.get("warmup")
     if isinstance(warmup, dict):
         warmup_labels = f'{labels},phase="warmup"'
@@ -2653,6 +2702,7 @@ def build_client(config: BenchmarkConfig) -> InferenceClient:
             model_name=config.model_name,
             input_name=config.input_name,
             input_shape=config.input_shape,
+            propagate_trace_context=config.propagate_trace_context,
         )
     if config.mode == "openai":
         return OpenAICompatibleStreamingClient(
@@ -2666,6 +2716,7 @@ def build_client(config: BenchmarkConfig) -> InferenceClient:
                 if config.openai_api_key_env
                 else None
             ),
+            propagate_trace_context=config.propagate_trace_context,
         )
     raise ValueError(f"Unsupported mode: {config.mode}")
 
@@ -2703,6 +2754,14 @@ def parse_args() -> CliOptions:
     parser.add_argument("--num-requests", type=int, default=200)
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument(
+        "--propagate-trace-context",
+        action="store_true",
+        help=(
+            "Add a fresh sampled W3C traceparent to each live HTTP request attempt; "
+            "identifiers are not written to artifacts."
+        ),
+    )
     parser.add_argument("--output-dir", default="benchmark_results")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
@@ -2926,6 +2985,8 @@ def parse_args() -> CliOptions:
         parser.error("--batch-invariance-probes requires --concurrency greater than one")
     if args.fail_on_batch_variance and not args.batch_invariance_probes:
         parser.error("--fail-on-batch-variance requires --batch-invariance-probes")
+    if args.propagate_trace_context and args.mode == "mock":
+        parser.error("--propagate-trace-context requires triton or openai mode")
     telemetry_thresholds = (
         args.max_server_failure_rate,
         args.max_server_queue_fraction,
@@ -3110,6 +3171,7 @@ def parse_args() -> CliOptions:
             num_requests=args.num_requests,
             concurrency=args.concurrency,
             retries=args.retries,
+            propagate_trace_context=args.propagate_trace_context,
             output_dir=args.output_dir,
             seed=args.seed,
             openai_prompt=args.openai_prompt,
