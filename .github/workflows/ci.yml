@@ -55,6 +55,7 @@ jobs:
             --concurrency 3 \
             --retries 0 \
             --propagate-trace-context \
+            --fail-on-trace-context-gap \
             --prometheus \
             --output-dir "$RESULT_DIR"
 
@@ -81,20 +82,30 @@ jobs:
           serialized = results[0].read_text(encoding="utf-8") + prometheus_path.read_text(
               encoding="utf-8"
           )
-          assert metrics["trace_context"] == {
-              "propagation": "w3c_traceparent",
-              "scope": "fresh context for each physical live HTTP request attempt",
-              "identifiers_persisted": False,
-              "server_acceptance": "not verified",
-              "note": (
-                  "Header injection does not prove server span creation, export, "
-                  "sampling behavior, or clock synchronization."
-              ),
-          }
+          continuation = metrics["trace_context"]["response_continuation"]
+          assert metrics["trace_context"]["propagation"] == "w3c_traceparent"
+          assert metrics["trace_context"]["identifiers_persisted"] is False
+          assert continuation["request_count"] == 6
+          assert continuation["matched_responses"] == 6
+          assert continuation["missing_responses"] == 0
+          assert continuation["invalid_responses"] == 0
+          assert continuation["mismatched_responses"] == 0
+          assert continuation["match_coverage"] == 1.0
+          assert continuation["complete"] is True
+          assert continuation["identifiers_persisted"] is False
+          assert metrics["trace_context_gate"]["passed"] is True
+          assert metrics["trace_context_gate"]["failure_reasons"] == []
           assert metrics["warmup"]["request_count"] == 2
           assert metrics["num_requests"] == 6
           assert "triton_benchmark_trace_context_enabled" in serialized
+          assert "triton_benchmark_trace_response_match_coverage" in serialized
+          assert "triton_benchmark_trace_context_gate_passed" in serialized
           assert all(value not in serialized for value in traceparents)
+          assert not re.search(
+              r"00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}", serialized
+          )
+          assert "fixture benchmark prompt" not in serialized
+          assert "Authorization" not in serialized
           PY
 
       - name: Run bracketed-telemetry mock benchmark

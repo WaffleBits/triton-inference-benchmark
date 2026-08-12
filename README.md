@@ -227,9 +227,26 @@ endpoint credentials, or private URLs in committed artifacts.
 physical HTTP attempt, including retries, in `openai` and `triton` modes. The
 flag is off by default and is rejected in mock mode. The generated trace ID,
 parent ID, and full header are never written to JSON or Prometheus output. This
-allows a trace-enabled server to continue request context, but the benchmark
-does not verify that the server accepted the header, created or exported spans,
-honored the sampling bit, or synchronized clocks.
+allows a trace-enabled server to continue request context.
+
+In OpenAI-compatible mode, the benchmark also classifies each successful
+response `traceparent` as matched, missing, invalid, or mismatched. A match means
+the response header is valid version-`00` context with the request trace ID and a
+different span ID. Artifacts retain only counts and match coverage; identifiers
+remain in memory. Add `--fail-on-trace-context-gap` to exit with status 5 unless
+every measured response matches. This gate does not prove server span creation
+or export, collector delivery, sampling, clock synchronization, or accelerator
+attribution.
+
+```bash
+python benchmark.py \
+  --mode openai \
+  --server-url http://localhost:8000 \
+  --model-name my-model \
+  --propagate-trace-context \
+  --fail-on-trace-context-gap \
+  --prometheus
+```
 
 ## Run against a real endpoint
 

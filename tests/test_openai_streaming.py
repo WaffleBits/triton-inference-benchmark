@@ -289,6 +289,16 @@ class OpenAIStreamingClientTest(unittest.TestCase):
                 Handler.traceparent = self.headers.get("traceparent")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
+                request_parts = Handler.traceparent.split("-")
+                response_span_id = (
+                    "2222222222222222"
+                    if request_parts[2] == "1111111111111111"
+                    else "1111111111111111"
+                )
+                self.send_header(
+                    "traceparent",
+                    f"00-{request_parts[1]}-{response_span_id}-01",
+                )
                 self.end_headers()
                 events = [
                     {"choices": [{"text": "hello"}]},
@@ -325,6 +335,7 @@ class OpenAIStreamingClientTest(unittest.TestCase):
         self.assertEqual(observation.observed_output_chunks, 2)
         self.assertEqual(observation.reported_output_tokens, 2)
         self.assertEqual(observation.output_bytes, len("hello world".encode("utf-8")))
+        self.assertEqual(observation.response_trace_context, "matched")
         self.assertGreaterEqual(observation.time_to_first_token_ms, 0.0)
         self.assertGreaterEqual(observation.inter_chunk_latency_ms, 0.0)
         self.assertEqual(Handler.payload["model"], "review-model")
@@ -348,6 +359,44 @@ class OpenAIStreamingClientTest(unittest.TestCase):
         )
 
         self.assertFalse(client.propagate_trace_context)
+
+    def test_does_not_classify_response_context_when_propagation_is_disabled(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+            def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+                length = int(self.headers["Content-Length"])
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header(
+                    "traceparent",
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-1111111111111111-01",
+                )
+                self.end_headers()
+                self.wfile.write(b'data: {"choices":[{"text":"ok"}]}\n\n')
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = OpenAICompatibleStreamingClient(
+                server_url=f"http://127.0.0.1:{server.server_port}",
+                model_name="review-model",
+                prompt="synthetic prompt",
+                max_tokens=8,
+                timeout_seconds=5.0,
+            )
+            observation = client.infer()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertIsNone(observation.response_trace_context)
 
     def test_retry_uses_a_fresh_trace_context_for_each_http_attempt(self) -> None:
         class Handler(BaseHTTPRequestHandler):

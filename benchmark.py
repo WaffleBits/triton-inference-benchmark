@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import secrets
 import statistics
 import threading
@@ -88,6 +89,33 @@ def build_traceparent() -> str:
     trace_id = _nonzero_random_hex(16)
     parent_id = _nonzero_random_hex(8)
     return f"00-{trace_id}-{parent_id}-01"
+
+
+TRACEPARENT_VERSION_00_PATTERN = re.compile(
+    r"^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$"
+)
+
+
+def classify_response_traceparent(
+    request_traceparent: str,
+    response_traceparent: str | None,
+) -> str:
+    """Classify response trace continuation without retaining either identifier."""
+    if response_traceparent is None:
+        return "missing"
+    request_match = TRACEPARENT_VERSION_00_PATTERN.fullmatch(request_traceparent)
+    response_match = TRACEPARENT_VERSION_00_PATTERN.fullmatch(
+        response_traceparent.strip()
+    )
+    if request_match is None or response_match is None:
+        return "invalid"
+    if response_match.group(1) == "0" * 32 or response_match.group(2) == "0" * 16:
+        return "invalid"
+    if response_match.group(2) == request_match.group(2):
+        return "invalid"
+    if response_match.group(1) != request_match.group(1):
+        return "mismatched"
+    return "matched"
 
 
 @dataclass(frozen=True)
@@ -204,6 +232,7 @@ class CliOptions:
     fail_on_regression: bool = False
     fail_on_batch_variance: bool = False
     fail_on_telemetry_gate: bool = False
+    fail_on_trace_context_gap: bool = False
 
 
 @dataclass(frozen=True)
@@ -213,6 +242,7 @@ class StreamingInferenceObservation:
     observed_output_chunks: int
     reported_output_tokens: int | None
     output_bytes: int
+    response_trace_context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -505,8 +535,11 @@ class OpenAICompatibleStreamingClient:
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        if self.propagate_trace_context:
-            headers["traceparent"] = build_traceparent()
+        request_traceparent = (
+            build_traceparent() if self.propagate_trace_context else None
+        )
+        if request_traceparent is not None:
+            headers["traceparent"] = request_traceparent
 
         request = urllib.request.Request(
             self.endpoint_url,
@@ -522,7 +555,13 @@ class OpenAICompatibleStreamingClient:
         reported_output_tokens: int | None = None
         output_bytes = 0
 
+        response_trace_context: str | None = None
         with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            if request_traceparent is not None:
+                response_trace_context = classify_response_traceparent(
+                    request_traceparent,
+                    response.headers.get("traceparent"),
+                )
             for raw_line in response:
                 line = raw_line.decode("utf-8").strip()
                 if not line.startswith("data:"):
@@ -567,6 +606,7 @@ class OpenAICompatibleStreamingClient:
             observed_output_chunks=observed_output_chunks,
             reported_output_tokens=reported_output_tokens,
             output_bytes=output_bytes,
+            response_trace_context=response_trace_context,
         )
 
 
@@ -1016,7 +1056,80 @@ def summarize_results(
             },
         }
 
+        response_contexts = [
+            item.response_trace_context
+            for item in streaming
+            if item.response_trace_context is not None
+        ]
+        if config.propagate_trace_context and config.mode == "openai":
+            continuation_counts = {
+                status: response_contexts.count(status)
+                for status in ("matched", "missing", "invalid", "mismatched")
+            }
+            matched = continuation_counts["matched"]
+            response_count = len(streaming)
+            trace_context = summary.get("trace_context")
+            assert isinstance(trace_context, dict)
+            trace_context["server_acceptance"] = "response trace context classified"
+            trace_context["response_continuation"] = {
+                "request_count": response_count,
+                "matched_responses": matched,
+                "missing_responses": continuation_counts["missing"],
+                "invalid_responses": continuation_counts["invalid"],
+                "mismatched_responses": continuation_counts["mismatched"],
+                "match_coverage": round(matched / response_count, 4)
+                if response_count
+                else 0.0,
+                "complete": response_count > 0 and matched == response_count,
+                "identifiers_persisted": False,
+                "scope": (
+                    "same trace ID observed in a valid response traceparent with a "
+                    "different span ID"
+                ),
+                "note": (
+                    "Response context does not prove server span creation/export, "
+                    "collector delivery, sampling, clock synchronization, or "
+                    "accelerator attribution."
+                ),
+            }
+
     return summary
+
+
+def build_trace_context_gate(metrics: dict[str, object]) -> dict[str, object]:
+    """Fail closed unless every measured OpenAI response continues its request trace."""
+    reasons: list[str] = []
+    failed_requests = metrics.get("failed_requests")
+    if not isinstance(failed_requests, int) or failed_requests:
+        reasons.append("one or more measured requests failed")
+
+    trace_context = metrics.get("trace_context")
+    continuation = (
+        trace_context.get("response_continuation")
+        if isinstance(trace_context, dict)
+        else None
+    )
+    if not isinstance(continuation, dict):
+        reasons.append("response trace-continuation evidence is unavailable")
+        return {"passed": False, "failure_reasons": reasons}
+
+    status_labels = (
+        ("missing_responses", "missing"),
+        ("invalid_responses", "invalid"),
+        ("mismatched_responses", "mismatched"),
+    )
+    for key, label in status_labels:
+        count = continuation.get(key)
+        if not isinstance(count, int) or count:
+            reasons.append(f"one or more response traceparent headers were {label}")
+    if continuation.get("complete") is not True:
+        reasons.append("response trace-continuation coverage was incomplete")
+
+    return {
+        "passed": not reasons,
+        "failure_reasons": reasons,
+        "scope": "measured successful OpenAI-compatible HTTP responses",
+    }
 
 
 def _complete_streaming_output_tokens(metrics: dict[str, object]) -> int | None:
@@ -2059,6 +2172,50 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
                 f"triton_benchmark_trace_context_enabled{{{labels}}} 1",
             ]
         )
+        continuation = trace_context.get("response_continuation")
+        if isinstance(continuation, dict):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_trace_response_total Successful measured HTTP responses by privacy-safe trace-continuation classification.",
+                    "# TYPE triton_benchmark_trace_response_total gauge",
+                ]
+            )
+            for source_key, status in (
+                ("matched_responses", "matched"),
+                ("missing_responses", "missing"),
+                ("invalid_responses", "invalid"),
+                ("mismatched_responses", "mismatched"),
+            ):
+                value = continuation.get(source_key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    lines.append(
+                        "triton_benchmark_trace_response_total"
+                        f'{{{labels},status="{status}"}} {value}'
+                    )
+            match_coverage = continuation.get("match_coverage")
+            if isinstance(match_coverage, (int, float)):
+                lines.extend(
+                    [
+                        "# HELP triton_benchmark_trace_response_match_coverage Ratio of successful measured responses that continued the outbound trace ID.",
+                        "# TYPE triton_benchmark_trace_response_match_coverage gauge",
+                        (
+                            "triton_benchmark_trace_response_match_coverage"
+                            f"{{{labels}}} {match_coverage:g}"
+                        ),
+                    ]
+                )
+
+    trace_context_gate = typed_metrics.get("trace_context_gate")
+    if isinstance(trace_context_gate, dict):
+        passed = trace_context_gate.get("passed")
+        if isinstance(passed, bool):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_trace_context_gate_passed Whether every measured OpenAI response continued its outbound trace.",
+                    "# TYPE triton_benchmark_trace_context_gate_passed gauge",
+                    f"triton_benchmark_trace_context_gate_passed{{{labels}}} {int(passed)}",
+                ]
+            )
 
     warmup = typed_metrics.get("warmup")
     if isinstance(warmup, dict):
@@ -2762,6 +2919,14 @@ def parse_args() -> CliOptions:
             "identifiers are not written to artifacts."
         ),
     )
+    parser.add_argument(
+        "--fail-on-trace-context-gap",
+        action="store_true",
+        help=(
+            "Exit with status 5 unless every measured successful OpenAI response "
+            "returns a valid traceparent on the outbound trace."
+        ),
+    )
     parser.add_argument("--output-dir", default="benchmark_results")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
@@ -2987,6 +3152,13 @@ def parse_args() -> CliOptions:
         parser.error("--fail-on-batch-variance requires --batch-invariance-probes")
     if args.propagate_trace_context and args.mode == "mock":
         parser.error("--propagate-trace-context requires triton or openai mode")
+    if args.fail_on_trace_context_gap and not (
+        args.mode == "openai" and args.propagate_trace_context
+    ):
+        parser.error(
+            "--fail-on-trace-context-gap requires openai mode and "
+            "--propagate-trace-context"
+        )
     telemetry_thresholds = (
         args.max_server_failure_rate,
         args.max_server_queue_fraction,
@@ -3218,6 +3390,7 @@ def parse_args() -> CliOptions:
         fail_on_regression=args.fail_on_regression,
         fail_on_batch_variance=args.fail_on_batch_variance,
         fail_on_telemetry_gate=args.fail_on_telemetry_gate,
+        fail_on_trace_context_gap=args.fail_on_trace_context_gap,
     )
 
 
@@ -3270,6 +3443,8 @@ def main() -> None:
             retries=config.retries,
             seed=config.seed,
         )
+    if options.fail_on_trace_context_gap:
+        metrics["trace_context_gate"] = build_trace_context_gate(metrics)
     metrics_path = save_metrics(metrics, config.output_dir)
 
     print(json.dumps(metrics, indent=2))
@@ -3311,6 +3486,15 @@ def main() -> None:
         and exit_code == 0
     ):
         exit_code = 4
+
+    trace_context_gate = metrics.get("trace_context_gate")
+    if (
+        options.fail_on_trace_context_gap
+        and isinstance(trace_context_gate, dict)
+        and not trace_context_gate.get("passed", False)
+        and exit_code == 0
+    ):
+        exit_code = 5
 
     if exit_code:
         raise SystemExit(exit_code)
