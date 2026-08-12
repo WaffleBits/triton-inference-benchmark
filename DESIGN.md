@@ -126,12 +126,21 @@ non-zero random 64-bit parent ID. A retry receives a new context rather than
 reusing the failed attempt's identifiers. The benchmark does not read ambient
 OpenTelemetry configuration or add `tracestate`.
 
-Artifacts record only that propagation was configured. Trace IDs, parent IDs,
-and full header values are not retained in request results, JSON, or Prometheus
-text. Header injection permits downstream context continuation; it does not
-prove server acceptance, span creation/export, sampling behavior, request-to-GPU
-attribution, or clock synchronization. The deterministic local SSE fixture
-verifies outbound HTTP wiring and artifact privacy, not production tracing.
+Trace IDs, parent IDs, and full header values are not retained in request
+results, JSON, or Prometheus text. In OpenAI-compatible mode, the client validates
+a version-`00` response `traceparent`, requires a different response span ID, and
+compares the response trace ID with the request trace ID in memory. The retained
+observation is only `matched`, `missing`, `invalid`, or `mismatched`.
+
+The aggregate records the four counts, match coverage, and completeness.
+`--fail-on-trace-context-gap` makes any failed request or non-matching successful
+response exit with status 5. The option requires OpenAI-compatible mode plus
+propagation; Triton's generic client does not expose response headers through the
+same interface. A match is bounded response-level continuation evidence. It does
+not prove span creation/export, collector delivery, sampling behavior,
+request-to-GPU attribution, or clock synchronization. The deterministic local
+SSE fixture verifies HTTP wiring, continuation classification, and artifact
+privacy, not production tracing.
 
 ## Batch-Invariance Probe
 

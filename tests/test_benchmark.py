@@ -17,10 +17,12 @@ from benchmark import (
     InferenceResult,
     LlmMetricsConfig,
     MockInferenceClient,
+    StreamingInferenceObservation,
     TritonHttpInferenceClient,
     attach_telemetry_summary,
     build_http_telemetry_client,
     build_cost_model,
+    build_trace_context_gate,
     build_traceparent,
     build_gpu_gauge_window,
     build_llm_metrics,
@@ -28,6 +30,7 @@ from benchmark import (
     build_telemetry_counter_window,
     build_telemetry_gate,
     build_telemetry_summary,
+    classify_response_traceparent,
     fingerprint_triton_outputs,
     format_prometheus_metrics,
     parse_args,
@@ -50,6 +53,37 @@ class BenchmarkHarnessTest(unittest.TestCase):
                 traceparent,
                 r"^00-(?!0{32})[0-9a-f]{32}-(?!0{16})[0-9a-f]{16}-01$",
             )
+
+    def test_classifies_response_trace_continuation_without_retaining_ids(self) -> None:
+        request = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+        self.assertEqual(
+            classify_response_traceparent(
+                request,
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-1111111111111111-01",
+            ),
+            "matched",
+        )
+        self.assertEqual(classify_response_traceparent(request, None), "missing")
+        self.assertEqual(
+            classify_response_traceparent(request, "not-a-traceparent"),
+            "invalid",
+        )
+        self.assertEqual(
+            classify_response_traceparent(
+                request,
+                "00-4BF92F3577B34DA6A3CE929D0E0E4736-1111111111111111-01",
+            ),
+            "invalid",
+        )
+        self.assertEqual(
+            classify_response_traceparent(
+                request,
+                "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1111111111111111-01",
+            ),
+            "mismatched",
+        )
+        self.assertEqual(classify_response_traceparent(request, request), "invalid")
 
     def test_workload_profiles_are_explicit_and_distinct(self) -> None:
         interactive = resolve_workload_profile("interactive")
@@ -270,6 +304,76 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertIsNone(
             re.search(r"00-[0-9a-f]{32}-[0-9a-f]{16}-01", prometheus)
         )
+
+    def test_summarizes_and_gates_response_trace_continuation(self) -> None:
+        metrics = summarize_results(
+            [
+                InferenceResult(
+                    ok=True,
+                    latency_ms=10.0,
+                    streaming=StreamingInferenceObservation(
+                        4.0, 1.0, 2, 3, 8, "matched"
+                    ),
+                ),
+                InferenceResult(
+                    ok=True,
+                    latency_ms=11.0,
+                    streaming=StreamingInferenceObservation(
+                        5.0, 1.5, 2, 3, 8, "missing"
+                    ),
+                ),
+            ],
+            duration_seconds=1.0,
+            config=BenchmarkConfig(
+                mode="openai",
+                num_requests=2,
+                propagate_trace_context=True,
+            ),
+        )
+
+        continuation = metrics["trace_context"]["response_continuation"]
+        self.assertEqual(continuation["request_count"], 2)
+        self.assertEqual(continuation["matched_responses"], 1)
+        self.assertEqual(continuation["missing_responses"], 1)
+        self.assertEqual(continuation["match_coverage"], 0.5)
+        self.assertFalse(continuation["complete"])
+        self.assertFalse(continuation["identifiers_persisted"])
+
+        gate = build_trace_context_gate(metrics)
+        self.assertFalse(gate["passed"])
+        self.assertIn("missing", " ".join(gate["failure_reasons"]))
+        prometheus = format_prometheus_metrics({**metrics, "trace_context_gate": gate})
+        self.assertIn("triton_benchmark_trace_response_total", prometheus)
+        self.assertIn('status="matched"} 1', prometheus)
+        self.assertIn('status="missing"} 1', prometheus)
+        self.assertIn("triton_benchmark_trace_context_gate_passed", prometheus)
+        self.assertIsNone(
+            re.search(r"00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}", prometheus)
+        )
+
+    def test_trace_context_gate_passes_complete_measured_responses(self) -> None:
+        metrics = summarize_results(
+            [
+                InferenceResult(
+                    ok=True,
+                    latency_ms=10.0,
+                    streaming=StreamingInferenceObservation(
+                        4.0, 1.0, 2, 3, 8, "matched"
+                    ),
+                )
+            ],
+            duration_seconds=1.0,
+            config=BenchmarkConfig(
+                mode="openai",
+                num_requests=1,
+                propagate_trace_context=True,
+            ),
+        )
+
+        gate = build_trace_context_gate(metrics)
+
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["failure_reasons"], [])
 
     def test_mock_benchmark_runs_without_triton_dependencies(self) -> None:
         config = BenchmarkConfig(
@@ -587,6 +691,37 @@ class BenchmarkHarnessTest(unittest.TestCase):
             options = parse_args()
 
         self.assertTrue(options.config.propagate_trace_context)
+
+    def test_parses_response_trace_context_gate_for_openai_mode(self) -> None:
+        with patch(
+            "sys.argv",
+            [
+                "benchmark.py",
+                "--mode",
+                "openai",
+                "--propagate-trace-context",
+                "--fail-on-trace-context-gap",
+            ],
+        ):
+            options = parse_args()
+
+        self.assertTrue(options.fail_on_trace_context_gap)
+
+    def test_response_trace_context_gate_requires_openai_propagation(self) -> None:
+        invalid_argv = (
+            ["benchmark.py", "--fail-on-trace-context-gap"],
+            [
+                "benchmark.py",
+                "--mode",
+                "triton",
+                "--propagate-trace-context",
+                "--fail-on-trace-context-gap",
+            ],
+        )
+        for argv in invalid_argv:
+            with self.subTest(argv=argv), patch("sys.argv", argv):
+                with self.assertRaises(SystemExit):
+                    parse_args()
 
     def test_trace_context_opt_in_rejects_mock_mode(self) -> None:
         with patch("sys.argv", ["benchmark.py", "--propagate-trace-context"]):

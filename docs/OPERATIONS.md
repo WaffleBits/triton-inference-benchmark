@@ -235,6 +235,33 @@ values are still point-in-time gauges unless sampling is explicitly enabled.
 Selected counter-series churn is detected by a label-derived SHA-256 fingerprint,
 without publishing the labels.
 
+### Response trace-continuation gate
+
+For an OpenAI-compatible service that returns W3C context, use the opt-in
+response gate to require a valid continuation on every measured successful
+response:
+
+```bash
+python benchmark.py \
+  --mode openai \
+  --server-url http://inference.example.internal \
+  --model-name my-model \
+  --propagate-trace-context \
+  --fail-on-trace-context-gap \
+  --prometheus
+```
+
+The client compares the request and response trace IDs only in memory and
+requires the response span ID to differ. JSON and Prometheus output contain
+classification counts and coverage, never the headers or identifiers. Exit
+status 5 means at least one measured request failed or a successful response was
+missing context, syntactically invalid, or continued another trace.
+
+Treat a passing gate as proof only of the observed HTTP header contract. It does
+not establish that spans were exported or delivered, that sampling occurred,
+that clocks align, or that server spans correlate with scheduler, kernel, or GPU
+events. Verify those properties in the authorized tracing backend.
+
 With `--telemetry-sample-interval-seconds`, the harness also samples known DCGM
 gauges after measured requests have been submitted and until the measured phase
 completes. The JSON and Prometheus artifacts report the number of boundary and

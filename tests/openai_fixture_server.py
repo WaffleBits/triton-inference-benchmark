@@ -49,6 +49,16 @@ def main() -> None:
 
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
+            request_parts = traceparent.split("-")
+            response_span_id = (
+                "2222222222222222"
+                if request_parts[2] == "1111111111111111"
+                else "1111111111111111"
+            )
+            self.send_header(
+                "traceparent",
+                f"00-{request_parts[1]}-{response_span_id}-01",
+            )
             self.end_headers()
             events = (
                 {"choices": [{"text": "fixture"}]},
