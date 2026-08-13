@@ -17,6 +17,8 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Repeatable model-serving benchmarks instead of one-off timing claims.
 - Latency percentile reporting for p50, p95, and p99.
 - Throughput and success-rate accounting under configurable concurrency.
+- Single-process open-loop constant-rate request pacing with measured submission
+  lag kept separate from successful-completion throughput.
 - A CI-friendly mock mode that keeps the repo reviewable without GPU hardware.
 - Phase-separated warmup evidence that is excluded from measured latency,
   throughput, regression, streaming-token, and cost results.
@@ -48,6 +50,6 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 ## Gaps Worth Closing Next
 
 - Add controlled server-lifecycle hooks for defensible cold-start measurements.
-- Add distributed load generation across multiple clients.
+- Add coordinated distributed load generation across multiple clients.
 - Add saved benchmark reports with trend comparisons over time.
 - Add model-aware numeric tolerance policies for outputs that do not promise bitwise determinism.

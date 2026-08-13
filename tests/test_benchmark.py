@@ -21,6 +21,7 @@ from benchmark import (
     TritonHttpInferenceClient,
     attach_telemetry_summary,
     build_http_telemetry_client,
+    build_constant_rate_submission_offsets,
     build_cost_model,
     build_trace_context_gate,
     build_traceparent,
@@ -264,6 +265,18 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertEqual(percentile(values, 50), 30.0)
         self.assertEqual(percentile(values, 100), 50.0)
 
+    def test_builds_constant_rate_submission_offsets(self) -> None:
+        self.assertEqual(
+            build_constant_rate_submission_offsets(4, request_rate_rps=4.0),
+            [0.0, 0.25, 0.5, 0.75],
+        )
+        self.assertEqual(
+            build_constant_rate_submission_offsets(1, request_rate_rps=7.5),
+            [0.0],
+        )
+        with self.assertRaisesRegex(ValueError, "greater than zero"):
+            build_constant_rate_submission_offsets(2, request_rate_rps=0)
+
     def test_summarize_results_calculates_success_rate_and_latency(self) -> None:
         config = BenchmarkConfig(num_requests=4, concurrency=2)
         results = [
@@ -389,6 +402,72 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertEqual(metrics["num_requests"], 12)
         self.assertEqual(metrics["failed_requests"], 0)
         self.assertGreater(metrics["throughput_rps"], 0)
+
+    def test_open_loop_rate_paces_measured_submissions_and_reports_lag(self) -> None:
+        class RecordingClient:
+            def __init__(self) -> None:
+                self.started: list[float] = []
+
+            def infer(self) -> None:
+                self.started.append(time.perf_counter())
+
+        client = RecordingClient()
+        metrics = run_benchmark(
+            client,
+            BenchmarkConfig(
+                mode="mock",
+                num_requests=4,
+                concurrency=4,
+                retries=0,
+                request_rate_rps=20.0,
+            ),
+        )
+
+        self.assertEqual(len(client.started), 4)
+        self.assertGreaterEqual(client.started[-1] - client.started[0], 0.12)
+        schedule = metrics["load_schedule"]
+        self.assertEqual(schedule["mode"], "open_loop_constant_rate")
+        self.assertEqual(schedule["configured_request_rate_rps"], 20.0)
+        self.assertEqual(schedule["request_count"], 4)
+        self.assertEqual(schedule["scheduled_submission_span_seconds"], 0.15)
+        self.assertGreater(schedule["achieved_submission_rate_rps"], 0)
+        self.assertGreater(schedule["achieved_request_start_rate_rps"], 0)
+        self.assertIn("p95", schedule["submission_lag_ms"])
+        self.assertIn("p95", schedule["executor_queue_ms"])
+        self.assertIn("p95", schedule["request_start_lag_ms"])
+
+        prometheus = format_prometheus_metrics(metrics)
+        self.assertIn("triton_benchmark_configured_request_rate_rps", prometheus)
+        self.assertIn("triton_benchmark_submission_lag_ms", prometheus)
+        self.assertIn("triton_benchmark_achieved_request_start_rate_rps", prometheus)
+        self.assertIn("triton_benchmark_executor_queue_ms", prometheus)
+        self.assertIn("triton_benchmark_request_start_lag_ms", prometheus)
+        self.assertIn('quantile="0.95"', prometheus)
+
+    def test_open_loop_reports_executor_queue_when_workers_are_saturated(self) -> None:
+        class SlowClient:
+            def infer(self) -> None:
+                time.sleep(0.03)
+
+        metrics = run_benchmark(
+            SlowClient(),
+            BenchmarkConfig(
+                mode="mock",
+                num_requests=6,
+                concurrency=1,
+                retries=0,
+                request_rate_rps=100.0,
+            ),
+        )
+
+        schedule = metrics["load_schedule"]
+        self.assertLess(schedule["submission_lag_ms"]["p95"], 20.0)
+        self.assertGreater(schedule["executor_queue_ms"]["p95"], 20.0)
+        self.assertGreater(schedule["request_start_lag_ms"]["p95"], 20.0)
+        self.assertLess(
+            schedule["achieved_request_start_rate_rps"],
+            schedule["achieved_submission_rate_rps"],
+        )
 
     def test_http_telemetry_brackets_only_the_measured_request_phase(self) -> None:
         events: list[str] = []
@@ -682,6 +761,19 @@ class BenchmarkHarnessTest(unittest.TestCase):
 
         self.assertEqual(options.config.warmup_requests, 7)
         self.assertEqual(options.config.num_requests, 3)
+
+    def test_parses_open_loop_request_rate(self) -> None:
+        with patch(
+            "sys.argv",
+            ["benchmark.py", "--request-rate-rps", "12.5", "--num-requests", "3"],
+        ):
+            options = parse_args()
+
+        self.assertEqual(options.config.request_rate_rps, 12.5)
+
+        with patch("sys.argv", ["benchmark.py", "--request-rate-rps", "-1"]):
+            with self.assertRaises(SystemExit):
+                parse_args()
 
     def test_parses_trace_context_opt_in_for_live_mode(self) -> None:
         with patch(

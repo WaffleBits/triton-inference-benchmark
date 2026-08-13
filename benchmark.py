@@ -129,6 +129,7 @@ class BenchmarkConfig:
     num_requests: int = 200
     concurrency: int = 10
     retries: int = 2
+    request_rate_rps: float = 0.0
     propagate_trace_context: bool = False
     output_dir: str = "benchmark_results"
     seed: int = 7
@@ -251,6 +252,7 @@ class InferenceResult:
     latency_ms: float
     error: str | None = None
     streaming: StreamingInferenceObservation | None = None
+    request_started_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -639,12 +641,18 @@ def execute_with_retries(client: InferenceClient, retries: int) -> InferenceResu
                     if isinstance(observation, StreamingInferenceObservation)
                     else None
                 ),
+                request_started_at=start,
             )
         except Exception as exc:  # noqa: BLE001 - benchmark harness records client failures.
             last_error = str(exc)
 
     latency_ms = (time.perf_counter() - start) * 1000
-    return InferenceResult(ok=False, latency_ms=latency_ms, error=last_error)
+    return InferenceResult(
+        ok=False,
+        latency_ms=latency_ms,
+        error=last_error,
+        request_started_at=start,
+    )
 
 
 def execute_output_with_retries(
@@ -775,28 +783,152 @@ def run_batch_invariance_probe(
     }
 
 
+def build_constant_rate_submission_offsets(
+    request_count: int,
+    request_rate_rps: float,
+) -> list[float]:
+    """Return monotonic deadline offsets for an open-loop constant-rate schedule."""
+    if request_rate_rps <= 0:
+        raise ValueError("request rate must be greater than zero")
+    return [index / request_rate_rps for index in range(request_count)]
+
+
+def _build_load_schedule_summary(
+    scheduled_offsets: list[float],
+    submission_offsets: list[float],
+    request_start_offsets: list[float],
+    request_rate_rps: float,
+) -> dict[str, object]:
+    if not (
+        len(scheduled_offsets)
+        == len(submission_offsets)
+        == len(request_start_offsets)
+    ):
+        raise ValueError("scheduled, submitted, and started requests must have equal counts")
+    submission_lags_ms = [
+        max(0.0, submitted - scheduled) * 1000
+        for scheduled, submitted in zip(scheduled_offsets, submission_offsets)
+    ]
+    executor_queue_ms = [
+        max(0.0, started - submitted) * 1000
+        for submitted, started in zip(submission_offsets, request_start_offsets)
+    ]
+    dispatch_lags_ms = [
+        max(0.0, started - scheduled) * 1000
+        for scheduled, started in zip(scheduled_offsets, request_start_offsets)
+    ]
+    scheduled_span = scheduled_offsets[-1] if scheduled_offsets else 0.0
+    submission_span = (
+        submission_offsets[-1] - submission_offsets[0]
+        if len(submission_offsets) > 1
+        else 0.0
+    )
+    request_start_span = (
+        max(request_start_offsets) - min(request_start_offsets)
+        if len(request_start_offsets) > 1
+        else 0.0
+    )
+    achieved_submission_rate = (
+        (len(submission_offsets) - 1) / submission_span
+        if len(submission_offsets) > 1 and submission_span > 0
+        else None
+    )
+    achieved_request_start_rate = (
+        (len(request_start_offsets) - 1) / request_start_span
+        if len(request_start_offsets) > 1 and request_start_span > 0
+        else None
+    )
+
+    def distribution(values: list[float]) -> dict[str, float]:
+        return {
+            "avg": round(statistics.fmean(values), 4) if values else 0.0,
+            "p50": round(percentile(values, 50), 4),
+            "p95": round(percentile(values, 95), 4),
+            "p99": round(percentile(values, 99), 4),
+            "max": round(max(values), 4) if values else 0.0,
+        }
+
+    return {
+        "mode": "open_loop_constant_rate",
+        "configured_request_rate_rps": request_rate_rps,
+        "request_count": len(submission_offsets),
+        "scheduled_submission_span_seconds": round(scheduled_span, 6),
+        "observed_submission_span_seconds": round(submission_span, 6),
+        "observed_request_start_span_seconds": round(request_start_span, 6),
+        "achieved_submission_rate_rps": round(achieved_submission_rate, 4)
+        if achieved_submission_rate is not None
+        else None,
+        "achieved_request_start_rate_rps": round(achieved_request_start_rate, 4)
+        if achieved_request_start_rate is not None
+        else None,
+        "submission_lag_ms": distribution(submission_lags_ms),
+        "executor_queue_ms": distribution(executor_queue_ms),
+        "request_start_lag_ms": distribution(dispatch_lags_ms),
+        "clock": "client_monotonic",
+        "scope": (
+            "client executor submission and worker-start timing; successful completion "
+            "throughput is reported separately"
+        ),
+        "note": (
+            "This schedule does not prove server arrival timing, queue isolation, or "
+            "distributed clock alignment."
+        ),
+    }
+
+
 def _run_request_phase(
     client: InferenceClient,
     request_count: int,
     concurrency: int,
     retries: int,
     phase_started: threading.Event | None = None,
-) -> tuple[list[InferenceResult], float]:
+    request_rate_rps: float = 0.0,
+) -> tuple[list[InferenceResult], float, dict[str, object] | None]:
     start = time.perf_counter()
     results: list[InferenceResult] = []
+    scheduled_offsets = (
+        build_constant_rate_submission_offsets(request_count, request_rate_rps)
+        if request_rate_rps
+        else []
+    )
+    submission_offsets: list[float] = []
+    request_start_offsets = [0.0] * request_count
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [
-            executor.submit(execute_with_retries, client, retries)
-            for _ in range(request_count)
-        ]
-        if phase_started is not None:
+        futures = {}
+        for request_index in range(request_count):
+            if scheduled_offsets:
+                deadline = start + scheduled_offsets[request_index]
+                remaining = deadline - time.perf_counter()
+                if remaining > 0:
+                    time.sleep(remaining)
+                submission_offsets.append(time.perf_counter() - start)
+            future = executor.submit(execute_with_retries, client, retries)
+            futures[future] = request_index
+            if request_index == 0 and phase_started is not None:
+                phase_started.set()
+        if not futures and phase_started is not None:
             phase_started.set()
         for future in as_completed(futures):
-            results.append(future.result())
+            result = future.result()
+            results.append(result)
+            request_index = futures[future]
+            if result.request_started_at is None:
+                raise RuntimeError("paced request did not record a worker start time")
+            request_start_offsets[request_index] = result.request_started_at - start
 
     duration_seconds = time.perf_counter() - start
-    return results, duration_seconds
+    load_schedule = (
+        _build_load_schedule_summary(
+            scheduled_offsets,
+            submission_offsets,
+            request_start_offsets,
+            request_rate_rps,
+        )
+        if scheduled_offsets
+        else None
+    )
+    return results, duration_seconds, load_schedule
 
 
 def _sample_telemetry_during_phase(
@@ -862,7 +994,7 @@ def run_benchmark(
     warmup_results: list[InferenceResult] = []
     warmup_duration_seconds = 0.0
     if config.warmup_requests:
-        warmup_results, warmup_duration_seconds = _run_request_phase(
+        warmup_results, warmup_duration_seconds, _ = _run_request_phase(
             client,
             request_count=config.warmup_requests,
             concurrency=config.concurrency,
@@ -892,12 +1024,13 @@ def run_benchmark(
         sampler.start()
 
     try:
-        results, duration_seconds = _run_request_phase(
+        results, duration_seconds, load_schedule = _run_request_phase(
             client,
             request_count=config.num_requests,
             concurrency=config.concurrency,
             retries=config.retries,
             phase_started=phase_started if sampler is not None else None,
+            request_rate_rps=config.request_rate_rps,
         )
     finally:
         stop_sampling.set()
@@ -918,6 +1051,8 @@ def run_benchmark(
             "establish a process, model, or accelerator cold-start measurement."
         ),
     }
+    if load_schedule is not None:
+        summary["load_schedule"] = load_schedule
     if warmup_results:
         summary["warmup"] = _summarize_request_phase(
             warmup_results,
@@ -2163,6 +2298,104 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
         f"triton_benchmark_retries{{{labels}}} {_config_number(typed_metrics, 'retries'):g}",
     ]
 
+    load_schedule = typed_metrics.get("load_schedule")
+    if isinstance(load_schedule, dict):
+        configured_rate = load_schedule.get("configured_request_rate_rps")
+        achieved_rate = load_schedule.get("achieved_submission_rate_rps")
+        lines.extend(
+            [
+                "# HELP triton_benchmark_configured_request_rate_rps Configured open-loop measured-request submission rate.",
+                "# TYPE triton_benchmark_configured_request_rate_rps gauge",
+                (
+                    "triton_benchmark_configured_request_rate_rps"
+                    f"{{{labels}}} {float(configured_rate):g}"
+                ),
+            ]
+        )
+        if isinstance(achieved_rate, (int, float)):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_achieved_submission_rate_rps Observed client submission rate over the measured submission span.",
+                    "# TYPE triton_benchmark_achieved_submission_rate_rps gauge",
+                    (
+                        "triton_benchmark_achieved_submission_rate_rps"
+                        f"{{{labels}}} {float(achieved_rate):g}"
+                    ),
+                ]
+            )
+        achieved_start_rate = load_schedule.get("achieved_request_start_rate_rps")
+        if isinstance(achieved_start_rate, (int, float)):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_achieved_request_start_rate_rps Observed client worker-start rate over the measured request-start span.",
+                    "# TYPE triton_benchmark_achieved_request_start_rate_rps gauge",
+                    (
+                        "triton_benchmark_achieved_request_start_rate_rps"
+                        f"{{{labels}}} {float(achieved_start_rate):g}"
+                    ),
+                ]
+            )
+        lag = load_schedule.get("submission_lag_ms")
+        if isinstance(lag, dict):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_submission_lag_ms Client submission delay after the configured monotonic deadline.",
+                    "# TYPE triton_benchmark_submission_lag_ms gauge",
+                ]
+            )
+            for stat in ("avg", "max"):
+                value = lag.get(stat)
+                if isinstance(value, (int, float)):
+                    lines.append(
+                        f'triton_benchmark_submission_lag_ms{{{labels},stat="{stat}"}} {value:g}'
+                    )
+            for stat, quantile in (
+                ("p50", "0.50"),
+                ("p95", "0.95"),
+                ("p99", "0.99"),
+            ):
+                value = lag.get(stat)
+                if isinstance(value, (int, float)):
+                    lines.append(
+                        "triton_benchmark_submission_lag_ms"
+                        f'{{{labels},quantile="{quantile}"}} {value:g}'
+                    )
+        for source_key, metric_name, help_text in (
+            (
+                "executor_queue_ms",
+                "triton_benchmark_executor_queue_ms",
+                "Client delay between executor submission and worker start.",
+            ),
+            (
+                "request_start_lag_ms",
+                "triton_benchmark_request_start_lag_ms",
+                "Client worker-start delay after the configured monotonic deadline.",
+            ),
+        ):
+            distribution = load_schedule.get(source_key)
+            if not isinstance(distribution, dict):
+                continue
+            lines.extend(
+                [
+                    f"# HELP {metric_name} {help_text}",
+                    f"# TYPE {metric_name} gauge",
+                ]
+            )
+            for stat in ("avg", "max"):
+                value = distribution.get(stat)
+                if isinstance(value, (int, float)):
+                    lines.append(f'{metric_name}{{{labels},stat="{stat}"}} {value:g}')
+            for stat, quantile in (
+                ("p50", "0.50"),
+                ("p95", "0.95"),
+                ("p99", "0.99"),
+            ):
+                value = distribution.get(stat)
+                if isinstance(value, (int, float)):
+                    lines.append(
+                        f'{metric_name}{{{labels},quantile="{quantile}"}} {value:g}'
+                    )
+
     trace_context = typed_metrics.get("trace_context")
     if isinstance(trace_context, dict):
         lines.extend(
@@ -2912,6 +3145,15 @@ def parse_args() -> CliOptions:
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument(
+        "--request-rate-rps",
+        type=float,
+        default=0.0,
+        help=(
+            "Open-loop constant measured-request submission rate; zero submits "
+            "immediately as before. Warmup is not paced."
+        ),
+    )
+    parser.add_argument(
         "--propagate-trace-context",
         action="store_true",
         help=(
@@ -3144,6 +3386,8 @@ def parse_args() -> CliOptions:
     args = parser.parse_args()
     if args.warmup_requests < 0:
         parser.error("--warmup-requests must be zero or greater")
+    if args.request_rate_rps < 0:
+        parser.error("--request-rate-rps must be zero or greater")
     if args.batch_invariance_probes < 0:
         parser.error("--batch-invariance-probes must be zero or greater")
     if args.batch_invariance_probes and args.concurrency <= 1:
@@ -3343,6 +3587,7 @@ def parse_args() -> CliOptions:
             num_requests=args.num_requests,
             concurrency=args.concurrency,
             retries=args.retries,
+            request_rate_rps=args.request_rate_rps,
             propagate_trace_context=args.propagate_trace_context,
             output_dir=args.output_dir,
             seed=args.seed,
