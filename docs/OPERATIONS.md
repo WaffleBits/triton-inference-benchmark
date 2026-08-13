@@ -6,7 +6,7 @@ This benchmark is intended to produce repeatable evidence for model-serving chan
 
 1. Run a baseline benchmark against the current model or serving image.
 2. Save the JSON result as the comparison baseline.
-3. Run the candidate benchmark with the same warmup count, measured request count, concurrency, payload shape, and retry settings.
+3. Run the candidate benchmark with the same warmup count, measured request count, concurrency, offered request rate, payload shape, and retry settings.
 4. If available, scrape Triton/DCGM Prometheus counters around the measured
    phase with `--telemetry-url`, or supply operator-captured files.
 5. Export JSON and Prometheus text artifacts.
@@ -111,6 +111,31 @@ must not be interpreted as a token count.
 Do not run batch-invariance probes in this mode. The streaming client does not
 yet fingerprint deterministic outputs, and the CLI rejects that combination.
 
+### Open-loop request pacing
+
+Use `--request-rate-rps` to offer measured requests at a client-side constant
+rate instead of submitting the full phase immediately:
+
+```bash
+python benchmark.py \
+  --mode openai \
+  --server-url http://localhost:8000/v1 \
+  --model-name local-model \
+  --warmup-requests 20 \
+  --num-requests 200 \
+  --concurrency 32 \
+  --request-rate-rps 50 \
+  --prometheus
+```
+
+Warmup remains immediate and is excluded from the schedule record. Compare the
+configured rate with achieved submission rate, submission lag, executor queue
+delay, and request-start lag before interpreting service latency. Submission lag
+shows whether the scheduler met its executor deadline; executor queue delay shows
+whether a worker was available. Concurrency still caps active workers, so a high
+offered rate can queue requests before they reach the server. Do not report
+configured request rate as achieved server throughput.
+
 ### Trace correlation
 
 Use `--propagate-trace-context` only when the authorized live endpoint is
@@ -150,6 +175,8 @@ Use `--prometheus` to write a `.prom` file next to the JSON result. The text-for
 - throughput
 - latency gauges for average, min, max, p50, p95, and p99
 - configured concurrency and retry count
+- configured/achieved submission rate, submission lag, executor queue delay, and
+  request-start lag when pacing is enabled
 - separate warmup outcomes, duration, throughput, and latency when configured
 
 The artifact can be pushed to a metrics gateway, archived by CI, or scraped from a shared results volume.

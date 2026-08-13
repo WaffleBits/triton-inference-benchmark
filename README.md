@@ -11,6 +11,8 @@ inference endpoint.
 ## Features
 
 - Concurrent load generation with configurable request and worker counts.
+- Optional open-loop constant-rate pacing for measured submissions, with
+  client-side submission-lag statistics kept separate from completion throughput.
 - Optional phase-separated warmup requests with their own outcomes, latency,
   throughput, JSON, and Prometheus records; headline and cost metrics remain
   scoped to the measured phase.
@@ -81,6 +83,26 @@ outcomes and latency distribution are reported under a separate `warmup`
 record. They do not contribute to headline latency, throughput, streaming-token,
 regression, or cost calculations. This phase preconditions a serving path; it
 does not prove a process, model, or accelerator cold start.
+
+Pace only the measured phase at an explicit offered request rate:
+
+```bash
+python benchmark.py \
+  --mode mock \
+  --warmup-requests 20 \
+  --num-requests 200 \
+  --concurrency 32 \
+  --request-rate-rps 50 \
+  --prometheus
+```
+
+`--request-rate-rps` uses client-monotonic constant-rate deadlines. The JSON and
+Prometheus artifacts keep configured/observed submission rate, submission lag,
+executor queue delay, and request-start lag separate from successful-completion
+throughput. Concurrency remains the worker cap; requests can queue in the client
+executor if service time exceeds that capacity. This is single-process
+scheduling evidence, not proof of exact server arrival times, isolated server
+queues, synchronized clocks, or distributed load.
 
 Compare a candidate run against a saved baseline and fail on regression:
 
@@ -283,4 +305,4 @@ python -m unittest discover -s tests
 ## Roadmap
 
 - Server-lifecycle hooks for controlled cold-start measurements.
-- Distributed load generation for multi-client benchmarking.
+- Coordinated distributed load generation for multi-client benchmarking.

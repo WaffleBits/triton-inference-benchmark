@@ -54,6 +54,7 @@ jobs:
             --num-requests 6 \
             --concurrency 3 \
             --retries 0 \
+            --request-rate-rps 20 \
             --propagate-trace-context \
             --fail-on-trace-context-gap \
             --prometheus \
@@ -83,6 +84,16 @@ jobs:
               encoding="utf-8"
           )
           continuation = metrics["trace_context"]["response_continuation"]
+          schedule = metrics["load_schedule"]
+          assert schedule["mode"] == "open_loop_constant_rate"
+          assert schedule["configured_request_rate_rps"] == 20
+          assert schedule["request_count"] == 6
+          assert schedule["scheduled_submission_span_seconds"] == 0.25
+          assert schedule["achieved_submission_rate_rps"] > 0
+          assert schedule["achieved_request_start_rate_rps"] > 0
+          assert schedule["submission_lag_ms"]["p95"] >= 0
+          assert schedule["executor_queue_ms"]["p95"] >= 0
+          assert schedule["request_start_lag_ms"]["p95"] >= 0
           assert metrics["trace_context"]["propagation"] == "w3c_traceparent"
           assert metrics["trace_context"]["identifiers_persisted"] is False
           assert continuation["request_count"] == 6
@@ -98,6 +109,11 @@ jobs:
           assert metrics["warmup"]["request_count"] == 2
           assert metrics["num_requests"] == 6
           assert "triton_benchmark_trace_context_enabled" in serialized
+          assert "triton_benchmark_configured_request_rate_rps" in serialized
+          assert "triton_benchmark_submission_lag_ms" in serialized
+          assert "triton_benchmark_achieved_request_start_rate_rps" in serialized
+          assert "triton_benchmark_executor_queue_ms" in serialized
+          assert "triton_benchmark_request_start_lag_ms" in serialized
           assert "triton_benchmark_trace_response_match_coverage" in serialized
           assert "triton_benchmark_trace_context_gate_passed" in serialized
           assert all(value not in serialized for value in traceparents)

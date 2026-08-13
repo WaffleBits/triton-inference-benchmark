@@ -26,6 +26,22 @@ not restart a model server, reload weights, flush accelerator state, or prove
 that a remote endpoint was cold. A future controlled cold-start feature needs
 explicit server-lifecycle hooks instead of inferring state from request order.
 
+## Arrival Schedule
+
+By default, each phase submits work immediately and concurrency limits active
+workers. A positive `--request-rate-rps` changes only the measured phase to an
+open-loop constant-rate schedule. Deadlines are computed from a client-monotonic
+clock and are independent of prior request completions. `--concurrency` remains
+the worker cap, so executor work can queue when service demand exceeds available
+client workers.
+
+The artifact reports the configured rate, scheduled/observed submission and
+request-start spans, observed submission rate, submission lag, executor queue
+delay, and request-start lag. These are client observations; successful-
+completion throughput remains a separate metric. The scheduler does not
+establish exact server arrival times, queue isolation, synchronized clocks,
+distributed traffic, or service capacity.
+
 ## Metrics
 
 The tool reports:
@@ -34,6 +50,7 @@ The tool reports:
 - Success rate.
 - End-to-end duration.
 - Throughput in requests per second.
+- Configured and observed client submission rate plus submission lag when paced.
 - Average, p50, p95, p99, min, and max latency.
 
 When `--prometheus` is enabled, the same core measurements are written as Prometheus text-format gauges and counters beside the JSON result. This keeps the harness dependency-free while making the output easy to archive in CI, push to a metrics gateway, or ingest into a dashboarding workflow.
