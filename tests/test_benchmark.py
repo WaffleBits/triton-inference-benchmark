@@ -17,6 +17,8 @@ from benchmark import (
     InferenceResult,
     LlmMetricsConfig,
     MockInferenceClient,
+    NumericOutput,
+    OutputObservation,
     StreamingInferenceObservation,
     TritonHttpInferenceClient,
     attach_telemetry_summary,
@@ -31,6 +33,7 @@ from benchmark import (
     build_telemetry_counter_window,
     build_telemetry_gate,
     build_telemetry_summary,
+    capture_triton_outputs,
     classify_response_traceparent,
     fingerprint_triton_outputs,
     format_prometheus_metrics,
@@ -153,6 +156,54 @@ class BenchmarkHarnessTest(unittest.TestCase):
 
         self.assertEqual(forward, reversed_order)
         self.assertNotEqual(forward, changed)
+
+    def test_triton_output_capture_retains_numeric_values_only_in_observation(self) -> None:
+        class FakeDtype:
+            hasobject = False
+            kind = "f"
+
+            def __str__(self) -> str:
+                return "float32"
+
+        class FakeFlattened:
+            @staticmethod
+            def tolist() -> list[float]:
+                return [1.25, 2.5]
+
+        class FakeOutput:
+            dtype = FakeDtype()
+            shape = (1, 2)
+
+            @staticmethod
+            def tobytes(order: str) -> bytes:
+                if order != "C":
+                    raise AssertionError(order)
+                return b"private-tensor-bytes"
+
+            @staticmethod
+            def ravel(order: str) -> FakeFlattened:
+                if order != "C":
+                    raise AssertionError(order)
+                return FakeFlattened()
+
+        class FakeResult:
+            @staticmethod
+            def get_response() -> dict[str, object]:
+                return {"outputs": [{"name": "scores"}]}
+
+            @staticmethod
+            def as_numpy(output_name: str) -> FakeOutput:
+                if output_name != "scores":
+                    raise AssertionError(output_name)
+                return FakeOutput()
+
+        observation = capture_triton_outputs(FakeResult())
+
+        self.assertEqual(len(observation.fingerprint), 64)
+        self.assertEqual(
+            observation.numeric_outputs,
+            (NumericOutput("scores", "float32", (1, 2), (1.25, 2.5)),),
+        )
 
     def test_triton_http_client_reuses_one_connection_per_worker(self) -> None:
         class FakeInputData:
@@ -937,8 +988,149 @@ class BenchmarkHarnessTest(unittest.TestCase):
         )
 
         self.assertFalse(report["exact_match"])
+        self.assertFalse(report["passed"])
         self.assertEqual(report["mismatched_outputs"], 4)
         self.assertEqual(report["mismatched_sample_ids"], [0, 1, 2, 3])
+
+    def test_batch_invariance_probe_accepts_numeric_drift_within_policy(self) -> None:
+        class NumericallyStableClient:
+            def infer_output(self, sample_id: int) -> OutputObservation:
+                import threading
+
+                concurrent = threading.current_thread() is not threading.main_thread()
+                values = (1.0005, 2.001) if concurrent else (1.0, 2.0)
+                return OutputObservation(
+                    fingerprint=f"private-output-canary:{sample_id}:{values}",
+                    numeric_outputs=(
+                        NumericOutput(
+                            name="scores",
+                            dtype="float32",
+                            shape=(2,),
+                            values=values,
+                        ),
+                    ),
+                )
+
+        report = run_batch_invariance_probe(
+            NumericallyStableClient(),
+            probe_count=4,
+            concurrency=2,
+            absolute_tolerance=0.0001,
+            relative_tolerance=0.001,
+        )
+
+        self.assertTrue(report["passed"])
+        self.assertFalse(report["exact_match"])
+        self.assertEqual(report["exact_matches"], 0)
+        self.assertEqual(report["tolerance_matches"], 4)
+        self.assertEqual(report["matched_outputs"], 4)
+        self.assertEqual(report["mismatch_reasons"], {})
+        self.assertAlmostEqual(report["max_observed_absolute_error"], 0.001)
+        self.assertAlmostEqual(report["max_observed_relative_error"], 0.0005)
+        serialized = json.dumps(report, sort_keys=True)
+        self.assertNotIn("private-output-canary", serialized)
+        self.assertNotIn('"values"', serialized)
+        self.assertNotIn('"fingerprint"', serialized)
+        self.assertFalse(report["comparison_policy"]["output_values_persisted"])
+
+    def test_batch_invariance_probe_rejects_numeric_drift_outside_policy(self) -> None:
+        class NumericallyUnstableClient:
+            def infer_output(self, sample_id: int) -> OutputObservation:
+                import threading
+
+                value = 1.02 if threading.current_thread() is not threading.main_thread() else 1.0
+                return OutputObservation(
+                    fingerprint=f"{sample_id}:{value}",
+                    numeric_outputs=(
+                        NumericOutput("scores", "float32", (1,), (value,)),
+                    ),
+                )
+
+        report = run_batch_invariance_probe(
+            NumericallyUnstableClient(),
+            probe_count=3,
+            concurrency=2,
+            absolute_tolerance=0.001,
+            relative_tolerance=0.001,
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["tolerance_matches"], 0)
+        self.assertEqual(report["mismatched_outputs"], 3)
+        self.assertEqual(report["mismatch_reasons"], {"outside_tolerance": 3})
+
+    def test_batch_invariance_probe_fails_closed_on_structural_output_change(self) -> None:
+        class ShapeChangingClient:
+            def infer_output(self, sample_id: int) -> OutputObservation:
+                import threading
+
+                concurrent = threading.current_thread() is not threading.main_thread()
+                shape = (1, 1) if concurrent else (1,)
+                return OutputObservation(
+                    fingerprint=f"{sample_id}:{shape}",
+                    numeric_outputs=(
+                        NumericOutput("scores", "float32", shape, (1.0,)),
+                    ),
+                )
+
+        report = run_batch_invariance_probe(
+            ShapeChangingClient(),
+            probe_count=2,
+            concurrency=2,
+            absolute_tolerance=0.01,
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["incompatible_outputs"], 2)
+        self.assertEqual(report["mismatch_reasons"], {"structural_incompatibility": 2})
+
+    def test_batch_invariance_probe_fails_closed_on_non_numeric_output_change(self) -> None:
+        class TextOutputClient:
+            def infer_output(self, sample_id: int) -> str:
+                import threading
+
+                phase = (
+                    "concurrent"
+                    if threading.current_thread() is not threading.main_thread()
+                    else "isolated"
+                )
+                return f"{sample_id}:{phase}"
+
+        report = run_batch_invariance_probe(
+            TextOutputClient(),
+            probe_count=2,
+            concurrency=2,
+            absolute_tolerance=0.01,
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["incompatible_outputs"], 2)
+        self.assertEqual(report["mismatch_reasons"], {"non_numeric_output": 2})
+
+    def test_batch_invariance_probe_rejects_non_finite_numeric_drift(self) -> None:
+        class NonFiniteClient:
+            def infer_output(self, sample_id: int) -> OutputObservation:
+                import threading
+
+                value = float("nan") if threading.current_thread() is not threading.main_thread() else 1.0
+                return OutputObservation(
+                    fingerprint=f"{sample_id}:{value}",
+                    numeric_outputs=(
+                        NumericOutput("scores", "float32", (1,), (value,)),
+                    ),
+                )
+
+        report = run_batch_invariance_probe(
+            NonFiniteClient(),
+            probe_count=2,
+            concurrency=2,
+            absolute_tolerance=1.0,
+            relative_tolerance=1.0,
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["mismatch_reasons"], {"non_finite_values": 2})
+        self.assertNotIn("NaN", json.dumps(report, allow_nan=False))
 
     def test_batch_invariance_probe_fails_when_noise_workload_fails(self) -> None:
         class NoiseFailingClient:
@@ -1030,11 +1222,20 @@ class BenchmarkHarnessTest(unittest.TestCase):
         )
         metrics["batch_invariance"] = {
             "probe_count": 4,
+            "exact_matches": 2,
+            "tolerance_matches": 1,
             "mismatched_outputs": 1,
             "failed_probes": 0,
             "noise_failures": 0,
             "match_rate": 0.75,
             "exact_match": False,
+            "passed": False,
+            "max_observed_absolute_error": 0.001,
+            "max_observed_relative_error": 0.0005,
+            "comparison_policy": {
+                "absolute_tolerance": 0.0001,
+                "relative_tolerance": 0.001,
+            },
         }
 
         output = format_prometheus_metrics(metrics)
@@ -1043,6 +1244,13 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertIn("triton_benchmark_batch_invariance_mismatches_total", output)
         self.assertIn("triton_benchmark_batch_invariance_noise_failures_total", output)
         self.assertIn("triton_benchmark_batch_invariance_match_rate", output)
+        self.assertIn("triton_benchmark_batch_invariance_exact_matches_total", output)
+        self.assertIn("triton_benchmark_batch_invariance_tolerance_matches_total", output)
+        self.assertIn("triton_benchmark_batch_invariance_max_absolute_error", output)
+        self.assertIn("triton_benchmark_batch_invariance_max_relative_error", output)
+        self.assertIn("triton_benchmark_batch_invariance_absolute_tolerance", output)
+        self.assertIn("triton_benchmark_batch_invariance_relative_tolerance", output)
+        self.assertIn("triton_benchmark_batch_invariance_passed", output)
         self.assertIn(
             'triton_benchmark_batch_invariance_exact_match{mode="mock",'
             'model="resnet50_trt_fp16"} 0\n',
@@ -1114,6 +1322,52 @@ class BenchmarkHarnessTest(unittest.TestCase):
                 probe_count=2,
                 concurrency=1,
             )
+
+    def test_parses_batch_output_tolerance_policy(self) -> None:
+        with patch(
+            "sys.argv",
+            [
+                "benchmark.py",
+                "--batch-invariance-probes",
+                "4",
+                "--concurrency",
+                "2",
+                "--batch-output-atol",
+                "0.0001",
+                "--batch-output-rtol",
+                "0.001",
+            ],
+        ):
+            options = parse_args()
+
+        self.assertEqual(options.batch_output_atol, 0.0001)
+        self.assertEqual(options.batch_output_rtol, 0.001)
+
+    def test_batch_output_tolerance_requires_probes(self) -> None:
+        with patch("sys.argv", ["benchmark.py", "--batch-output-atol", "0.001"]):
+            with self.assertRaises(SystemExit):
+                parse_args()
+
+    def test_batch_output_tolerance_must_be_finite_and_non_negative(self) -> None:
+        for flag, value in (
+            ("--batch-output-atol", "-0.001"),
+            ("--batch-output-rtol", "nan"),
+        ):
+            with self.subTest(flag=flag, value=value):
+                with patch(
+                    "sys.argv",
+                    [
+                        "benchmark.py",
+                        "--batch-invariance-probes",
+                        "2",
+                        "--concurrency",
+                        "2",
+                        flag,
+                        value,
+                    ],
+                ):
+                    with self.assertRaises(SystemExit):
+                        parse_args()
 
     def test_regression_report_flags_p95_increase(self) -> None:
         baseline = {

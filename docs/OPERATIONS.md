@@ -45,6 +45,8 @@ python benchmark.py \
   --num-requests 500 \
   --concurrency 32 \
   --batch-invariance-probes 16 \
+  --batch-output-atol 0.0001 \
+  --batch-output-rtol 0.001 \
   --fail-on-batch-variance \
   --baseline sample_results/mock_run.json \
   --telemetry-baseline-prometheus sample_results/mock_telemetry_before.prom \
@@ -161,7 +163,8 @@ For a production-style inference service, the benchmark output should be reviewe
 - GPU utilization and queue duration explain whether a latency change is client-side load, accelerator pressure, or server-side scheduling.
 - Paired Triton counters stay within the workload's accepted failure-rate and
   queue-fraction thresholds.
-- Fixed probe inputs retain exact output fingerprints when mixed with concurrent traffic.
+- Fixed probe inputs remain exact or within an explicitly reviewed run-scoped
+  numeric tolerance when mixed with concurrent traffic.
 
 This repo does not claim a universal SLO because real targets depend on model size, accelerator type, batch policy, and product latency budget.
 
@@ -324,7 +327,16 @@ The estimate excludes CPU, storage, network, fleet headroom, and engineering cos
 
 Use `--batch-invariance-probes <count>` to compare fixed requests in two layouts:
 isolated execution and concurrent execution mixed with unrelated requests. Add
-`--fail-on-batch-variance` in CI when exact repeatability is required.
+`--fail-on-batch-variance` in CI to enforce the configured policy. Comparison is
+exact by default. `--batch-output-atol` and `--batch-output-rtol` opt a run into
+numeric comparison while output metadata remains exact. The artifact reports
+exact matches, tolerance matches, incompatibility counts, and aggregate worst
+finite errors; it does not retain tensor values, bytes, or fingerprints.
+
+Treat tolerances as model/backend/dtype-specific release inputs, not universal
+defaults. Increase one only after a quality owner has established an acceptable
+numeric boundary. Non-numeric, non-finite, shape, dtype, and output-name changes
+fail closed when fingerprints differ.
 
 When a mismatch appears:
 

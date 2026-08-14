@@ -36,7 +36,8 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
   with explicit authentication and artifact privacy boundaries.
 - Sampled GPU gauge windows that reject target churn while persisting only a
   series-membership hash and count rather than raw Prometheus labels.
-- Exact-output batch-invariance testing under concurrent noise traffic.
+- Batch-invariance testing under concurrent noise traffic, with exact comparison
+  by default and privacy-safe run-scoped numeric tolerance gates.
 - Token-throughput, GPU-capacity, energy, and normalized cost-to-serve estimates with explicit assumptions.
 - Kubernetes job posture with non-root runtime settings.
 
@@ -52,4 +53,3 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Add controlled server-lifecycle hooks for defensible cold-start measurements.
 - Add coordinated distributed load generation across multiple clients.
 - Add saved benchmark reports with trend comparisons over time.
-- Add model-aware numeric tolerance policies for outputs that do not promise bitwise determinism.

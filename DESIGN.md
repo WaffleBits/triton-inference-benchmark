@@ -163,15 +163,22 @@ privacy, not production tracing.
 
 `--batch-invariance-probes` checks whether infrastructure scheduling changes model
 outputs. Each fixed synthetic input is sent once in isolation and once in a
-concurrent workload mixed with unrelated noise requests. The harness fingerprints
-all Triton outputs, compares them exactly, records mismatched sample IDs, and can
-fail CI with `--fail-on-batch-variance`.
+concurrent workload mixed with unrelated noise requests. The harness captures an
+exact fingerprint plus numeric Triton tensors in process memory and can fail CI
+with `--fail-on-batch-variance`.
 
-Exact equality is intentionally strict. It is useful for deterministic serving,
-prefix-cache validation, replayable rollouts, and debugging numerical changes
-caused by dynamic batching or reduction order. Models that intentionally permit
-small floating-point drift will eventually need a model-aware tolerance policy;
-the current probe reports that drift as a mismatch instead of hiding it.
+Exact equality remains the zero-tolerance default. `--batch-output-atol` and
+`--batch-output-rtol` opt one run into element-wise numeric comparison using
+`absolute_error <= atol + rtol * abs(isolated_value)`. Output names, dtypes,
+shapes, and element counts remain exact invariants. Non-numeric, structurally
+different, and non-finite output differences fail closed. Reports separate exact
+matches from tolerance matches and publish finite aggregate errors, but never
+tensor values, bytes, or fingerprints.
+
+The policy is run-scoped rather than automatically model-safe. An operator must
+select tolerances for the model, backend, dtype, accelerator, and quality target.
+Passing does not prove semantic equivalence, traffic isolation, deterministic
+kernels, or cross-accelerator correctness.
 
 ## Regression Comparison
 
@@ -193,4 +200,3 @@ AI infrastructure repos often fail basic review because they cannot run without 
 - Add server-lifecycle hooks for controlled cold-start measurements.
 - Add request payload profiles by model family.
 - Add distributed load generation across multiple clients.
-- Add model-aware numeric tolerance policies for batch-invariance probes.

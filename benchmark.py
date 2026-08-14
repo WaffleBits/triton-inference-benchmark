@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -227,6 +228,8 @@ class CliOptions:
     max_server_failure_rate: float | None = None
     max_server_queue_fraction: float | None = None
     batch_invariance_probes: int = 0
+    batch_output_atol: float = 0.0
+    batch_output_rtol: float = 0.0
     baseline_path: str | None = None
     max_p95_regression_pct: float = 10.0
     max_success_rate_drop: float = 0.01
@@ -260,8 +263,26 @@ class OutputInferenceResult:
     sample_id: int
     ok: bool
     latency_ms: float
-    output_fingerprint: str | None = None
+    output_observation: OutputObservation | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class NumericOutput:
+    """One numeric Triton output retained only for in-process comparison."""
+
+    name: str
+    dtype: str
+    shape: tuple[int, ...]
+    values: tuple[bool | int | float | complex, ...]
+
+
+@dataclass(frozen=True)
+class OutputObservation:
+    """Private output evidence; fingerprints and values are never serialized."""
+
+    fingerprint: str
+    numeric_outputs: tuple[NumericOutput, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -357,11 +378,12 @@ class InferenceClient(Protocol):
 
 
 class OutputInferenceClient(Protocol):
-    def infer_output(self, sample_id: int) -> str:
-        """Execute a deterministic input and return an output fingerprint."""
+    def infer_output(self, sample_id: int) -> str | OutputObservation:
+        """Execute a deterministic input and return private output evidence."""
 
 
-def fingerprint_triton_outputs(result: Any) -> str:
+def capture_triton_outputs(result: Any) -> OutputObservation:
+    """Capture exact and numeric Triton outputs without preparing serializable data."""
     response = result.get_response()
 
     if isinstance(response, dict):
@@ -381,6 +403,8 @@ def fingerprint_triton_outputs(result: Any) -> str:
         raise RuntimeError("Triton response did not include output metadata")
 
     hasher = hashlib.sha256()
+    numeric_outputs: list[NumericOutput] = []
+    all_outputs_numeric = True
     for output_name in sorted(output_names):
         output = result.as_numpy(output_name)
         if output is None:
@@ -404,7 +428,45 @@ def fingerprint_triton_outputs(result: Any) -> str:
         hasher.update(metadata)
         hasher.update(len(payload).to_bytes(8, byteorder="big"))
         hasher.update(payload)
-    return hasher.hexdigest()
+
+        dtype_kind = getattr(output.dtype, "kind", None)
+        if dtype_kind not in {"b", "i", "u", "f", "c"}:
+            all_outputs_numeric = False
+            continue
+        try:
+            flattened_values = output.ravel(order="C").tolist()
+        except (AttributeError, TypeError, ValueError):
+            all_outputs_numeric = False
+            continue
+        if not isinstance(flattened_values, list):
+            flattened_values = [flattened_values]
+        if not all(
+            isinstance(value, (bool, int, float, complex))
+            for value in flattened_values
+        ):
+            all_outputs_numeric = False
+            continue
+        numeric_outputs.append(
+            NumericOutput(
+                name=output_name,
+                dtype=str(output.dtype),
+                shape=tuple(int(dimension) for dimension in output.shape),
+                values=tuple(flattened_values),
+            )
+        )
+
+    return OutputObservation(
+        fingerprint=hasher.hexdigest(),
+        numeric_outputs=(
+            tuple(numeric_outputs)
+            if all_outputs_numeric and len(numeric_outputs) == len(output_names)
+            else None
+        ),
+    )
+
+
+def fingerprint_triton_outputs(result: Any) -> str:
+    return capture_triton_outputs(result).fingerprint
 
 
 class MockInferenceClient:
@@ -429,12 +491,22 @@ class MockInferenceClient:
         if self.random.random() < self.failure_rate:
             raise RuntimeError("synthetic inference failure")
 
-    def infer_output(self, sample_id: int) -> str:
+    def infer_output(self, sample_id: int) -> OutputObservation:
         sample_random = random.Random(self.seed + sample_id)
         latency_ms = sample_random.uniform(self.min_latency_ms, self.max_latency_ms)
         time.sleep(latency_ms / 1000)
         payload = f"mock-output:{self.seed}:{sample_id}".encode()
-        return hashlib.sha256(payload).hexdigest()
+        return OutputObservation(
+            fingerprint=hashlib.sha256(payload).hexdigest(),
+            numeric_outputs=(
+                NumericOutput(
+                    name="mock_scores",
+                    dtype="float64",
+                    shape=(2,),
+                    values=(float(sample_id), float((self.seed + sample_id) % 17) / 17),
+                ),
+            ),
+        )
 
 
 class TritonHttpInferenceClient:
@@ -472,11 +544,11 @@ class TritonHttpInferenceClient:
         input_data = self.np.random.rand(*self.input_shape).astype(self.np.float32)
         self._infer(input_data)
 
-    def infer_output(self, sample_id: int) -> str:
+    def infer_output(self, sample_id: int) -> OutputObservation:
         random_generator = self.np.random.default_rng(sample_id)
         input_data = random_generator.random(self.input_shape).astype(self.np.float32)
         result = self._infer(input_data)
-        return fingerprint_triton_outputs(result)
+        return capture_triton_outputs(result)
 
     def _infer(self, input_data: Any) -> Any:
         request_input = self.httpclient.InferInput(
@@ -665,13 +737,18 @@ def execute_output_with_retries(
 
     for _ in range(retries + 1):
         try:
-            fingerprint = client.infer_output(sample_id)
+            captured_output = client.infer_output(sample_id)
+            observation = (
+                captured_output
+                if isinstance(captured_output, OutputObservation)
+                else OutputObservation(fingerprint=captured_output)
+            )
             latency_ms = (time.perf_counter() - start) * 1000
             return OutputInferenceResult(
                 sample_id=sample_id,
                 ok=True,
                 latency_ms=latency_ms,
-                output_fingerprint=fingerprint,
+                output_observation=observation,
             )
         except Exception as exc:  # noqa: BLE001 - probe records client failures.
             last_error = str(exc)
@@ -685,17 +762,150 @@ def execute_output_with_retries(
     )
 
 
+def _compare_output_observations(
+    baseline: OutputObservation,
+    candidate: OutputObservation,
+    absolute_tolerance: float,
+    relative_tolerance: float,
+) -> dict[str, object]:
+    if baseline.fingerprint == candidate.fingerprint:
+        has_numeric_evidence = (
+            baseline.numeric_outputs is not None
+            and candidate.numeric_outputs is not None
+        )
+        return {
+            "matched": True,
+            "exact": True,
+            "tolerance_match": False,
+            "numeric_comparison": has_numeric_evidence,
+            "incompatible": False,
+            "reason": None,
+            "max_absolute_error": 0.0 if has_numeric_evidence else None,
+            "max_relative_error": 0.0 if has_numeric_evidence else None,
+        }
+
+    if absolute_tolerance == 0 and relative_tolerance == 0:
+        return {
+            "matched": False,
+            "exact": False,
+            "tolerance_match": False,
+            "numeric_comparison": False,
+            "incompatible": False,
+            "reason": "exact_fingerprint_mismatch",
+            "max_absolute_error": None,
+            "max_relative_error": None,
+        }
+
+    baseline_outputs = baseline.numeric_outputs
+    candidate_outputs = candidate.numeric_outputs
+    if baseline_outputs is None or candidate_outputs is None:
+        return {
+            "matched": False,
+            "exact": False,
+            "tolerance_match": False,
+            "numeric_comparison": False,
+            "incompatible": True,
+            "reason": "non_numeric_output",
+            "max_absolute_error": None,
+            "max_relative_error": None,
+        }
+
+    baseline_structure = [
+        (output.name, output.dtype, output.shape, len(output.values))
+        for output in baseline_outputs
+    ]
+    candidate_structure = [
+        (output.name, output.dtype, output.shape, len(output.values))
+        for output in candidate_outputs
+    ]
+    if baseline_structure != candidate_structure:
+        return {
+            "matched": False,
+            "exact": False,
+            "tolerance_match": False,
+            "numeric_comparison": False,
+            "incompatible": True,
+            "reason": "structural_incompatibility",
+            "max_absolute_error": None,
+            "max_relative_error": None,
+        }
+
+    max_absolute_error = 0.0
+    relative_errors: list[float] = []
+    within_tolerance = True
+    for baseline_output, candidate_output in zip(
+        baseline_outputs,
+        candidate_outputs,
+    ):
+        for baseline_value, candidate_value in zip(
+            baseline_output.values,
+            candidate_output.values,
+        ):
+            baseline_magnitude = float(abs(baseline_value))
+            candidate_magnitude = float(abs(candidate_value))
+            if not (
+                math.isfinite(baseline_magnitude)
+                and math.isfinite(candidate_magnitude)
+            ):
+                return {
+                    "matched": False,
+                    "exact": False,
+                    "tolerance_match": False,
+                    "numeric_comparison": False,
+                    "incompatible": True,
+                    "reason": "non_finite_values",
+                    "max_absolute_error": None,
+                    "max_relative_error": None,
+                }
+            absolute_error = float(abs(candidate_value - baseline_value))
+            allowed_error = absolute_tolerance + relative_tolerance * baseline_magnitude
+            if not (math.isfinite(absolute_error) and math.isfinite(allowed_error)):
+                return {
+                    "matched": False,
+                    "exact": False,
+                    "tolerance_match": False,
+                    "numeric_comparison": False,
+                    "incompatible": True,
+                    "reason": "non_finite_values",
+                    "max_absolute_error": None,
+                    "max_relative_error": None,
+                }
+            max_absolute_error = max(max_absolute_error, absolute_error)
+            if baseline_magnitude > 0:
+                relative_errors.append(absolute_error / baseline_magnitude)
+            if absolute_error > allowed_error:
+                within_tolerance = False
+
+    return {
+        "matched": within_tolerance,
+        "exact": False,
+        "tolerance_match": within_tolerance,
+        "numeric_comparison": True,
+        "incompatible": False,
+        "reason": None if within_tolerance else "outside_tolerance",
+        "max_absolute_error": max_absolute_error,
+        "max_relative_error": max(relative_errors, default=0.0),
+    }
+
+
 def run_batch_invariance_probe(
     client: OutputInferenceClient,
     probe_count: int,
     concurrency: int,
     retries: int = 0,
     seed: int = 7,
+    absolute_tolerance: float = 0.0,
+    relative_tolerance: float = 0.0,
 ) -> dict[str, object]:
     if probe_count <= 0:
         raise ValueError("probe_count must be greater than zero")
     if concurrency <= 1:
         raise ValueError("concurrency must be greater than one")
+    if any(
+        not math.isfinite(value) or value < 0
+        for value in (absolute_tolerance, relative_tolerance)
+    ):
+        raise ValueError("batch output tolerances must be finite and non-negative")
 
     probe_ids = list(range(probe_count))
     baseline_results = {
@@ -728,8 +938,15 @@ def run_batch_invariance_probe(
 
     mismatched_sample_ids: list[int] = []
     matched_outputs = 0
+    exact_matches = 0
+    tolerance_matches = 0
+    numeric_comparisons = 0
+    incompatible_outputs = 0
     compared_outputs = 0
     errors: list[dict[str, object]] = []
+    mismatch_reasons: dict[str, int] = {}
+    observed_absolute_errors: list[float] = []
+    observed_relative_errors: list[float] = []
 
     for sample_id in probe_ids:
         baseline = baseline_results[sample_id]
@@ -754,13 +971,57 @@ def run_batch_invariance_probe(
             continue
 
         compared_outputs += 1
-        if baseline.output_fingerprint == candidate.output_fingerprint:
+        baseline_observation = baseline.output_observation
+        candidate_observation = candidate.output_observation
+        if baseline_observation is None or candidate_observation is None:
+            comparison = {
+                "matched": False,
+                "exact": False,
+                "tolerance_match": False,
+                "numeric_comparison": False,
+                "incompatible": True,
+                "reason": "missing_output_evidence",
+                "max_absolute_error": None,
+                "max_relative_error": None,
+            }
+        else:
+            comparison = _compare_output_observations(
+                baseline_observation,
+                candidate_observation,
+                absolute_tolerance=absolute_tolerance,
+                relative_tolerance=relative_tolerance,
+            )
+
+        if comparison["numeric_comparison"]:
+            numeric_comparisons += 1
+        if comparison["incompatible"]:
+            incompatible_outputs += 1
+        absolute_error = comparison["max_absolute_error"]
+        relative_error = comparison["max_relative_error"]
+        if isinstance(absolute_error, (int, float)):
+            observed_absolute_errors.append(float(absolute_error))
+        if isinstance(relative_error, (int, float)):
+            observed_relative_errors.append(float(relative_error))
+
+        if comparison["matched"]:
             matched_outputs += 1
+            if comparison["exact"]:
+                exact_matches += 1
+            elif comparison["tolerance_match"]:
+                tolerance_matches += 1
         else:
             mismatched_sample_ids.append(sample_id)
+            reason = str(comparison["reason"])
+            mismatch_reasons[reason] = mismatch_reasons.get(reason, 0) + 1
 
     failed_probes = len(errors)
     exact_match = (
+        failed_probes == 0
+        and noise_failures == 0
+        and compared_outputs == probe_count
+        and exact_matches == probe_count
+    )
+    passed = (
         failed_probes == 0
         and noise_failures == 0
         and compared_outputs == probe_count
@@ -773,12 +1034,36 @@ def run_batch_invariance_probe(
         "noise_request_count": len(noise_ids),
         "compared_outputs": compared_outputs,
         "matched_outputs": matched_outputs,
+        "exact_matches": exact_matches,
+        "tolerance_matches": tolerance_matches,
+        "numeric_comparisons": numeric_comparisons,
+        "incompatible_outputs": incompatible_outputs,
         "mismatched_outputs": len(mismatched_sample_ids),
         "failed_probes": failed_probes,
         "noise_failures": noise_failures,
         "match_rate": round(matched_outputs / probe_count, 4),
         "exact_match": exact_match,
+        "passed": passed,
+        "comparison_policy": {
+            "mode": (
+                "numeric_tolerance"
+                if absolute_tolerance > 0 or relative_tolerance > 0
+                else "exact_fingerprint"
+            ),
+            "absolute_tolerance": absolute_tolerance,
+            "relative_tolerance": relative_tolerance,
+            "criterion": (
+                "absolute_error <= absolute_tolerance + "
+                "relative_tolerance * abs(isolated_value)"
+            ),
+            "scope": "this benchmark run and model only",
+            "output_values_persisted": False,
+            "output_fingerprints_persisted": False,
+        },
+        "max_observed_absolute_error": max(observed_absolute_errors, default=None),
+        "max_observed_relative_error": max(observed_relative_errors, default=None),
         "mismatched_sample_ids": mismatched_sample_ids,
+        "mismatch_reasons": mismatch_reasons,
         "errors": errors,
     }
 
@@ -2758,7 +3043,17 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
             (
                 "mismatched_outputs",
                 "triton_benchmark_batch_invariance_mismatches_total",
-                "Outputs that changed between isolated and concurrent execution.",
+                "Outputs outside the configured comparison policy.",
+            ),
+            (
+                "exact_matches",
+                "triton_benchmark_batch_invariance_exact_matches_total",
+                "Outputs with identical isolated and concurrent fingerprints.",
+            ),
+            (
+                "tolerance_matches",
+                "triton_benchmark_batch_invariance_tolerance_matches_total",
+                "Numerically different outputs accepted by the run-scoped policy.",
             ),
             (
                 "failed_probes",
@@ -2773,7 +3068,17 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
             (
                 "match_rate",
                 "triton_benchmark_batch_invariance_match_rate",
-                "Ratio of fixed inputs with identical isolated and concurrent outputs.",
+                "Ratio of fixed inputs within the configured output policy.",
+            ),
+            (
+                "max_observed_absolute_error",
+                "triton_benchmark_batch_invariance_max_absolute_error",
+                "Maximum finite absolute numeric error across compared outputs.",
+            ),
+            (
+                "max_observed_relative_error",
+                "triton_benchmark_batch_invariance_max_relative_error",
+                "Maximum finite relative error against isolated outputs.",
             ),
         ]
         for source_key, metric_name, help_text in batch_specs:
@@ -2795,6 +3100,42 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
                     ),
                 ]
             )
+
+        passed = batch_invariance.get("passed")
+        if isinstance(passed, bool):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_batch_invariance_passed Whether all probes passed the configured output policy without request or noise failures.",
+                    "# TYPE triton_benchmark_batch_invariance_passed gauge",
+                    (
+                        f"triton_benchmark_batch_invariance_passed{{{labels}}} "
+                        f"{int(passed)}"
+                    ),
+                ]
+            )
+
+        comparison_policy = batch_invariance.get("comparison_policy")
+        if isinstance(comparison_policy, dict):
+            tolerance_specs = [
+                (
+                    "absolute_tolerance",
+                    "triton_benchmark_batch_invariance_absolute_tolerance",
+                    "Configured run-scoped absolute output tolerance.",
+                ),
+                (
+                    "relative_tolerance",
+                    "triton_benchmark_batch_invariance_relative_tolerance",
+                    "Configured run-scoped relative output tolerance.",
+                ),
+            ]
+            for source_key, metric_name, help_text in tolerance_specs:
+                value = _nested_number(comparison_policy, (source_key,))
+                if value is None:
+                    continue
+                lines.extend(
+                    [f"# HELP {metric_name} {help_text}", f"# TYPE {metric_name} gauge"]
+                )
+                lines.append(f"{metric_name}{{{labels}}} {value:g}")
 
     streaming = typed_metrics.get("streaming")
     if isinstance(streaming, dict):
@@ -3354,7 +3695,25 @@ def parse_args() -> CliOptions:
         default=0,
         help=(
             "Run this many fixed inputs in isolation and under concurrent noise traffic, "
-            "then compare exact output fingerprints."
+            "then compare output correctness under the configured policy."
+        ),
+    )
+    parser.add_argument(
+        "--batch-output-atol",
+        type=float,
+        default=0.0,
+        help=(
+            "Run-scoped absolute numeric tolerance for batch-invariance outputs; "
+            "zero preserves exact comparison unless a relative tolerance is set."
+        ),
+    )
+    parser.add_argument(
+        "--batch-output-rtol",
+        type=float,
+        default=0.0,
+        help=(
+            "Run-scoped relative numeric tolerance for batch-invariance outputs; "
+            "evaluated against the isolated value."
         ),
     )
     parser.add_argument(
@@ -3392,6 +3751,16 @@ def parse_args() -> CliOptions:
         parser.error("--batch-invariance-probes must be zero or greater")
     if args.batch_invariance_probes and args.concurrency <= 1:
         parser.error("--batch-invariance-probes requires --concurrency greater than one")
+    batch_output_tolerances = (args.batch_output_atol, args.batch_output_rtol)
+    if any(
+        not math.isfinite(value) or value < 0
+        for value in batch_output_tolerances
+    ):
+        parser.error("batch output tolerances must be finite and non-negative")
+    if any(value > 0 for value in batch_output_tolerances) and not (
+        args.batch_invariance_probes
+    ):
+        parser.error("batch output tolerances require --batch-invariance-probes")
     if args.fail_on_batch_variance and not args.batch_invariance_probes:
         parser.error("--fail-on-batch-variance requires --batch-invariance-probes")
     if args.propagate_trace_context and args.mode == "mock":
@@ -3629,6 +3998,8 @@ def parse_args() -> CliOptions:
         max_server_failure_rate=args.max_server_failure_rate,
         max_server_queue_fraction=args.max_server_queue_fraction,
         batch_invariance_probes=args.batch_invariance_probes,
+        batch_output_atol=args.batch_output_atol,
+        batch_output_rtol=args.batch_output_rtol,
         baseline_path=args.baseline,
         max_p95_regression_pct=args.max_p95_regression_pct,
         max_success_rate_drop=args.max_success_rate_drop,
@@ -3687,6 +4058,8 @@ def main() -> None:
             concurrency=config.concurrency,
             retries=config.retries,
             seed=config.seed,
+            absolute_tolerance=options.batch_output_atol,
+            relative_tolerance=options.batch_output_rtol,
         )
     if options.fail_on_trace_context_gap:
         metrics["trace_context_gate"] = build_trace_context_gate(metrics)
@@ -3718,7 +4091,7 @@ def main() -> None:
     if (
         options.fail_on_batch_variance
         and isinstance(batch_invariance, dict)
-        and not batch_invariance.get("exact_match", False)
+        and not batch_invariance.get("passed", False)
         and exit_code == 0
     ):
         exit_code = 3
