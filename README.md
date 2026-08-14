@@ -36,6 +36,8 @@ inference endpoint.
   output-token throughput without treating transport chunks as tokens.
 - Opt-in W3C `traceparent` propagation for live Triton and OpenAI-compatible
   requests, with fresh identifiers per HTTP attempt and no identifiers in artifacts.
+- Isolated-versus-concurrent output gates with exact fingerprints by default and
+  opt-in run-scoped numeric tolerances; output values stay in process memory.
 
 ## Quick Start
 
@@ -182,6 +184,38 @@ scrapes and labels the distribution as sampled rather than time-weighted. A
 membership change rejects that sampled window. Matching hashes do not prove
 physical target identity, target health, isolation from unrelated activity, or
 clock synchronization.
+
+## Gate batch-dependent numeric drift
+
+Compare fixed synthetic Triton inputs in isolation and while mixed with
+concurrent noise traffic:
+
+```bash
+python benchmark.py \
+  --mode triton \
+  --server-url localhost:8000 \
+  --model-name resnet50_trt_fp16 \
+  --num-requests 200 \
+  --concurrency 8 \
+  --batch-invariance-probes 16 \
+  --batch-output-atol 0.0001 \
+  --batch-output-rtol 0.001 \
+  --fail-on-batch-variance \
+  --prometheus
+```
+
+Zero tolerances preserve exact SHA-256 fingerprint comparison. With either
+tolerance set, a numerically different element passes only when
+`absolute_error <= atol + rtol * abs(isolated_value)`. Output names, dtypes,
+shapes, and element counts must still match exactly; non-numeric and non-finite
+differences fail closed. JSON and Prometheus report the run-scoped policy,
+exact and tolerance match counts, mismatch classes, and finite aggregate worst
+errors. Tensor values, bytes, and fingerprints are not serialized.
+
+Tolerance is not a model-quality claim. The operator must choose it for the
+specific model, backend, dtype, and acceptance boundary. This single-client
+probe does not prove semantic equivalence, production correctness, traffic
+isolation, deterministic kernels, or cross-accelerator parity.
 
 ## Sample output (mock backend)
 

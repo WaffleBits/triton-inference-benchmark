@@ -151,6 +151,8 @@ jobs:
             --num-requests 20 \
             --concurrency 4 \
             --batch-invariance-probes 8 \
+            --batch-output-atol 0.0001 \
+            --batch-output-rtol 0.001 \
             --fail-on-batch-variance \
             --input-tokens-per-request 1024 \
             --output-tokens-per-request 256 \
@@ -189,6 +191,19 @@ jobs:
               metrics["telemetry_window"]["series_membership"]["fingerprint_sha256"]
           ) == 64
           assert metrics["telemetry_gate"]["passed"] is True
+          batch_gate = metrics["batch_invariance"]
+          assert batch_gate["passed"] is True
+          assert batch_gate["exact_match"] is True
+          assert batch_gate["exact_matches"] == 8
+          assert batch_gate["tolerance_matches"] == 0
+          assert batch_gate["numeric_comparisons"] == 8
+          assert batch_gate["max_observed_absolute_error"] == 0
+          assert batch_gate["max_observed_relative_error"] == 0
+          assert batch_gate["comparison_policy"]["mode"] == "numeric_tolerance"
+          assert batch_gate["comparison_policy"]["absolute_tolerance"] == 0.0001
+          assert batch_gate["comparison_policy"]["relative_tolerance"] == 0.001
+          assert batch_gate["comparison_policy"]["output_values_persisted"] is False
+          assert batch_gate["comparison_policy"]["output_fingerprints_persisted"] is False
           gauge_window = metrics["telemetry_gauge_window"]
           assert gauge_window["in_window_scrape_count"] >= 2
           assert (
@@ -202,6 +217,11 @@ jobs:
           prometheus = results[0].with_suffix(".prom").read_text(encoding="utf-8")
           assert "triton_benchmark_server_series_membership_stable" in prometheus
           assert "triton_benchmark_gpu_window_series_membership_stable" in prometheus
+          assert "triton_benchmark_batch_invariance_passed" in prometheus
+          assert "triton_benchmark_batch_invariance_exact_matches_total" in prometheus
+          assert "triton_benchmark_batch_invariance_tolerance_matches_total" in prometheus
+          assert "triton_benchmark_batch_invariance_absolute_tolerance" in prometheus
+          assert "triton_benchmark_batch_invariance_relative_tolerance" in prometheus
           serialized = json.dumps(metrics)
           assert "127.0.0.1" not in serialized
           assert "nv_inference_request_success" not in serialized
