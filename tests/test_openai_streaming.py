@@ -443,6 +443,7 @@ class OpenAIStreamingClientTest(unittest.TestCase):
             thread.join(timeout=2)
 
         self.assertTrue(result.ok)
+        self.assertEqual(result.attempt_count, 2)
         self.assertEqual(len(Handler.traceparents), 2)
         self.assertEqual(len(set(Handler.traceparents)), 2)
         for traceparent in Handler.traceparents:

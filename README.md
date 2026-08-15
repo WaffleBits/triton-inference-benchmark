@@ -16,7 +16,8 @@ inference endpoint.
 - Optional phase-separated warmup requests with their own outcomes, latency,
   throughput, JSON, and Prometheus records; headline and cost metrics remain
   scoped to the measured phase.
-- Retry-aware request execution with failure accounting.
+- Retry-aware request execution with measured client-attempt amplification,
+  recovery/exhaustion accounting, and an optional fail gate.
 - Latency metrics: average, p50, p95, p99, min, max, plus throughput and success rate.
 - JSON output and Prometheus text export for trend tracking.
 - Baseline-versus-candidate comparison with p95 and success-rate gates.
@@ -105,6 +106,28 @@ throughput. Concurrency remains the worker cap; requests can queue in the client
 executor if service time exceeds that capacity. This is single-process
 scheduling evidence, not proof of exact server arrival times, isolated server
 queues, synchronized clocks, or distributed load.
+
+Gate the extra client work used to recover failed logical requests:
+
+```bash
+python benchmark.py \
+  --mode openai \
+  --server-url http://localhost:8000/v1 \
+  --model-name local-model \
+  --num-requests 200 \
+  --concurrency 16 \
+  --retries 2 \
+  --max-client-attempt-amplification 1.05 \
+  --fail-on-retry-gate \
+  --prometheus
+```
+
+The factor is the number of measured calls to `InferenceClient.infer` divided
+by measured logical requests. JSON and Prometheus also separate retried,
+recovered, and exhausted requests. Warmup has its own attempt accounting and is
+excluded from the measured gate. A client call can fail before endpoint receipt,
+so this is harness-attempt evidence rather than a server request count or proof
+of retry traffic reaching a router, model server, or accelerator.
 
 Compare a candidate run against a saved baseline and fail on regression:
 

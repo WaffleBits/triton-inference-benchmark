@@ -138,6 +138,30 @@ whether a worker was available. Concurrency still caps active workers, so a high
 offered rate can queue requests before they reach the server. Do not report
 configured request rate as achieved server throughput.
 
+### Retry amplification
+
+Set a run-scoped budget when retries are enabled:
+
+```bash
+python benchmark.py \
+  --mode openai \
+  --server-url http://localhost:8000/v1 \
+  --model-name local-model \
+  --num-requests 200 \
+  --concurrency 16 \
+  --retries 2 \
+  --max-client-attempt-amplification 1.05 \
+  --fail-on-retry-gate \
+  --prometheus
+```
+
+Review total client attempts, retry attempts, recovered requests, exhausted
+requests, and the amplification factor together. A 1.05 factor means the
+harness made 105 client calls per 100 measured logical requests; it does not
+prove all 105 reached the server. Compare it with server counters and traces in
+the authorized environment before attributing load. Warmup retry activity stays
+under `warmup.retry` and is excluded from this gate.
+
 ### Trace correlation
 
 Use `--propagate-trace-context` only when the authorized live endpoint is

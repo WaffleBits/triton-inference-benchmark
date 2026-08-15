@@ -233,10 +233,12 @@ class CliOptions:
     baseline_path: str | None = None
     max_p95_regression_pct: float = 10.0
     max_success_rate_drop: float = 0.01
+    max_client_attempt_amplification: float | None = None
     fail_on_regression: bool = False
     fail_on_batch_variance: bool = False
     fail_on_telemetry_gate: bool = False
     fail_on_trace_context_gap: bool = False
+    fail_on_retry_gate: bool = False
 
 
 @dataclass(frozen=True)
@@ -256,6 +258,7 @@ class InferenceResult:
     error: str | None = None
     streaming: StreamingInferenceObservation | None = None
     request_started_at: float | None = None
+    attempt_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -701,7 +704,7 @@ def execute_with_retries(client: InferenceClient, retries: int) -> InferenceResu
     start = time.perf_counter()
     last_error: str | None = None
 
-    for _ in range(retries + 1):
+    for attempt_count in range(1, retries + 2):
         try:
             observation = client.infer()
             latency_ms = (time.perf_counter() - start) * 1000
@@ -714,6 +717,7 @@ def execute_with_retries(client: InferenceClient, retries: int) -> InferenceResu
                     else None
                 ),
                 request_started_at=start,
+                attempt_count=attempt_count,
             )
         except Exception as exc:  # noqa: BLE001 - benchmark harness records client failures.
             last_error = str(exc)
@@ -724,6 +728,7 @@ def execute_with_retries(client: InferenceClient, retries: int) -> InferenceResu
         latency_ms=latency_ms,
         error=last_error,
         request_started_at=start,
+        attempt_count=retries + 1,
     )
 
 
@@ -1236,9 +1241,92 @@ def _sample_telemetry_during_phase(
             return
 
 
+def _summarize_retry_attempts(
+    results: list[InferenceResult],
+    configured_retries: int,
+) -> dict[str, object]:
+    """Summarize client calls without claiming that an endpoint received them."""
+    logical_requests = len(results)
+    attempt_counts = [max(1, int(result.attempt_count)) for result in results]
+    client_attempts = sum(attempt_counts)
+    retry_attempts = client_attempts - logical_requests
+    return {
+        "configured_retries_per_request": configured_retries,
+        "logical_requests": logical_requests,
+        "client_attempts": client_attempts,
+        "retry_attempts": retry_attempts,
+        "retried_requests": sum(count > 1 for count in attempt_counts),
+        "recovered_requests": sum(
+            result.ok and count > 1
+            for result, count in zip(results, attempt_counts)
+        ),
+        "exhausted_requests": sum(not result.ok for result in results),
+        "client_attempt_amplification": round(
+            client_attempts / logical_requests,
+            4,
+        )
+        if logical_requests
+        else 0,
+        "scope": (
+            "Counts calls made by this harness to InferenceClient.infer. A client "
+            "attempt does not prove endpoint, router, model-server, or accelerator receipt."
+        ),
+    }
+
+
+def build_retry_gate(
+    retry_summary: dict[str, object],
+    max_client_attempt_amplification: float,
+) -> dict[str, object]:
+    """Gate measured client-attempt amplification against an explicit budget."""
+    if (
+        not math.isfinite(max_client_attempt_amplification)
+        or max_client_attempt_amplification < 1
+    ):
+        raise ValueError("maximum client-attempt amplification must be finite and at least 1")
+    client_attempts = retry_summary.get("client_attempts")
+    logical_requests = retry_summary.get("logical_requests")
+    if isinstance(client_attempts, int) and isinstance(logical_requests, int):
+        evaluable = logical_requests > 0 and client_attempts >= logical_requests
+        observed = client_attempts / logical_requests if evaluable else None
+    else:
+        summarized = retry_summary.get("client_attempt_amplification")
+        evaluable = isinstance(summarized, (int, float)) and math.isfinite(
+            float(summarized)
+        )
+        observed = float(summarized) if evaluable else None
+    passed = (
+        evaluable
+        and observed is not None
+        and observed <= max_client_attempt_amplification
+    )
+    failure_reasons: list[str] = []
+    if not evaluable or observed is None:
+        failure_reasons.append("client-attempt amplification is unavailable")
+    elif not passed:
+        failure_reasons.append(
+            "client-attempt amplification "
+            f"{observed:g} exceeded {max_client_attempt_amplification:g} threshold"
+        )
+    return {
+        "passed": passed,
+        "checks": {
+            "client_attempt_amplification": {
+                "observed": round(observed, 6) if observed is not None else None,
+                "maximum": max_client_attempt_amplification,
+                "evaluable": evaluable,
+                "passed": passed,
+            }
+        },
+        "failure_reasons": failure_reasons,
+        "scope": "measured logical requests only; warmup is excluded",
+    }
+
+
 def _summarize_request_phase(
     results: list[InferenceResult],
     duration_seconds: float,
+    configured_retries: int,
 ) -> dict[str, object]:
     latencies = [result.latency_ms for result in results if result.ok]
     successes = len(latencies)
@@ -1260,6 +1348,7 @@ def _summarize_request_phase(
             "min": round(min(latencies), 4) if latencies else 0,
             "max": round(max(latencies), 4) if latencies else 0,
         },
+        "retry": _summarize_retry_attempts(results, configured_retries),
     }
 
 
@@ -1270,6 +1359,7 @@ def run_benchmark(
     max_server_failure_rate: float | None = None,
     max_server_queue_fraction: float | None = None,
     telemetry_sample_interval_seconds: float = 0.0,
+    max_client_attempt_amplification: float | None = None,
 ) -> dict[str, object]:
     if telemetry_sample_interval_seconds < 0:
         raise ValueError("telemetry sample interval must be zero or greater")
@@ -1328,6 +1418,13 @@ def run_benchmark(
         raise RuntimeError("telemetry sampling produced no in-window scrapes")
     telemetry_after = telemetry_client.scrape() if telemetry_client else None
     summary = summarize_results(results, duration_seconds, config)
+    if max_client_attempt_amplification is not None:
+        retry_summary = summary.get("retry")
+        assert isinstance(retry_summary, dict)
+        summary["retry_gate"] = build_retry_gate(
+            retry_summary,
+            max_client_attempt_amplification,
+        )
     summary["measurement_scope"] = {
         "headline_phase": "measured requests",
         "warmup_excluded": bool(config.warmup_requests),
@@ -1342,6 +1439,7 @@ def run_benchmark(
         summary["warmup"] = _summarize_request_phase(
             warmup_results,
             warmup_duration_seconds,
+            config.retries,
         )
     if telemetry_before is not None and telemetry_after is not None:
         summary = attach_telemetry_snapshots(
@@ -1410,6 +1508,7 @@ def summarize_results(
             "min": round(min(latencies), 4) if latencies else 0,
             "max": round(max(latencies), 4) if latencies else 0,
         },
+        "retry": _summarize_retry_attempts(results, config.retries),
         "config": persisted_config,
     }
 
@@ -2583,6 +2682,86 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
         f"triton_benchmark_retries{{{labels}}} {_config_number(typed_metrics, 'retries'):g}",
     ]
 
+    retry = typed_metrics.get("retry")
+    if isinstance(retry, dict):
+        retry_specs = (
+            (
+                "client_attempts",
+                "triton_benchmark_client_attempts_total",
+                "Client calls made for measured logical requests.",
+            ),
+            (
+                "retry_attempts",
+                "triton_benchmark_retry_attempts_total",
+                "Client calls after the initial measured-request attempt.",
+            ),
+            (
+                "retried_requests",
+                "triton_benchmark_retried_requests_total",
+                "Measured logical requests that needed more than one client attempt.",
+            ),
+            (
+                "recovered_requests",
+                "triton_benchmark_recovered_requests_total",
+                "Measured logical requests that succeeded after a failed client attempt.",
+            ),
+            (
+                "exhausted_requests",
+                "triton_benchmark_exhausted_requests_total",
+                "Measured logical requests that remained failed after all configured attempts.",
+            ),
+        )
+        for source_key, metric_name, help_text in retry_specs:
+            value = retry.get(source_key)
+            if isinstance(value, (int, float)):
+                lines.extend(
+                    [
+                        f"# HELP {metric_name} {help_text}",
+                        f"# TYPE {metric_name} counter",
+                        f"{metric_name}{{{labels}}} {value:g}",
+                    ]
+                )
+        amplification = retry.get("client_attempt_amplification")
+        if isinstance(amplification, (int, float)):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_client_attempt_amplification Measured client attempts divided by measured logical requests.",
+                    "# TYPE triton_benchmark_client_attempt_amplification gauge",
+                    (
+                        "triton_benchmark_client_attempt_amplification"
+                        f"{{{labels}}} {amplification:g}"
+                    ),
+                ]
+            )
+
+    retry_gate = typed_metrics.get("retry_gate")
+    if isinstance(retry_gate, dict):
+        checks = retry_gate.get("checks")
+        check = (
+            checks.get("client_attempt_amplification")
+            if isinstance(checks, dict)
+            else None
+        )
+        if isinstance(check, dict):
+            maximum = check.get("maximum")
+            if isinstance(maximum, (int, float)):
+                lines.extend(
+                    [
+                        "# HELP triton_benchmark_retry_gate_max_amplification Configured maximum measured client-attempt amplification.",
+                        "# TYPE triton_benchmark_retry_gate_max_amplification gauge",
+                        (
+                            "triton_benchmark_retry_gate_max_amplification"
+                            f"{{{labels}}} {maximum:g}"
+                        ),
+                        "# HELP triton_benchmark_retry_gate_passed Whether measured client-attempt amplification stayed within budget.",
+                        "# TYPE triton_benchmark_retry_gate_passed gauge",
+                        (
+                            "triton_benchmark_retry_gate_passed"
+                            f"{{{labels}}} {1 if retry_gate.get('passed') else 0}"
+                        ),
+                    ]
+                )
+
     load_schedule = typed_metrics.get("load_schedule")
     if isinstance(load_schedule, dict):
         configured_rate = load_schedule.get("configured_request_rate_rps")
@@ -3486,6 +3665,22 @@ def parse_args() -> CliOptions:
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument(
+        "--max-client-attempt-amplification",
+        type=float,
+        help=(
+            "Maximum measured client calls per measured logical request; values "
+            "must be at least 1."
+        ),
+    )
+    parser.add_argument(
+        "--fail-on-retry-gate",
+        action="store_true",
+        help=(
+            "Exit with status 6 when measured client-attempt amplification exceeds "
+            "--max-client-attempt-amplification."
+        ),
+    )
+    parser.add_argument(
         "--request-rate-rps",
         type=float,
         default=0.0,
@@ -3747,6 +3942,17 @@ def parse_args() -> CliOptions:
         parser.error("--warmup-requests must be zero or greater")
     if args.request_rate_rps < 0:
         parser.error("--request-rate-rps must be zero or greater")
+    if args.retries < 0:
+        parser.error("--retries must be zero or greater")
+    if args.max_client_attempt_amplification is not None and (
+        not math.isfinite(args.max_client_attempt_amplification)
+        or args.max_client_attempt_amplification < 1
+    ):
+        parser.error("--max-client-attempt-amplification must be finite and at least 1")
+    if args.fail_on_retry_gate and args.max_client_attempt_amplification is None:
+        parser.error(
+            "--fail-on-retry-gate requires --max-client-attempt-amplification"
+        )
     if args.batch_invariance_probes < 0:
         parser.error("--batch-invariance-probes must be zero or greater")
     if args.batch_invariance_probes and args.concurrency <= 1:
@@ -4003,10 +4209,12 @@ def parse_args() -> CliOptions:
         baseline_path=args.baseline,
         max_p95_regression_pct=args.max_p95_regression_pct,
         max_success_rate_drop=args.max_success_rate_drop,
+        max_client_attempt_amplification=args.max_client_attempt_amplification,
         fail_on_regression=args.fail_on_regression,
         fail_on_batch_variance=args.fail_on_batch_variance,
         fail_on_telemetry_gate=args.fail_on_telemetry_gate,
         fail_on_trace_context_gap=args.fail_on_trace_context_gap,
+        fail_on_retry_gate=args.fail_on_retry_gate,
     )
 
 
@@ -4030,6 +4238,9 @@ def main() -> None:
         telemetry_sample_interval_seconds=options.telemetry_sample_interval_seconds,
         max_server_failure_rate=options.max_server_failure_rate,
         max_server_queue_fraction=options.max_server_queue_fraction,
+        max_client_attempt_amplification=(
+            options.max_client_attempt_amplification
+        ),
     )
     if options.workload_profile:
         metrics["workload_profile"] = asdict(options.workload_profile)
@@ -4113,6 +4324,15 @@ def main() -> None:
         and exit_code == 0
     ):
         exit_code = 5
+
+    retry_gate = metrics.get("retry_gate")
+    if (
+        options.fail_on_retry_gate
+        and isinstance(retry_gate, dict)
+        and not retry_gate.get("passed", False)
+        and exit_code == 0
+    ):
+        exit_code = 6
 
     if exit_code:
         raise SystemExit(exit_code)

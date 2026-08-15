@@ -53,6 +53,21 @@ The tool reports:
 - Configured and observed client submission rate plus submission lag when paced.
 - Average, p50, p95, p99, min, and max latency.
 
+## Retry Accounting
+
+Every logical request records how many times the harness called
+`InferenceClient.infer`. The measured summary reports total client attempts,
+attempts after the first call, retried requests, successful recovery after a
+retry, exhausted requests, and client-attempt amplification. The optional gate
+compares that measured factor with an explicit run-scoped maximum.
+
+Warmup uses the same retry policy but keeps its attempt summary separate and
+does not contribute to the measured gate. End-to-end successful latency already
+includes time spent in failed attempts. Attempt counts do not establish server
+receipt: DNS, connection, TLS, client serialization, or transport failures can
+occur before an endpoint observes a request. The artifact therefore does not
+label client-attempt amplification as server load amplification.
+
 When `--prometheus` is enabled, the same core measurements are written as Prometheus text-format gauges and counters beside the JSON result. This keeps the harness dependency-free while making the output easy to archive in CI, push to a metrics gateway, or ingest into a dashboarding workflow.
 
 When `--telemetry-prometheus` is provided, the benchmark attaches a correlated

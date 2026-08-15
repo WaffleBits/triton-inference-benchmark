@@ -18,13 +18,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port-file", required=True)
     parser.add_argument("--trace-file", required=True)
-    return parser.parse_args()
+    parser.add_argument("--fail-first-requests", type=int, default=0)
+    args = parser.parse_args()
+    if args.fail_first_requests < 0:
+        parser.error("--fail-first-requests must be zero or greater")
+    return args
 
 
 def main() -> None:
     args = parse_args()
     trace_path = Path(args.trace_file)
     trace_lock = threading.Lock()
+    request_state = {"count": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *values: object) -> None:
@@ -44,8 +49,17 @@ def main() -> None:
                 return
 
             with trace_lock:
+                request_state["count"] += 1
+                fail_this_request = (
+                    request_state["count"] <= args.fail_first_requests
+                )
                 with trace_path.open("a", encoding="utf-8") as trace_file:
                     trace_file.write(f"{traceparent}\n")
+
+            if fail_this_request:
+                self.send_response(503)
+                self.end_headers()
+                return
 
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
