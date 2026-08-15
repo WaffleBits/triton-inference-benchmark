@@ -124,6 +124,88 @@ jobs:
           assert "Authorization" not in serialized
           PY
 
+      - name: Run transient-failure retry amplification gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT_FILE=$(mktemp)
+          TRACE_FILE=$(mktemp)
+          RESULT_DIR=$(mktemp -d)
+          python tests/openai_fixture_server.py \
+            --port-file "$PORT_FILE" \
+            --trace-file "$TRACE_FILE" \
+            --fail-first-requests 1 &
+          FIXTURE_PID=$!
+          trap 'kill "$FIXTURE_PID" 2>/dev/null || true; rm -rf "$PORT_FILE" "$TRACE_FILE" "$RESULT_DIR"' EXIT
+          for _ in {1..100}; do
+            if [ -s "$PORT_FILE" ]; then
+              break
+            fi
+            if ! kill -0 "$FIXTURE_PID" 2>/dev/null; then
+              echo "retry fixture exited before becoming ready" >&2
+              exit 1
+            fi
+            sleep 0.1
+          done
+          test -s "$PORT_FILE"
+          PORT=$(<"$PORT_FILE")
+
+          python benchmark.py \
+            --mode openai \
+            --server-url "http://127.0.0.1:${PORT}" \
+            --model-name fixture-model \
+            --num-requests 4 \
+            --concurrency 1 \
+            --retries 1 \
+            --propagate-trace-context \
+            --max-client-attempt-amplification 1.25 \
+            --fail-on-retry-gate \
+            --prometheus \
+            --output-dir "$RESULT_DIR"
+
+          python - "$TRACE_FILE" "$RESULT_DIR" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          trace_path = Path(sys.argv[1])
+          result_dir = Path(sys.argv[2])
+          traceparents = trace_path.read_text(encoding="utf-8").splitlines()
+          assert len(traceparents) == 5, traceparents
+          assert len(set(traceparents)) == 5, traceparents
+
+          results = sorted(result_dir.glob("benchmark_*.json"))
+          assert len(results) == 1, results
+          metrics = json.loads(results[0].read_text(encoding="utf-8"))
+          retry = metrics["retry"]
+          assert retry["logical_requests"] == 4
+          assert retry["client_attempts"] == 5
+          assert retry["retry_attempts"] == 1
+          assert retry["retried_requests"] == 1
+          assert retry["recovered_requests"] == 1
+          assert retry["exhausted_requests"] == 0
+          assert retry["client_attempt_amplification"] == 1.25
+          assert metrics["retry_gate"]["passed"] is True
+          assert metrics["retry_gate"]["failure_reasons"] == []
+          assert metrics["retry_gate"]["scope"].startswith("measured")
+
+          prometheus = results[0].with_suffix(".prom").read_text(encoding="utf-8")
+          assert "triton_benchmark_client_attempts_total" in prometheus
+          assert "triton_benchmark_retry_attempts_total" in prometheus
+          assert "triton_benchmark_recovered_requests_total" in prometheus
+          assert "triton_benchmark_client_attempt_amplification" in prometheus
+          assert "triton_benchmark_retry_gate_passed" in prometheus
+          assert "triton_benchmark_retry_gate_max_amplification" in prometheus
+          serialized = results[0].read_text(encoding="utf-8") + prometheus
+          assert all(value not in serialized for value in traceparents)
+          assert not re.search(
+              r"00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}", serialized
+          )
+          assert "Return a short deterministic benchmark response." not in serialized
+          assert "Authorization" not in serialized
+          PY
+
       - name: Run bracketed-telemetry mock benchmark
         shell: bash
         run: |

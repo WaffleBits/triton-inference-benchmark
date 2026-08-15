@@ -20,6 +20,8 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Single-process open-loop constant-rate request pacing with measured submission
   lag kept separate from successful-completion throughput.
 - A CI-friendly mock mode that keeps the repo reviewable without GPU hardware.
+- Measured client-attempt amplification with separate retry recovery/exhaustion
+  counts and an explicit run-scoped fail gate.
 - Phase-separated warmup evidence that is excluded from measured latency,
   throughput, regression, streaming-token, and cost results.
 - A live Triton HTTP path and an OpenAI-compatible streaming path for authorized model-serving infrastructure.

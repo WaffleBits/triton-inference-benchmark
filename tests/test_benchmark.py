@@ -23,6 +23,7 @@ from benchmark import (
     TritonHttpInferenceClient,
     attach_telemetry_summary,
     build_http_telemetry_client,
+    build_retry_gate,
     build_constant_rate_submission_offsets,
     build_cost_model,
     build_trace_context_gate,
@@ -35,8 +36,10 @@ from benchmark import (
     build_telemetry_summary,
     capture_triton_outputs,
     classify_response_traceparent,
+    execute_with_retries,
     fingerprint_triton_outputs,
     format_prometheus_metrics,
+    main,
     parse_args,
     parse_prometheus_samples,
     percentile,
@@ -344,6 +347,121 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertEqual(metrics["success_rate"], 0.75)
         self.assertEqual(metrics["throughput_rps"], 6.0)
         self.assertEqual(metrics["latency_ms"]["p50"], 20.0)
+
+    def test_retry_attempts_are_counted_per_logical_request(self) -> None:
+        class FlakyClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def infer(self) -> None:
+                self.calls += 1
+                if self.calls < 3:
+                    raise RuntimeError("transient fixture failure")
+
+        result = execute_with_retries(FlakyClient(), retries=2)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.attempt_count, 3)
+
+        metrics = summarize_results(
+            [
+                result,
+                InferenceResult(ok=True, latency_ms=1.0, attempt_count=1),
+                InferenceResult(
+                    ok=False,
+                    latency_ms=2.0,
+                    error="private failure detail",
+                    attempt_count=3,
+                ),
+            ],
+            duration_seconds=1.0,
+            config=BenchmarkConfig(num_requests=3, retries=2),
+        )
+
+        retry = metrics["retry"]
+        self.assertEqual(retry["logical_requests"], 3)
+        self.assertEqual(retry["client_attempts"], 7)
+        self.assertEqual(retry["retry_attempts"], 4)
+        self.assertEqual(retry["retried_requests"], 2)
+        self.assertEqual(retry["recovered_requests"], 1)
+        self.assertEqual(retry["exhausted_requests"], 1)
+        self.assertEqual(retry["client_attempt_amplification"], 2.3333)
+        self.assertNotIn("private failure detail", json.dumps(metrics))
+
+    def test_retry_gate_and_prometheus_use_measured_client_attempts(self) -> None:
+        metrics = summarize_results(
+            [
+                InferenceResult(ok=True, latency_ms=1.0, attempt_count=2),
+                InferenceResult(ok=True, latency_ms=1.0, attempt_count=1),
+                InferenceResult(ok=True, latency_ms=1.0, attempt_count=1),
+                InferenceResult(ok=True, latency_ms=1.0, attempt_count=1),
+            ],
+            duration_seconds=1.0,
+            config=BenchmarkConfig(num_requests=4, retries=1),
+        )
+
+        passing = build_retry_gate(metrics["retry"], 1.25)
+        failing = build_retry_gate(metrics["retry"], 1.20)
+        rounding_boundary = build_retry_gate(
+            {
+                "logical_requests": 10_000,
+                "client_attempts": 10_001,
+                "client_attempt_amplification": 1.0,
+            },
+            1.00005,
+        )
+
+        self.assertTrue(passing["passed"])
+        self.assertFalse(failing["passed"])
+        self.assertFalse(rounding_boundary["passed"])
+        self.assertEqual(
+            rounding_boundary["checks"]["client_attempt_amplification"]["observed"],
+            1.0001,
+        )
+        self.assertIn("exceeded", " ".join(failing["failure_reasons"]))
+
+        prometheus = format_prometheus_metrics({**metrics, "retry_gate": passing})
+        self.assertIn("triton_benchmark_client_attempts_total", prometheus)
+        self.assertIn("triton_benchmark_retry_attempts_total", prometheus)
+        self.assertIn("triton_benchmark_recovered_requests_total", prometheus)
+        self.assertIn("triton_benchmark_client_attempt_amplification", prometheus)
+        self.assertIn("triton_benchmark_retry_gate_passed", prometheus)
+        self.assertIn("triton_benchmark_retry_gate_max_amplification", prometheus)
+
+    def test_retry_gate_cli_exits_six_when_amplification_exceeds_budget(self) -> None:
+        class FlakyClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def infer(self) -> None:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("transient fixture failure")
+
+        with (
+            tempfile.TemporaryDirectory() as output_dir,
+            patch(
+                "sys.argv",
+                [
+                    "benchmark.py",
+                    "--num-requests",
+                    "2",
+                    "--concurrency",
+                    "1",
+                    "--retries",
+                    "1",
+                    "--max-client-attempt-amplification",
+                    "1",
+                    "--fail-on-retry-gate",
+                    "--output-dir",
+                    output_dir,
+                ],
+            ),
+            patch("benchmark.build_client", return_value=FlakyClient()),
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(SystemExit, "6"):
+                main()
 
     def test_trace_context_summary_and_prometheus_omit_identifiers(self) -> None:
         metrics = summarize_results(
@@ -825,6 +943,31 @@ class BenchmarkHarnessTest(unittest.TestCase):
         with patch("sys.argv", ["benchmark.py", "--request-rate-rps", "-1"]):
             with self.assertRaises(SystemExit):
                 parse_args()
+
+    def test_parses_and_validates_retry_amplification_gate(self) -> None:
+        with patch(
+            "sys.argv",
+            [
+                "benchmark.py",
+                "--max-client-attempt-amplification",
+                "1.25",
+                "--fail-on-retry-gate",
+            ],
+        ):
+            options = parse_args()
+
+        self.assertEqual(options.max_client_attempt_amplification, 1.25)
+        self.assertTrue(options.fail_on_retry_gate)
+
+        for argv in (
+            ["benchmark.py", "--max-client-attempt-amplification", "0.99"],
+            ["benchmark.py", "--max-client-attempt-amplification", "nan"],
+            ["benchmark.py", "--fail-on-retry-gate"],
+            ["benchmark.py", "--retries", "-1"],
+        ):
+            with self.subTest(argv=argv), patch("sys.argv", argv):
+                with self.assertRaises(SystemExit):
+                    parse_args()
 
     def test_parses_trace_context_opt_in_for_live_mode(self) -> None:
         with patch(
