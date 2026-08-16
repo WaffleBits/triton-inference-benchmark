@@ -19,6 +19,7 @@ from benchmark import (
     MockInferenceClient,
     NumericOutput,
     OutputObservation,
+    RequestPathMetricNames,
     StreamingInferenceObservation,
     TritonHttpInferenceClient,
     attach_telemetry_summary,
@@ -31,6 +32,8 @@ from benchmark import (
     build_gpu_gauge_window,
     build_llm_metrics,
     build_regression_report,
+    build_request_path_accounting,
+    build_request_path_gate,
     build_telemetry_counter_window,
     build_telemetry_gate,
     build_telemetry_summary,
@@ -463,6 +466,51 @@ class BenchmarkHarnessTest(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "6"):
                 main()
 
+    def test_request_path_gate_cli_exits_seven_on_accounting_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            before_path = root / "before.prom"
+            after_path = root / "after.prom"
+            output_dir = root / "results"
+            before_path.write_text(
+                "router_total 0\nbackend_total 0\nsuccess_total 0\n",
+                encoding="utf-8",
+            )
+            after_path.write_text(
+                "router_total 2\nbackend_total 1\nsuccess_total 1\n",
+                encoding="utf-8",
+            )
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "benchmark.py",
+                        "--num-requests",
+                        "1",
+                        "--concurrency",
+                        "1",
+                        "--retries",
+                        "0",
+                        "--telemetry-baseline-prometheus",
+                        str(before_path),
+                        "--telemetry-prometheus",
+                        str(after_path),
+                        "--request-path-ingress-metric",
+                        "router_total",
+                        "--request-path-backend-metric",
+                        "backend_total",
+                        "--request-path-success-metric",
+                        "success_total",
+                        "--fail-on-request-path-gap",
+                        "--output-dir",
+                        str(output_dir),
+                    ],
+                ),
+                patch("builtins.print"),
+            ):
+                with self.assertRaisesRegex(SystemExit, "7"):
+                    main()
+
     def test_trace_context_summary_and_prometheus_omit_identifiers(self) -> None:
         metrics = summarize_results(
             [InferenceResult(ok=True, latency_ms=10.0)],
@@ -688,6 +736,143 @@ class BenchmarkHarnessTest(unittest.TestCase):
         )
         self.assertEqual(metrics["telemetry_window"]["derived"]["request_total"], 3)
         self.assertTrue(metrics["telemetry_gate"]["passed"])
+
+    def test_request_path_accounting_correlates_private_counter_deltas(self) -> None:
+        metrics = summarize_results(
+            [
+                InferenceResult(ok=True, latency_ms=10.0, attempt_count=2),
+                InferenceResult(ok=True, latency_ms=10.0),
+                InferenceResult(ok=True, latency_ms=10.0),
+                InferenceResult(ok=True, latency_ms=10.0),
+            ],
+            duration_seconds=1.0,
+            config=BenchmarkConfig(num_requests=4, retries=1),
+        )
+        metric_names = RequestPathMetricNames(
+            ingress="private_router_receipts_total",
+            backend="private_backend_receipts_total",
+            success="private_backend_success_total",
+        )
+        before = """
+        private_router_receipts_total{tenant="private-a"} 10
+        private_backend_receipts_total{tenant="private-a"} 8
+        private_backend_success_total{tenant="private-a"} 7
+        """
+        after = """
+        private_router_receipts_total{tenant="private-a"} 15
+        private_backend_receipts_total{tenant="private-a"} 12
+        private_backend_success_total{tenant="private-a"} 11
+        """
+
+        accounting = build_request_path_accounting(
+            metrics,
+            before,
+            after,
+            metric_names,
+            source="paired_http_prometheus_scrapes",
+            alignment="harness_bracketed_measured_phase",
+        )
+        gate = build_request_path_gate(accounting)
+
+        self.assertTrue(accounting["valid"])
+        self.assertEqual(accounting["client"]["logical_requests"], 4)
+        self.assertEqual(accounting["client"]["client_attempts"], 5)
+        self.assertEqual(accounting["stages"]["ingress"]["delta"], 5)
+        self.assertEqual(accounting["stages"]["backend"]["delta"], 4)
+        self.assertEqual(accounting["stages"]["success"]["delta"], 4)
+        self.assertEqual(accounting["ratios"]["ingress_per_client_attempt"], 1.0)
+        self.assertEqual(accounting["ratios"]["backend_per_ingress"], 0.8)
+        self.assertEqual(accounting["ratios"]["success_per_backend"], 1.0)
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["failure_reasons"], [])
+
+        exported = format_prometheus_metrics(
+            {**metrics, "request_path": accounting, "request_path_gate": gate}
+        )
+        self.assertIn("triton_benchmark_request_path_events_total", exported)
+        self.assertIn('stage="ingress"} 5', exported)
+        self.assertIn("triton_benchmark_request_path_ratio", exported)
+        self.assertEqual(
+            exported.count("# HELP triton_benchmark_request_path_ratio "),
+            1,
+        )
+        self.assertIn("triton_benchmark_request_path_gate_passed", exported)
+
+        serialized = json.dumps(accounting) + exported
+        self.assertNotIn("private_router_receipts_total", serialized)
+        self.assertNotIn("private_backend_receipts_total", serialized)
+        self.assertNotIn("private_backend_success_total", serialized)
+        self.assertNotIn("private-a", serialized)
+
+    def test_request_path_accounting_fails_closed_on_churn_and_reset(self) -> None:
+        metrics = summarize_results(
+            [InferenceResult(ok=True, latency_ms=10.0)],
+            duration_seconds=1.0,
+            config=BenchmarkConfig(num_requests=1),
+        )
+        metric_names = RequestPathMetricNames(
+            ingress="router_total",
+            backend="backend_total",
+            success="success_total",
+        )
+
+        accounting = build_request_path_accounting(
+            metrics,
+            """
+            router_total{worker="a"} 4
+            backend_total 9
+            success_total 7
+            """,
+            """
+            router_total{worker="b"} 5
+            backend_total 8
+            success_total 8
+            """,
+            metric_names,
+        )
+        gate = build_request_path_gate(accounting)
+
+        self.assertFalse(accounting["valid"])
+        self.assertIsNone(accounting["stages"]["ingress"]["delta"])
+        self.assertIsNone(accounting["stages"]["backend"]["delta"])
+        self.assertIn("series_membership_changed", accounting["issues"])
+        self.assertIn("counter_reset", accounting["issues"])
+        self.assertFalse(gate["passed"])
+        self.assertIn("invalid", " ".join(gate["failure_reasons"]))
+
+    def test_request_path_accounting_rejects_malformed_counter_evidence(self) -> None:
+        metrics = summarize_results(
+            [InferenceResult(ok=True, latency_ms=10.0)],
+            duration_seconds=1.0,
+            config=BenchmarkConfig(num_requests=1),
+        )
+        metric_names = RequestPathMetricNames(
+            ingress="router_total",
+            backend="backend_total",
+            success="success_total",
+        )
+        cases = {
+            "counter_missing": ("", ""),
+            "non_finite_counter": ("router_total NaN", "router_total 1"),
+            "negative_counter": ("router_total -1", "router_total 0"),
+            "non_integral_counter": ("router_total 0.5", "router_total 1.5"),
+            "duplicate_series": (
+                "router_total{worker=\"a\"} 0\nrouter_total{worker=\"a\"} 0",
+                "router_total{worker=\"a\"} 1\nrouter_total{worker=\"a\"} 1",
+            ),
+        }
+
+        for expected_issue, (before_ingress, after_ingress) in cases.items():
+            with self.subTest(issue=expected_issue):
+                accounting = build_request_path_accounting(
+                    metrics,
+                    f"{before_ingress}\nbackend_total 0\nsuccess_total 0\n",
+                    f"{after_ingress}\nbackend_total 1\nsuccess_total 1\n",
+                    metric_names,
+                )
+                self.assertFalse(accounting["valid"])
+                self.assertIn(expected_issue, accounting["issues"])
+                self.assertFalse(build_request_path_gate(accounting)["passed"])
 
     def test_http_telemetry_samples_gpu_gauges_during_measured_phase(self) -> None:
         class SlowClient:
@@ -1994,6 +2179,49 @@ class BenchmarkHarnessTest(unittest.TestCase):
         ):
             with self.assertRaises(SystemExit):
                 parse_args()
+
+    def test_parses_request_path_metrics_and_isolated_gate(self) -> None:
+        with patch(
+            "sys.argv",
+            [
+                "benchmark.py",
+                "--telemetry-url",
+                "https://metrics.example.test/metrics",
+                "--request-path-ingress-metric",
+                "router_requests_total",
+                "--request-path-backend-metric",
+                "backend_requests_total",
+                "--request-path-success-metric",
+                "backend_success_total",
+                "--fail-on-request-path-gap",
+            ],
+        ):
+            options = parse_args()
+
+        self.assertEqual(options.request_path_metrics.ingress, "router_requests_total")
+        self.assertEqual(options.request_path_metrics.backend, "backend_requests_total")
+        self.assertEqual(options.request_path_metrics.success, "backend_success_total")
+        self.assertTrue(options.fail_on_request_path_gap)
+
+    def test_request_path_metrics_require_complete_names_and_paired_telemetry(self) -> None:
+        invalid_argv = (
+            ["benchmark.py", "--request-path-ingress-metric", "router_total"],
+            [
+                "benchmark.py",
+                "--request-path-ingress-metric",
+                "router_total",
+                "--request-path-backend-metric",
+                "backend_total",
+                "--request-path-success-metric",
+                "success_total",
+            ],
+            ["benchmark.py", "--fail-on-request-path-gap"],
+        )
+        for argv in invalid_argv:
+            with self.subTest(argv=argv):
+                with patch("sys.argv", argv):
+                    with self.assertRaises(SystemExit):
+                        parse_args()
 
 
 if __name__ == "__main__":

@@ -18,6 +18,8 @@ inference endpoint.
   scoped to the measured phase.
 - Retry-aware request execution with measured client-attempt amplification,
   recovery/exhaustion accounting, and an optional fail gate.
+- Opt-in ingress/backend/success counter accounting that reconciles measured
+  client attempts with privacy-safe aggregate serving-path evidence.
 - Latency metrics: average, p50, p95, p99, min, max, plus throughput and success rate.
 - JSON output and Prometheus text export for trend tracking.
 - Baseline-versus-candidate comparison with p95 and success-rate gates.
@@ -128,6 +130,37 @@ recovered, and exhausted requests. Warmup has its own attempt accounting and is
 excluded from the measured gate. A client call can fail before endpoint receipt,
 so this is harness-attempt evidence rather than a server request count or proof
 of retry traffic reaching a router, model server, or accelerator.
+
+Reconcile client attempts with counters from an isolated serving path:
+
+```bash
+python benchmark.py \
+  --mode openai \
+  --server-url http://localhost:8000/v1 \
+  --model-name local-model \
+  --num-requests 200 \
+  --concurrency 16 \
+  --retries 2 \
+  --telemetry-url http://localhost:8000/metrics \
+  --request-path-ingress-metric gateway_requests_received_total \
+  --request-path-backend-metric model_server_requests_received_total \
+  --request-path-success-metric model_server_requests_succeeded_total \
+  --fail-on-request-path-gap \
+  --prometheus
+```
+
+All three selected metric families must be cumulative counters with integer
+values and stable series membership across the paired scrapes. The report keeps
+ingress, backend, and success deltas plus adjacent-stage ratios, but stores only
+SHA-256 fingerprints for metric names and label membership. The opt-in exact
+gate requires ingress receipts to equal measured client attempts, stage counts
+to be non-increasing, and success receipts to equal successful logical requests.
+
+Use that gate only when the selected series are isolated to this run. Aggregate
+counter agreement does not establish per-request causality, correct metric
+instrumentation, process identity, traffic isolation, or synchronized clocks.
+The same accounting can consume explicitly paired snapshot files, but their
+timing is labeled operator-supplied and unverified.
 
 Compare a candidate run against a saved baseline and fail on regression:
 

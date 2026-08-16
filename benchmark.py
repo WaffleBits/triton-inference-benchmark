@@ -32,6 +32,7 @@ TRITON_REQUEST_DURATION_METRICS = {"nv_inference_request_duration_us"}
 TRITON_QUEUE_DURATION_METRICS = {"nv_inference_queue_duration_us"}
 TRITON_COMPUTE_INFER_DURATION_METRICS = {"nv_inference_compute_infer_duration_us"}
 MAX_TELEMETRY_RESPONSE_BYTES = 10 * 1024 * 1024
+PROMETHEUS_METRIC_NAME_PATTERN = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
 
 GPU_GAUGE_METRIC_ALIASES = {
     **{name: "utilization_pct" for name in GPU_UTILIZATION_METRICS},
@@ -213,6 +214,22 @@ WORKLOAD_PROFILES = {
 
 
 @dataclass(frozen=True)
+class RequestPathMetricNames:
+    """Operator-selected cumulative counters for three serving-path stages."""
+
+    ingress: str
+    backend: str
+    success: str
+
+    def by_stage(self) -> dict[str, str]:
+        return {
+            "ingress": self.ingress,
+            "backend": self.backend,
+            "success": self.success,
+        }
+
+
+@dataclass(frozen=True)
 class CliOptions:
     config: BenchmarkConfig
     workload_profile: WorkloadProfile | None = None
@@ -227,6 +244,7 @@ class CliOptions:
     telemetry_api_key_env: str = ""
     max_server_failure_rate: float | None = None
     max_server_queue_fraction: float | None = None
+    request_path_metrics: RequestPathMetricNames | None = None
     batch_invariance_probes: int = 0
     batch_output_atol: float = 0.0
     batch_output_rtol: float = 0.0
@@ -239,6 +257,7 @@ class CliOptions:
     fail_on_telemetry_gate: bool = False
     fail_on_trace_context_gap: bool = False
     fail_on_retry_gate: bool = False
+    fail_on_request_path_gap: bool = False
 
 
 @dataclass(frozen=True)
@@ -1360,11 +1379,14 @@ def run_benchmark(
     max_server_queue_fraction: float | None = None,
     telemetry_sample_interval_seconds: float = 0.0,
     max_client_attempt_amplification: float | None = None,
+    request_path_metrics: RequestPathMetricNames | None = None,
 ) -> dict[str, object]:
     if telemetry_sample_interval_seconds < 0:
         raise ValueError("telemetry sample interval must be zero or greater")
     if telemetry_sample_interval_seconds and telemetry_client is None:
         raise ValueError("telemetry sampling requires a telemetry client")
+    if request_path_metrics is not None and telemetry_client is None:
+        raise ValueError("request-path accounting requires a telemetry client")
 
     warmup_results: list[InferenceResult] = []
     warmup_duration_seconds = 0.0
@@ -1451,6 +1473,7 @@ def run_benchmark(
             counter_window_source="paired_http_prometheus_scrapes",
             max_server_failure_rate=max_server_failure_rate,
             max_server_queue_fraction=max_server_queue_fraction,
+            request_path_metrics=request_path_metrics,
         )
         if telemetry_sample_interval_seconds:
             gauge_captures = [
@@ -2069,6 +2092,272 @@ def _build_series_membership(
     }
 
 
+def _request_path_counter_series(
+    samples: list[PrometheusSample],
+    metric_name: str,
+) -> tuple[dict[str, float], set[str]]:
+    """Select one counter family while retaining labels only in ephemeral keys."""
+    values: dict[str, float] = {}
+    issues: set[str] = set()
+    for sample in samples:
+        if sample.metric != metric_name:
+            continue
+        identity = json.dumps(
+            sorted(sample.labels.items()),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if identity in values:
+            issues.add("duplicate_series")
+        values[identity] = sample.value
+        if not math.isfinite(sample.value):
+            issues.add("non_finite_counter")
+        elif sample.value < 0:
+            issues.add("negative_counter")
+        elif not sample.value.is_integer():
+            issues.add("non_integral_counter")
+    return values, issues
+
+
+def _request_path_membership_fingerprint(stage: str, identities: set[str]) -> str | None:
+    if not identities:
+        return None
+    payload = json.dumps(
+        [[stage, identity] for identity in sorted(identities)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _build_request_path_stage_window(
+    stage: str,
+    metric_name: str,
+    before_samples: list[PrometheusSample],
+    after_samples: list[PrometheusSample],
+) -> dict[str, object]:
+    before, before_issues = _request_path_counter_series(before_samples, metric_name)
+    after, after_issues = _request_path_counter_series(after_samples, metric_name)
+    issues = set(before_issues) | set(after_issues)
+    if not before or not after:
+        issues.add("counter_missing")
+
+    before_identities = set(before)
+    after_identities = set(after)
+    membership_stable = bool(before_identities) and before_identities == after_identities
+    if before_identities and after_identities and not membership_stable:
+        issues.add("series_membership_changed")
+
+    delta: int | None = None
+    if membership_stable and not issues:
+        deltas = [after[key] - before[key] for key in sorted(before)]
+        if any(value < 0 for value in deltas):
+            issues.add("counter_reset")
+        else:
+            delta = int(sum(deltas))
+
+    before_fingerprint = _request_path_membership_fingerprint(stage, before_identities)
+    after_fingerprint = _request_path_membership_fingerprint(stage, after_identities)
+    membership: dict[str, object] = {
+        "stable": membership_stable,
+        "before_series_count": len(before_identities),
+        "after_series_count": len(after_identities),
+        "series_count": len(before_identities) if membership_stable else None,
+        "fingerprint_sha256": before_fingerprint if membership_stable else None,
+        "fingerprint_scope": (
+            "fixed request-path stage and sorted labels; sample values and raw "
+            "series identities excluded"
+        ),
+    }
+    if before_fingerprint != after_fingerprint:
+        membership["before_fingerprint_sha256"] = before_fingerprint
+        membership["after_fingerprint_sha256"] = after_fingerprint
+
+    return {
+        "valid": not issues,
+        "delta": delta,
+        "metric_name_sha256": hashlib.sha256(metric_name.encode("utf-8")).hexdigest(),
+        "series_membership": membership,
+        "issues": sorted(issues),
+    }
+
+
+def _nonnegative_int(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def build_request_path_accounting(
+    metrics: dict[str, object],
+    before_prometheus_text: str,
+    after_prometheus_text: str,
+    metric_names: RequestPathMetricNames,
+    *,
+    source: str = "paired_prometheus_counter_snapshots",
+    alignment: str = "operator_supplied_unverified",
+) -> dict[str, object]:
+    """Correlate privacy-safe aggregate ingress/backend/success counter deltas."""
+    names = metric_names.by_stage()
+    if len(set(names.values())) != len(names):
+        raise ValueError("request-path metric names must be distinct")
+    for metric_name in names.values():
+        if PROMETHEUS_METRIC_NAME_PATTERN.fullmatch(metric_name) is None:
+            raise ValueError(f"invalid Prometheus metric name: {metric_name!r}")
+
+    before_samples = parse_prometheus_samples(before_prometheus_text)
+    after_samples = parse_prometheus_samples(after_prometheus_text)
+    stages = {
+        stage: _build_request_path_stage_window(
+            stage,
+            metric_name,
+            before_samples,
+            after_samples,
+        )
+        for stage, metric_name in names.items()
+    }
+
+    retry = metrics.get("retry")
+    retry = retry if isinstance(retry, dict) else {}
+    logical_requests = _nonnegative_int(retry.get("logical_requests"))
+    client_attempts = _nonnegative_int(retry.get("client_attempts"))
+    successful_requests = _nonnegative_int(metrics.get("successful_requests"))
+
+    issues = {
+        issue
+        for stage_summary in stages.values()
+        for issue in stage_summary.get("issues", [])
+        if isinstance(issue, str)
+    }
+    if (
+        logical_requests is None
+        or client_attempts is None
+        or successful_requests is None
+    ):
+        issues.add("client_summary_unavailable")
+
+    ingress = stages["ingress"].get("delta")
+    backend = stages["backend"].get("delta")
+    success = stages["success"].get("delta")
+
+    def ratio(numerator: object, denominator: object) -> float | None:
+        if (
+            isinstance(numerator, int)
+            and not isinstance(numerator, bool)
+            and isinstance(denominator, int)
+            and not isinstance(denominator, bool)
+            and denominator > 0
+        ):
+            return round(numerator / denominator, 6)
+        return None
+
+    notes = [
+        "counter deltas are aggregate observations and do not establish per-request causality",
+        "the selected counter series must be isolated to this run for exact accounting",
+        "metric names and labels are represented only by SHA-256 fingerprints",
+    ]
+    if alignment == "harness_bracketed_measured_phase":
+        notes.insert(
+            0,
+            "the harness fetched counters immediately before and after measured requests",
+        )
+    else:
+        notes[:0] = [
+            "snapshot timing is operator supplied and not verified by the harness",
+        ]
+
+    return {
+        "source": source,
+        "alignment": alignment,
+        "valid": not issues,
+        "client": {
+            "logical_requests": logical_requests,
+            "client_attempts": client_attempts,
+            "successful_requests": successful_requests,
+        },
+        "stages": stages,
+        "ratios": {
+            "ingress_per_client_attempt": ratio(ingress, client_attempts),
+            "backend_per_ingress": ratio(backend, ingress),
+            "success_per_backend": ratio(success, backend),
+        },
+        "issues": sorted(issues),
+        "notes": notes,
+    }
+
+
+def build_request_path_gate(accounting: dict[str, object]) -> dict[str, object]:
+    """Fail closed on exact request-path accounting for an isolated counter scope."""
+    client = accounting.get("client")
+    stages = accounting.get("stages")
+    client = client if isinstance(client, dict) else {}
+    stages = stages if isinstance(stages, dict) else {}
+
+    def stage_delta(stage: str) -> int | None:
+        summary = stages.get(stage)
+        return (
+            _nonnegative_int(summary.get("delta"))
+            if isinstance(summary, dict)
+            else None
+        )
+
+    client_attempts = _nonnegative_int(client.get("client_attempts"))
+    successful_requests = _nonnegative_int(client.get("successful_requests"))
+    ingress = stage_delta("ingress")
+    backend = stage_delta("backend")
+    success = stage_delta("success")
+
+    ingress_evaluable = ingress is not None and client_attempts is not None
+    ingress_passed = ingress_evaluable and ingress == client_attempts
+    order_evaluable = ingress is not None and backend is not None and success is not None
+    order_passed = order_evaluable and ingress >= backend >= success
+    success_evaluable = success is not None and successful_requests is not None
+    success_passed = success_evaluable and success == successful_requests
+
+    checks = {
+        "ingress_matches_client_attempts": {
+            "observed": ingress,
+            "expected": client_attempts,
+            "evaluable": ingress_evaluable,
+            "passed": ingress_passed,
+        },
+        "stage_counts_non_increasing": {
+            "ingress": ingress,
+            "backend": backend,
+            "success": success,
+            "evaluable": order_evaluable,
+            "passed": order_passed,
+        },
+        "success_matches_successful_requests": {
+            "observed": success,
+            "expected": successful_requests,
+            "evaluable": success_evaluable,
+            "passed": success_passed,
+        },
+    }
+    failure_reasons: list[str] = []
+    if accounting.get("valid") is not True:
+        failure_reasons.append("request-path counter evidence is invalid")
+    if not ingress_passed:
+        failure_reasons.append("ingress receipts did not equal measured client attempts")
+    if not order_passed:
+        failure_reasons.append("request-path stage counts were unavailable or out of order")
+    if not success_passed:
+        failure_reasons.append(
+            "success receipts did not equal successful measured logical requests"
+        )
+
+    return {
+        "passed": not failure_reasons,
+        "checks": checks,
+        "failure_reasons": failure_reasons,
+        "scope": (
+            "exact aggregate accounting for counter series isolated to the measured run; "
+            "no per-request causality is claimed"
+        ),
+    }
+
+
 def _stat_summary(values: list[float]) -> dict[str, float]:
     if not values:
         return {}
@@ -2540,6 +2829,7 @@ def attach_telemetry_summary(
     telemetry_baseline_prometheus_path: str | Path | None = None,
     max_server_failure_rate: float | None = None,
     max_server_queue_fraction: float | None = None,
+    request_path_metrics: RequestPathMetricNames | None = None,
 ) -> dict[str, object]:
     path = Path(telemetry_prometheus_path)
     baseline_text = None
@@ -2552,6 +2842,7 @@ def attach_telemetry_summary(
         baseline_prometheus_text=baseline_text,
         max_server_failure_rate=max_server_failure_rate,
         max_server_queue_fraction=max_server_queue_fraction,
+        request_path_metrics=request_path_metrics,
     )
 
 
@@ -2565,6 +2856,7 @@ def attach_telemetry_snapshots(
     counter_window_source: str = "paired_prometheus_counter_snapshots",
     max_server_failure_rate: float | None = None,
     max_server_queue_fraction: float | None = None,
+    request_path_metrics: RequestPathMetricNames | None = None,
 ) -> dict[str, object]:
     enriched_metrics = dict(metrics)
     model_name = str(metrics.get("model_name", "unknown"))
@@ -2595,8 +2887,21 @@ def attach_telemetry_snapshots(
                 max_server_failure_rate=max_server_failure_rate,
                 max_server_queue_fraction=max_server_queue_fraction,
             )
+        if request_path_metrics is not None:
+            request_path = build_request_path_accounting(
+                metrics,
+                baseline_prometheus_text,
+                prometheus_text,
+                request_path_metrics,
+                source=counter_window_source,
+                alignment=alignment,
+            )
+            enriched_metrics["request_path"] = request_path
+            enriched_metrics["request_path_gate"] = build_request_path_gate(request_path)
     elif max_server_failure_rate is not None or max_server_queue_fraction is not None:
         raise ValueError("telemetry thresholds require paired pre-run and post-run snapshots")
+    elif request_path_metrics is not None:
+        raise ValueError("request-path accounting requires paired counter snapshots")
     return enriched_metrics
 
 
@@ -2761,6 +3066,74 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
                         ),
                     ]
                 )
+
+    request_path = typed_metrics.get("request_path")
+    if isinstance(request_path, dict):
+        valid = request_path.get("valid")
+        if isinstance(valid, bool):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_request_path_valid Whether every selected request-path counter window was valid.",
+                    "# TYPE triton_benchmark_request_path_valid gauge",
+                    f"triton_benchmark_request_path_valid{{{labels}}} {int(valid)}",
+                ]
+            )
+        stages = request_path.get("stages")
+        if isinstance(stages, dict):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_request_path_events_total Aggregate counter delta by fixed serving-path stage.",
+                    "# TYPE triton_benchmark_request_path_events_total counter",
+                ]
+            )
+            for stage in ("ingress", "backend", "success"):
+                stage_summary = stages.get(stage)
+                delta = (
+                    stage_summary.get("delta")
+                    if isinstance(stage_summary, dict)
+                    else None
+                )
+                if isinstance(delta, (int, float)) and not isinstance(delta, bool):
+                    lines.append(
+                        "triton_benchmark_request_path_events_total"
+                        f'{{{labels},stage="{stage}"}} {delta:g}'
+                    )
+        ratios = request_path.get("ratios")
+        if isinstance(ratios, dict):
+            ratio_specs = (
+                ("ingress_per_client_attempt", "ingress_per_client_attempt"),
+                ("backend_per_ingress", "backend_per_ingress"),
+                ("success_per_backend", "success_per_backend"),
+            )
+            ratio_samples: list[str] = []
+            for source_key, relation in ratio_specs:
+                value = ratios.get(source_key)
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    continue
+                ratio_samples.append(
+                    "triton_benchmark_request_path_ratio"
+                    f'{{{labels},relation="{relation}"}} {value:g}'
+                )
+            if ratio_samples:
+                lines.extend(
+                    [
+                        "# HELP triton_benchmark_request_path_ratio Aggregate ratio between adjacent request-path observations.",
+                        "# TYPE triton_benchmark_request_path_ratio gauge",
+                        *ratio_samples,
+                    ]
+                )
+
+    request_path_gate = typed_metrics.get("request_path_gate")
+    if isinstance(request_path_gate, dict):
+        passed = request_path_gate.get("passed")
+        if isinstance(passed, bool):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_request_path_gate_passed Whether isolated request-path counters exactly reconciled with harness outcomes.",
+                    "# TYPE triton_benchmark_request_path_gate_passed gauge",
+                    f"triton_benchmark_request_path_gate_passed{{{labels}}} {int(passed)}",
+                ]
+            )
 
     load_schedule = typed_metrics.get("load_schedule")
     if isinstance(load_schedule, dict):
@@ -3867,6 +4240,26 @@ def parse_args() -> CliOptions:
         ),
     )
     parser.add_argument(
+        "--request-path-ingress-metric",
+        help="Cumulative Prometheus counter for requests accepted by the ingress layer.",
+    )
+    parser.add_argument(
+        "--request-path-backend-metric",
+        help="Cumulative Prometheus counter for requests accepted by the backend layer.",
+    )
+    parser.add_argument(
+        "--request-path-success-metric",
+        help="Cumulative Prometheus counter for successful backend completions.",
+    )
+    parser.add_argument(
+        "--fail-on-request-path-gap",
+        action="store_true",
+        help=(
+            "Exit with status 7 unless isolated ingress/backend/success counters "
+            "exactly reconcile with measured client attempts and outcomes."
+        ),
+    )
+    parser.add_argument(
         "--max-server-failure-rate",
         type=float,
         help="Maximum failed-request fraction in the paired Triton counter window.",
@@ -3985,6 +4378,36 @@ def parse_args() -> CliOptions:
     paired_snapshot_files = bool(
         args.telemetry_baseline_prometheus and args.telemetry_prometheus
     )
+    request_path_values = (
+        args.request_path_ingress_metric,
+        args.request_path_backend_metric,
+        args.request_path_success_metric,
+    )
+    request_path_metrics: RequestPathMetricNames | None = None
+    if any(request_path_values) and not all(request_path_values):
+        parser.error(
+            "request-path accounting requires ingress, backend, and success metric names"
+        )
+    if all(request_path_values):
+        request_path_metrics = RequestPathMetricNames(
+            ingress=args.request_path_ingress_metric,
+            backend=args.request_path_backend_metric,
+            success=args.request_path_success_metric,
+        )
+        metric_names = tuple(request_path_metrics.by_stage().values())
+        if len(set(metric_names)) != len(metric_names):
+            parser.error("request-path metric names must be distinct")
+        if any(
+            PROMETHEUS_METRIC_NAME_PATTERN.fullmatch(name) is None
+            for name in metric_names
+        ):
+            parser.error("request-path metric names must be valid Prometheus names")
+        if not (paired_snapshot_files or args.telemetry_url):
+            parser.error(
+                "request-path accounting requires --telemetry-url or paired telemetry snapshots"
+            )
+    if args.fail_on_request_path_gap and request_path_metrics is None:
+        parser.error("--fail-on-request-path-gap requires request-path metric names")
     if args.telemetry_url and (
         args.telemetry_baseline_prometheus or args.telemetry_prometheus
     ):
@@ -4203,6 +4626,7 @@ def parse_args() -> CliOptions:
         telemetry_api_key_env=args.telemetry_api_key_env,
         max_server_failure_rate=args.max_server_failure_rate,
         max_server_queue_fraction=args.max_server_queue_fraction,
+        request_path_metrics=request_path_metrics,
         batch_invariance_probes=args.batch_invariance_probes,
         batch_output_atol=args.batch_output_atol,
         batch_output_rtol=args.batch_output_rtol,
@@ -4215,6 +4639,7 @@ def parse_args() -> CliOptions:
         fail_on_telemetry_gate=args.fail_on_telemetry_gate,
         fail_on_trace_context_gap=args.fail_on_trace_context_gap,
         fail_on_retry_gate=args.fail_on_retry_gate,
+        fail_on_request_path_gap=args.fail_on_request_path_gap,
     )
 
 
@@ -4241,6 +4666,9 @@ def main() -> None:
         max_client_attempt_amplification=(
             options.max_client_attempt_amplification
         ),
+        request_path_metrics=(
+            options.request_path_metrics if options.telemetry_url else None
+        ),
     )
     if options.workload_profile:
         metrics["workload_profile"] = asdict(options.workload_profile)
@@ -4261,6 +4689,7 @@ def main() -> None:
             ),
             max_server_failure_rate=options.max_server_failure_rate,
             max_server_queue_fraction=options.max_server_queue_fraction,
+            request_path_metrics=options.request_path_metrics,
         )
     if options.batch_invariance_probes:
         metrics["batch_invariance"] = run_batch_invariance_probe(
@@ -4333,6 +4762,17 @@ def main() -> None:
         and exit_code == 0
     ):
         exit_code = 6
+
+    request_path_gate = metrics.get("request_path_gate")
+    if (
+        options.fail_on_request_path_gap
+        and (
+            not isinstance(request_path_gate, dict)
+            or not request_path_gate.get("passed", False)
+        )
+        and exit_code == 0
+    ):
+        exit_code = 7
 
     if exit_code:
         raise SystemExit(exit_code)
