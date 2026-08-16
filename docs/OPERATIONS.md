@@ -162,6 +162,41 @@ prove all 105 reached the server. Compare it with server counters and traces in
 the authorized environment before attributing load. Warmup retry activity stays
 under `warmup.retry` and is excluded from this gate.
 
+### Request-path accounting
+
+When ingress and backend counters are isolated to the qualification run,
+reconcile them with the measured retry summary:
+
+```bash
+python benchmark.py \
+  --mode openai \
+  --server-url http://inference.example.internal/v1 \
+  --model-name my-model \
+  --num-requests 200 \
+  --concurrency 16 \
+  --retries 2 \
+  --telemetry-url http://inference.example.internal/metrics \
+  --request-path-ingress-metric gateway_requests_received_total \
+  --request-path-backend-metric model_server_requests_received_total \
+  --request-path-success-metric model_server_requests_succeeded_total \
+  --fail-on-request-path-gap \
+  --prometheus
+```
+
+The gate exits with status 7 unless ingress receipts equal measured client
+attempts, ingress/backend/success counts are non-increasing, and successful
+backend completions equal successful logical requests. Missing metrics,
+non-integer values, duplicate series, label churn, and per-series counter resets
+make the evidence invalid.
+
+Use a dedicated benchmark tenant, route, model label, or endpoint so unrelated
+requests do not enter the selected series. A passing gate reconciles aggregate
+deltas; it does not join an individual client attempt to an individual server
+event. Review the backend-per-ingress ratio to see where aggregate attempts were
+absorbed, then use authorized traces and logs for causal diagnosis. Metric names,
+labels, raw scrapes, endpoint URLs, credentials, and trace identifiers stay out
+of the result artifact.
+
 ### Trace correlation
 
 Use `--propagate-trace-context` only when the authorized live endpoint is
@@ -205,6 +240,8 @@ Use `--prometheus` to write a `.prom` file next to the JSON result. The text-for
 - configured/achieved submission rate, submission lag, executor queue delay, and
   request-start lag when pacing is enabled
 - separate warmup outcomes, duration, throughput, and latency when configured
+- privacy-safe ingress/backend/success deltas, adjacent-stage ratios, and the
+  isolated-scope request-path gate when configured
 
 The artifact can be pushed to a metrics gateway, archived by CI, or scraped from a shared results volume.
 

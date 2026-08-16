@@ -158,6 +158,11 @@ jobs:
             --concurrency 1 \
             --retries 1 \
             --propagate-trace-context \
+            --telemetry-url "http://127.0.0.1:${PORT}/metrics" \
+            --request-path-ingress-metric fixture_ingress_requests_total \
+            --request-path-backend-metric fixture_backend_requests_total \
+            --request-path-success-metric fixture_backend_success_total \
+            --fail-on-request-path-gap \
             --max-client-attempt-amplification 1.25 \
             --fail-on-retry-gate \
             --prometheus \
@@ -189,6 +194,16 @@ jobs:
           assert metrics["retry_gate"]["passed"] is True
           assert metrics["retry_gate"]["failure_reasons"] == []
           assert metrics["retry_gate"]["scope"].startswith("measured")
+          request_path = metrics["request_path"]
+          assert request_path["valid"] is True
+          assert request_path["alignment"] == "harness_bracketed_measured_phase"
+          assert request_path["client"]["client_attempts"] == 5
+          assert request_path["stages"]["ingress"]["delta"] == 5
+          assert request_path["stages"]["backend"]["delta"] == 4
+          assert request_path["stages"]["success"]["delta"] == 4
+          assert request_path["ratios"]["backend_per_ingress"] == 0.8
+          assert metrics["request_path_gate"]["passed"] is True
+          assert metrics["request_path_gate"]["failure_reasons"] == []
 
           prometheus = results[0].with_suffix(".prom").read_text(encoding="utf-8")
           assert "triton_benchmark_client_attempts_total" in prometheus
@@ -197,6 +212,11 @@ jobs:
           assert "triton_benchmark_client_attempt_amplification" in prometheus
           assert "triton_benchmark_retry_gate_passed" in prometheus
           assert "triton_benchmark_retry_gate_max_amplification" in prometheus
+          assert "triton_benchmark_request_path_events_total" in prometheus
+          assert 'stage="ingress"} 5' in prometheus
+          assert 'stage="backend"} 4' in prometheus
+          assert 'stage="success"} 4' in prometheus
+          assert "triton_benchmark_request_path_gate_passed" in prometheus
           serialized = results[0].read_text(encoding="utf-8") + prometheus
           assert all(value not in serialized for value in traceparents)
           assert not re.search(
@@ -204,6 +224,10 @@ jobs:
           )
           assert "Return a short deterministic benchmark response." not in serialized
           assert "Authorization" not in serialized
+          assert "fixture_ingress_requests_total" not in serialized
+          assert "fixture_backend_requests_total" not in serialized
+          assert "fixture_backend_success_total" not in serialized
+          assert 'service="router"' not in serialized
           PY
 
       - name: Run bracketed-telemetry mock benchmark

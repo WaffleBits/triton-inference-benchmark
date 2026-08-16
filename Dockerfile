@@ -3,7 +3,8 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN python -m pip install --no-cache-dir --upgrade pip==26.2.1 \
+    && pip install --no-cache-dir -r /app/requirements.txt
 
 COPY benchmark.py /app/
 

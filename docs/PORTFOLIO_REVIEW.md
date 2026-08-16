@@ -22,6 +22,8 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - A CI-friendly mock mode that keeps the repo reviewable without GPU hardware.
 - Measured client-attempt amplification with separate retry recovery/exhaustion
   counts and an explicit run-scoped fail gate.
+- Opt-in ingress/backend/success counter reconciliation with per-series reset
+  checks, privacy-safe fingerprints, and an exact isolated-scope gate.
 - Phase-separated warmup evidence that is excluded from measured latency,
   throughput, regression, streaming-token, and cost results.
 - A live Triton HTTP path and an OpenAI-compatible streaming path for authorized model-serving infrastructure.
@@ -54,4 +56,6 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 
 - Add controlled server-lifecycle hooks for defensible cold-start measurements.
 - Add coordinated distributed load generation across multiple clients.
+- Exercise request-path accounting across separately deployed router and model
+  server processes under controlled failure injection.
 - Add saved benchmark reports with trend comparisons over time.

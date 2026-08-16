@@ -68,6 +68,30 @@ receipt: DNS, connection, TLS, client serialization, or transport failures can
 occur before an endpoint observes a request. The artifact therefore does not
 label client-attempt amplification as server load amplification.
 
+## Request-Path Counter Accounting
+
+Three optional operator-selected Prometheus counter families can bridge that
+client-only boundary: ingress receipts, backend receipts, and successful backend
+completions. The feature reuses the paired telemetry snapshots around the
+measured phase. It requires integer cumulative values, stable label membership,
+no duplicate series, and no per-series reset. Multiple stable series are summed
+only after each one passes those checks.
+
+The artifact retains fixed stage names, aggregate deltas and ratios, plus
+SHA-256 fingerprints of the selected metric names and stage/label membership.
+Raw metric names, labels, and scrape text are excluded. The fixed accounting
+gate checks exact ingress-to-client-attempt equality, non-increasing stage
+counts, and exact success-to-successful-logical-request equality.
+
+That gate is intentionally opt-in because exact reconciliation requires the
+selected series to be isolated to the benchmark. Harness-bracketed aggregate
+counters still do not establish per-request causality, correct instrumentation,
+process identity, traffic isolation, or synchronized clocks. Operator-supplied
+files have an additional unverified-timing boundary. The deterministic SSE
+fixture validates one transient failure absorbed at ingress, but its stage
+counters are a single-process local test rather than a deployed router/backend
+measurement.
+
 When `--prometheus` is enabled, the same core measurements are written as Prometheus text-format gauges and counters beside the JSON result. This keeps the harness dependency-free while making the output easy to archive in CI, push to a metrics gateway, or ingest into a dashboarding workflow.
 
 When `--telemetry-prometheus` is provided, the benchmark attaches a correlated
@@ -215,3 +239,5 @@ AI infrastructure repos often fail basic review because they cannot run without 
 - Add server-lifecycle hooks for controlled cold-start measurements.
 - Add request payload profiles by model family.
 - Add distributed load generation across multiple clients.
+- Exercise request-path accounting against separately deployed router and model
+  server processes under controlled failure injection.
