@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import re
 import threading
@@ -115,7 +116,7 @@ def main() -> None:
                 response_body = exc.read()
                 content_type = exc.headers.get("Content-Type")
                 response_traceparent = exc.headers.get("traceparent")
-            except urllib.error.URLError:
+            except (urllib.error.URLError, OSError, http.client.HTTPException):
                 status = 502
                 response_body = b""
                 content_type = None

@@ -230,7 +230,7 @@ jobs:
           assert 'service="router"' not in serialized
           PY
 
-      - name: Run multi-process request-path qualification
+      - name: Run supervised process-lifecycle qualification
         run: python tests/run_multi_process_path_fixture.py
 
       - name: Run bracketed-telemetry mock benchmark
