@@ -61,6 +61,11 @@ attempts after the first call, retried requests, successful recovery after a
 retry, exhausted requests, and client-attempt amplification. The optional gate
 compares that measured factor with an explicit run-scoped maximum.
 
+For logical requests that succeed after retry, the summary also reports their
+client-observed end-to-end latency distribution. That duration includes failed
+attempts and retry work; it is not service MTTR or evidence that a process was
+restarted or healed.
+
 Warmup uses the same retry policy but keeps its attempt summary separate and
 does not contribute to the measured gate. End-to-end successful latency already
 includes time spent in failed attempts. Attempt counts do not establish server
@@ -84,13 +89,19 @@ gate checks exact ingress-to-client-attempt equality, non-increasing stage
 counts, and exact success-to-successful-logical-request equality.
 
 That gate is intentionally opt-in because exact reconciliation requires the
-selected series to be isolated to the benchmark. Harness-bracketed aggregate
-counters still do not establish per-request causality, correct instrumentation,
-process identity, traffic isolation, or synchronized clocks. Operator-supplied
-files have an additional unverified-timing boundary. The deterministic SSE
-fixture validates one transient failure absorbed at ingress, but its stage
-counters are a single-process local test rather than a deployed router/backend
-measurement.
+selected series to be isolated to the benchmark. `--telemetry-url` is repeatable;
+configured sources are scraped concurrently at each boundary, every scrape must
+succeed, and the combined response remains bounded. Artifacts retain the source
+count but not URLs or raw responses. Harness-bracketed aggregate counters still
+do not establish per-request causality, correct instrumentation, process
+identity, traffic isolation, or synchronized clocks. Operator-supplied files
+have an additional unverified-timing boundary.
+
+The deterministic multi-process qualification runs separate local router and
+backend OS processes, injects one router-local and one backend failure on
+different logical requests, and validates independent ingress/backend/success
+counters. It is synthetic single-host evidence, not a deployed router/model
+server, orchestrated recovery, production traffic, or service MTTR.
 
 When `--prometheus` is enabled, the same core measurements are written as Prometheus text-format gauges and counters beside the JSON result. This keeps the harness dependency-free while making the output easy to archive in CI, push to a metrics gateway, or ingest into a dashboarding workflow.
 
@@ -109,10 +120,10 @@ Configured telemetry gates fail closed when a derived value is unavailable. The
 JSON and Prometheus outputs contain summaries and deltas, not raw scrape text or
 operator filesystem paths.
 
-File snapshot alignment is explicitly operator-supplied and unverified. With
-`--telemetry-url`, the harness instead fetches one bounded HTTP(S) snapshot after
-warmup and immediately before measured requests, then another after the measured
-phase completes. This alignment is labeled
+File snapshot alignment is explicitly operator-supplied and unverified. With one
+or more `--telemetry-url` options, the harness instead fetches bounded HTTP(S)
+snapshots concurrently after warmup and immediately before measured requests,
+then fetches them again after the measured phase completes. This alignment is labeled
 `harness_bracketed_measured_phase`; scrape time is excluded from the request
 phase duration. The URL, optional bearer token, authorization header, and raw
 responses are not serialized.
@@ -239,5 +250,5 @@ AI infrastructure repos often fail basic review because they cannot run without 
 - Add server-lifecycle hooks for controlled cold-start measurements.
 - Add request payload profiles by model family.
 - Add distributed load generation across multiple clients.
-- Exercise request-path accounting against separately deployed router and model
-  server processes under controlled failure injection.
+- Exercise multi-source request-path accounting in an orchestrated router and
+  model-server deployment rather than only the committed single-host fixture.

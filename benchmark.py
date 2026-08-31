@@ -32,6 +32,7 @@ TRITON_REQUEST_DURATION_METRICS = {"nv_inference_request_duration_us"}
 TRITON_QUEUE_DURATION_METRICS = {"nv_inference_queue_duration_us"}
 TRITON_COMPUTE_INFER_DURATION_METRICS = {"nv_inference_compute_infer_duration_us"}
 MAX_TELEMETRY_RESPONSE_BYTES = 10 * 1024 * 1024
+MAX_TELEMETRY_ENDPOINTS = 16
 PROMETHEUS_METRIC_NAME_PATTERN = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
 
 GPU_GAUGE_METRIC_ALIASES = {
@@ -238,7 +239,7 @@ class CliOptions:
     export_prometheus: bool = False
     telemetry_prometheus_path: str | None = None
     telemetry_baseline_prometheus_path: str | None = None
-    telemetry_url: str | None = None
+    telemetry_urls: tuple[str, ...] = ()
     telemetry_timeout_seconds: float = 10.0
     telemetry_sample_interval_seconds: float = 0.0
     telemetry_api_key_env: str = ""
@@ -333,6 +334,7 @@ class HttpPrometheusTelemetryClient:
         endpoint_url: str,
         timeout_seconds: float = 10.0,
         bearer_token: str | None = None,
+        max_response_bytes: int = MAX_TELEMETRY_RESPONSE_BYTES,
     ) -> None:
         parsed = urllib.parse.urlsplit(endpoint_url)
         if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
@@ -345,10 +347,14 @@ class HttpPrometheusTelemetryClient:
             raise ValueError("telemetry endpoint URL contains an invalid port") from exc
         if timeout_seconds <= 0:
             raise ValueError("telemetry timeout must be greater than zero")
+        if max_response_bytes <= 0:
+            raise ValueError("telemetry response limit must be greater than zero")
 
         self.endpoint_url = endpoint_url
         self.timeout_seconds = timeout_seconds
         self.bearer_token = bearer_token
+        self.max_response_bytes = max_response_bytes
+        self.source_count = 1
 
     def scrape(self) -> str:
         headers = {
@@ -363,11 +369,11 @@ class HttpPrometheusTelemetryClient:
             method="GET",
         )
         with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-            payload = response.read(MAX_TELEMETRY_RESPONSE_BYTES + 1)
-        if len(payload) > MAX_TELEMETRY_RESPONSE_BYTES:
+            payload = response.read(self.max_response_bytes + 1)
+        if len(payload) > self.max_response_bytes:
             raise ValueError(
                 "telemetry response exceeded "
-                f"{MAX_TELEMETRY_RESPONSE_BYTES} byte limit"
+                f"{self.max_response_bytes} byte limit"
             )
         try:
             return payload.decode("utf-8")
@@ -375,11 +381,56 @@ class HttpPrometheusTelemetryClient:
             raise ValueError("telemetry response must be UTF-8 Prometheus text") from exc
 
 
+class MultiEndpointPrometheusTelemetryClient:
+    """Concurrently combine bounded snapshots from independent metric sources."""
+
+    def __init__(self, clients: tuple[TelemetrySnapshotClient, ...]) -> None:
+        if len(clients) < 2:
+            raise ValueError("multi-endpoint telemetry requires at least two clients")
+        if len(clients) > MAX_TELEMETRY_ENDPOINTS:
+            raise ValueError(
+                f"telemetry supports at most {MAX_TELEMETRY_ENDPOINTS} endpoints"
+            )
+        self.clients = clients
+        self.source_count = len(clients)
+
+    def scrape(self) -> str:
+        with ThreadPoolExecutor(max_workers=self.source_count) as executor:
+            futures = [executor.submit(client.scrape) for client in self.clients]
+            snapshots = [future.result() for future in futures]
+
+        combined = "\n".join(snapshot.rstrip("\n") for snapshot in snapshots)
+        if combined:
+            combined = f"{combined}\n"
+        if len(combined.encode("utf-8")) > MAX_TELEMETRY_RESPONSE_BYTES:
+            raise ValueError(
+                "combined telemetry response exceeded "
+                f"{MAX_TELEMETRY_RESPONSE_BYTES} byte limit"
+            )
+        return combined
+
+
+def _normalize_telemetry_endpoint_urls(
+    endpoint_urls: str | tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    urls = (endpoint_urls,) if isinstance(endpoint_urls, str) else tuple(endpoint_urls)
+    if not urls:
+        raise ValueError("at least one telemetry endpoint is required")
+    if len(urls) > MAX_TELEMETRY_ENDPOINTS:
+        raise ValueError(
+            f"telemetry supports at most {MAX_TELEMETRY_ENDPOINTS} endpoints"
+        )
+    if len(set(urls)) != len(urls):
+        raise ValueError("duplicate telemetry endpoint URLs are not allowed")
+    return urls
+
+
 def build_http_telemetry_client(
-    endpoint_url: str,
+    endpoint_urls: str | tuple[str, ...] | list[str],
     timeout_seconds: float,
     api_key_env: str = "",
-) -> HttpPrometheusTelemetryClient:
+) -> TelemetrySnapshotClient:
+    urls = _normalize_telemetry_endpoint_urls(endpoint_urls)
     bearer_token: str | None = None
     if api_key_env:
         bearer_token = os.environ.get(api_key_env)
@@ -387,10 +438,24 @@ def build_http_telemetry_client(
             raise ValueError(
                 f"telemetry API key environment variable is missing or empty: {api_key_env}"
             )
-    return HttpPrometheusTelemetryClient(
-        endpoint_url,
-        timeout_seconds=timeout_seconds,
-        bearer_token=bearer_token,
+    per_source_response_limit = (
+        MAX_TELEMETRY_RESPONSE_BYTES
+        if len(urls) == 1
+        else (MAX_TELEMETRY_RESPONSE_BYTES - len(urls)) // len(urls)
+    )
+    clients = tuple(
+        HttpPrometheusTelemetryClient(
+            endpoint_url,
+            timeout_seconds=timeout_seconds,
+            bearer_token=bearer_token,
+            max_response_bytes=per_source_response_limit,
+        )
+        for endpoint_url in urls
+    )
+    return (
+        clients[0]
+        if len(clients) == 1
+        else MultiEndpointPrometheusTelemetryClient(clients)
     )
 
 
@@ -1269,6 +1334,36 @@ def _summarize_retry_attempts(
     attempt_counts = [max(1, int(result.attempt_count)) for result in results]
     client_attempts = sum(attempt_counts)
     retry_attempts = client_attempts - logical_requests
+    recovered_latencies = [
+        result.latency_ms
+        for result, count in zip(results, attempt_counts)
+        if result.ok and count > 1
+    ]
+    recovered_latency_summary = {
+        "request_count": len(recovered_latencies),
+        "avg": round(statistics.fmean(recovered_latencies), 4)
+        if recovered_latencies
+        else None,
+        "p50": round(percentile(recovered_latencies, 50), 4)
+        if recovered_latencies
+        else None,
+        "p95": round(percentile(recovered_latencies, 95), 4)
+        if recovered_latencies
+        else None,
+        "p99": round(percentile(recovered_latencies, 99), 4)
+        if recovered_latencies
+        else None,
+        "min": round(min(recovered_latencies), 4) if recovered_latencies else None,
+        "max": round(max(recovered_latencies), 4) if recovered_latencies else None,
+        "scope": (
+            "client-observed end-to-end latency for measured logical requests that "
+            "succeeded after retry"
+        ),
+        "note": (
+            "Includes failed-attempt and retry time observed by the client; it is not "
+            "service MTTR or proof of process recovery."
+        ),
+    }
     return {
         "configured_retries_per_request": configured_retries,
         "logical_requests": logical_requests,
@@ -1279,6 +1374,7 @@ def _summarize_retry_attempts(
             result.ok and count > 1
             for result, count in zip(results, attempt_counts)
         ),
+        "recovered_request_latency_ms": recovered_latency_summary,
         "exhausted_requests": sum(not result.ok for result in results),
         "client_attempt_amplification": round(
             client_attempts / logical_requests,
@@ -1464,17 +1560,32 @@ def run_benchmark(
             config.retries,
         )
     if telemetry_before is not None and telemetry_after is not None:
+        endpoint_count = int(getattr(telemetry_client, "source_count", 1))
+        multiple_endpoints = endpoint_count > 1
         summary = attach_telemetry_snapshots(
             summary,
             telemetry_after,
             baseline_prometheus_text=telemetry_before,
-            source="http_prometheus_snapshot",
+            source=(
+                "combined_http_prometheus_snapshot"
+                if multiple_endpoints
+                else "http_prometheus_snapshot"
+            ),
             alignment="harness_bracketed_measured_phase",
-            counter_window_source="paired_http_prometheus_scrapes",
+            counter_window_source=(
+                "paired_multi_endpoint_http_prometheus_scrapes"
+                if multiple_endpoints
+                else "paired_http_prometheus_scrapes"
+            ),
             max_server_failure_rate=max_server_failure_rate,
             max_server_queue_fraction=max_server_queue_fraction,
             request_path_metrics=request_path_metrics,
         )
+        for artifact_key in ("telemetry", "telemetry_window", "request_path"):
+            artifact = summary.get(artifact_key)
+            if isinstance(artifact, dict):
+                artifact["endpoint_count"] = endpoint_count
+                artifact["endpoint_urls_persisted"] = False
         if telemetry_sample_interval_seconds:
             gauge_captures = [
                 _build_gpu_gauge_capture(telemetry_before),
@@ -3038,6 +3149,24 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
                     ),
                 ]
             )
+        recovered_latency = retry.get("recovered_request_latency_ms")
+        if isinstance(recovered_latency, dict):
+            latency_samples: list[str] = []
+            for statistic in ("avg", "p50", "p95", "p99", "min", "max"):
+                value = recovered_latency.get(statistic)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    latency_samples.append(
+                        "triton_benchmark_recovered_request_latency_ms"
+                        f'{{{labels},statistic="{statistic}"}} {value:g}'
+                    )
+            if latency_samples:
+                lines.extend(
+                    [
+                        "# HELP triton_benchmark_recovered_request_latency_ms Client-observed end-to-end latency for measured logical requests that succeeded after retry.",
+                        "# TYPE triton_benchmark_recovered_request_latency_ms gauge",
+                        *latency_samples,
+                    ]
+                )
 
     retry_gate = typed_metrics.get("retry_gate")
     if isinstance(retry_gate, dict):
@@ -4211,9 +4340,12 @@ def parse_args() -> CliOptions:
     )
     parser.add_argument(
         "--telemetry-url",
+        action="append",
+        default=[],
         help=(
             "Optional HTTP(S) Prometheus endpoint scraped after warmup, immediately "
-            "before measured requests, and immediately after they complete."
+            "before measured requests, and immediately after they complete. Repeat "
+            "the option to capture independent sources concurrently."
         ),
     )
     parser.add_argument(
@@ -4331,6 +4463,7 @@ def parse_args() -> CliOptions:
         help="Exit with status 3 when any batch-invariance probe fails or changes output.",
     )
     args = parser.parse_args()
+    telemetry_urls = tuple(args.telemetry_url)
     if args.warmup_requests < 0:
         parser.error("--warmup-requests must be zero or greater")
     if args.request_rate_rps < 0:
@@ -4402,36 +4535,38 @@ def parse_args() -> CliOptions:
             for name in metric_names
         ):
             parser.error("request-path metric names must be valid Prometheus names")
-        if not (paired_snapshot_files or args.telemetry_url):
+        if not (paired_snapshot_files or telemetry_urls):
             parser.error(
                 "request-path accounting requires --telemetry-url or paired telemetry snapshots"
             )
     if args.fail_on_request_path_gap and request_path_metrics is None:
         parser.error("--fail-on-request-path-gap requires request-path metric names")
-    if args.telemetry_url and (
+    if telemetry_urls and (
         args.telemetry_baseline_prometheus or args.telemetry_prometheus
     ):
         parser.error(
             "--telemetry-url is mutually exclusive with telemetry snapshot files"
         )
-    if args.telemetry_api_key_env and not args.telemetry_url:
+    if args.telemetry_api_key_env and not telemetry_urls:
         parser.error("--telemetry-api-key-env requires --telemetry-url")
     if args.telemetry_sample_interval_seconds < 0:
         parser.error("--telemetry-sample-interval-seconds must be zero or greater")
-    if args.telemetry_sample_interval_seconds and not args.telemetry_url:
+    if args.telemetry_sample_interval_seconds and not telemetry_urls:
         parser.error("--telemetry-sample-interval-seconds requires --telemetry-url")
     if args.telemetry_timeout_seconds <= 0:
         parser.error("--telemetry-timeout-seconds must be greater than zero")
-    if args.telemetry_url:
+    if telemetry_urls:
         try:
-            HttpPrometheusTelemetryClient(
-                args.telemetry_url,
-                timeout_seconds=args.telemetry_timeout_seconds,
-            )
+            _normalize_telemetry_endpoint_urls(telemetry_urls)
+            for telemetry_url in telemetry_urls:
+                HttpPrometheusTelemetryClient(
+                    telemetry_url,
+                    timeout_seconds=args.telemetry_timeout_seconds,
+                )
         except ValueError as exc:
             parser.error(str(exc))
     if any(value is not None for value in telemetry_thresholds) and not (
-        paired_snapshot_files or args.telemetry_url
+        paired_snapshot_files or telemetry_urls
     ):
         parser.error(
             "telemetry thresholds require --telemetry-url or paired telemetry snapshots"
@@ -4620,7 +4755,7 @@ def parse_args() -> CliOptions:
         export_prometheus=args.prometheus,
         telemetry_prometheus_path=args.telemetry_prometheus,
         telemetry_baseline_prometheus_path=args.telemetry_baseline_prometheus,
-        telemetry_url=args.telemetry_url,
+        telemetry_urls=telemetry_urls,
         telemetry_timeout_seconds=args.telemetry_timeout_seconds,
         telemetry_sample_interval_seconds=args.telemetry_sample_interval_seconds,
         telemetry_api_key_env=args.telemetry_api_key_env,
@@ -4648,11 +4783,11 @@ def main() -> None:
     config = options.config
     telemetry_client = (
         build_http_telemetry_client(
-            options.telemetry_url,
+            options.telemetry_urls,
             timeout_seconds=options.telemetry_timeout_seconds,
             api_key_env=options.telemetry_api_key_env,
         )
-        if options.telemetry_url
+        if options.telemetry_urls
         else None
     )
     client = build_client(config)
@@ -4667,7 +4802,7 @@ def main() -> None:
             options.max_client_attempt_amplification
         ),
         request_path_metrics=(
-            options.request_path_metrics if options.telemetry_url else None
+            options.request_path_metrics if options.telemetry_urls else None
         ),
     )
     if options.workload_profile:

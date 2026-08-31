@@ -17,9 +17,11 @@ inference endpoint.
   throughput, JSON, and Prometheus records; headline and cost metrics remain
   scoped to the measured phase.
 - Retry-aware request execution with measured client-attempt amplification,
-  recovery/exhaustion accounting, and an optional fail gate.
-- Opt-in ingress/backend/success counter accounting that reconciles measured
-  client attempts with privacy-safe aggregate serving-path evidence.
+  recovery/exhaustion accounting, client-observed recovered-request latency,
+  and an optional fail gate.
+- Opt-in ingress/backend/success counter accounting that can scrape independent
+  telemetry endpoints concurrently and reconcile measured client attempts with
+  privacy-safe aggregate serving-path evidence.
 - Latency metrics: average, p50, p95, p99, min, max, plus throughput and success rate.
 - JSON output and Prometheus text export for trend tracking.
 - Baseline-versus-candidate comparison with p95 and success-rate gates.
@@ -126,10 +128,13 @@ python benchmark.py \
 
 The factor is the number of measured calls to `InferenceClient.infer` divided
 by measured logical requests. JSON and Prometheus also separate retried,
-recovered, and exhausted requests. Warmup has its own attempt accounting and is
+recovered, and exhausted requests plus the end-to-end latency distribution for
+logical requests recovered by retry. Warmup has its own attempt accounting and is
 excluded from the measured gate. A client call can fail before endpoint receipt,
 so this is harness-attempt evidence rather than a server request count or proof
-of retry traffic reaching a router, model server, or accelerator.
+of retry traffic reaching a router, model server, or accelerator. Recovered-
+request latency is client-observed and includes failed attempts; it is not
+service MTTR or proof that a process recovered.
 
 Reconcile client attempts with counters from an isolated serving path:
 
@@ -141,7 +146,8 @@ python benchmark.py \
   --num-requests 200 \
   --concurrency 16 \
   --retries 2 \
-  --telemetry-url http://localhost:8000/metrics \
+  --telemetry-url http://gateway.local:8000/metrics \
+  --telemetry-url http://model-server.local:8001/metrics \
   --request-path-ingress-metric gateway_requests_received_total \
   --request-path-backend-metric model_server_requests_received_total \
   --request-path-success-metric model_server_requests_succeeded_total \
@@ -149,12 +155,15 @@ python benchmark.py \
   --prometheus
 ```
 
-All three selected metric families must be cumulative counters with integer
-values and stable series membership across the paired scrapes. The report keeps
-ingress, backend, and success deltas plus adjacent-stage ratios, but stores only
-SHA-256 fingerprints for metric names and label membership. The opt-in exact
-gate requires ingress receipts to equal measured client attempts, stage counts
-to be non-increasing, and success receipts to equal successful logical requests.
+Repeat `--telemetry-url` to capture separate metric sources concurrently at each
+boundary; if any source fails, the qualification aborts. All three selected
+metric families must be cumulative counters with integer values and stable series
+membership across the paired scrapes. The report keeps the endpoint count,
+ingress/backend/success deltas, and adjacent-stage ratios, but stores neither the
+URLs nor raw scrapes and uses only SHA-256 fingerprints for metric names and label
+membership. The opt-in exact gate requires ingress receipts to equal measured
+client attempts, stage counts to be non-increasing, and success receipts to equal
+successful logical requests.
 
 Use that gate only when the selected series are isolated to this run. Aggregate
 counter agreement does not establish per-request causality, correct metric
@@ -222,11 +231,13 @@ python benchmark.py \
 
 The first HTTP scrape runs after warmup and immediately before measured work is
 submitted. The second runs immediately after all measured requests finish.
-Authentication is opt-in: omit `--telemetry-api-key-env` for an unauthenticated
-endpoint, and no ambient API key is sent. The bearer token, endpoint URL, raw
-scrapes, and authorization header are not written to JSON or Prometheus
-artifacts. The endpoint must be an absolute HTTP(S) URL without embedded
-credentials, and each response is bounded to 10 MiB.
+Authentication is opt-in: omit `--telemetry-api-key-env` for unauthenticated
+endpoints, and no ambient API key is sent. The bearer token, endpoint URLs, raw
+scrapes, and authorization headers are not written to JSON or Prometheus
+artifacts. Endpoints must use absolute HTTP(S) URLs without embedded credentials;
+the combined snapshot has a shared 10 MiB response budget. When multiple
+URLs are configured, one explicitly selected bearer token is sent to every listed
+endpoint, so combine only endpoints authorized to receive that credential.
 
 `harness_bracketed_measured_phase` describes process ordering, not server
 isolation. Counter deltas can still include unrelated traffic. The harness hashes
@@ -396,3 +407,5 @@ python -m unittest discover -s tests
 
 - Server-lifecycle hooks for controlled cold-start measurements.
 - Coordinated distributed load generation for multi-client benchmarking.
+- Exercise the multi-source path gate in a real orchestrated router/model-server
+  deployment; the committed qualification remains a synthetic single-host fixture.
