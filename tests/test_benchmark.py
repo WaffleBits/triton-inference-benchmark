@@ -17,6 +17,7 @@ from benchmark import (
     InferenceResult,
     LlmMetricsConfig,
     MockInferenceClient,
+    MultiEndpointPrometheusTelemetryClient,
     NumericOutput,
     OutputObservation,
     RequestPathMetricNames,
@@ -1030,6 +1031,131 @@ class BenchmarkHarnessTest(unittest.TestCase):
                 client.scrape()
 
         self.assertGreater(MAX_TELEMETRY_RESPONSE_BYTES, 0)
+
+    def test_multi_endpoint_telemetry_scrapes_sources_concurrently(self) -> None:
+        barrier = Barrier(2)
+
+        class FixtureClient:
+            def __init__(self, payload: str) -> None:
+                self.payload = payload
+
+            def scrape(self) -> str:
+                barrier.wait(timeout=1)
+                return self.payload
+
+        telemetry_client = MultiEndpointPrometheusTelemetryClient(
+            (
+                FixtureClient("router_requests_total 1\n"),
+                FixtureClient("backend_requests_total 1\n"),
+            )
+        )
+
+        snapshot = telemetry_client.scrape()
+
+        self.assertEqual(telemetry_client.source_count, 2)
+        self.assertIn("router_requests_total 1", snapshot)
+        self.assertIn("backend_requests_total 1", snapshot)
+
+    def test_multi_endpoint_telemetry_fails_closed_on_source_error_or_size(self) -> None:
+        class StaticClient:
+            def __init__(self, payload: str) -> None:
+                self.payload = payload
+
+            def scrape(self) -> str:
+                return self.payload
+
+        class FailingClient:
+            def scrape(self) -> str:
+                raise RuntimeError("backend metrics unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "backend metrics unavailable"):
+            MultiEndpointPrometheusTelemetryClient(
+                (StaticClient("router_total 1\n"), FailingClient())
+            ).scrape()
+
+        half_limit = "x" * (MAX_TELEMETRY_RESPONSE_BYTES // 2)
+        with self.assertRaisesRegex(ValueError, "combined telemetry response exceeded"):
+            MultiEndpointPrometheusTelemetryClient(
+                (StaticClient(half_limit), StaticClient(half_limit))
+            ).scrape()
+
+    def test_multi_endpoint_telemetry_records_only_source_count(self) -> None:
+        class SequencedClient:
+            def __init__(self, snapshots: tuple[str, str]) -> None:
+                self.snapshots = iter(snapshots)
+
+            def scrape(self) -> str:
+                return next(self.snapshots)
+
+        telemetry_client = MultiEndpointPrometheusTelemetryClient(
+            (
+                SequencedClient(
+                    (
+                        'private_router_ingress_total{route="secret-route"} 0\n',
+                        'private_router_ingress_total{route="secret-route"} 1\n',
+                    )
+                ),
+                SequencedClient(
+                    (
+                        'private_backend_received_total{model="secret-model"} 0\n'
+                        'private_backend_success_total{model="secret-model"} 0\n',
+                        'private_backend_received_total{model="secret-model"} 1\n'
+                        'private_backend_success_total{model="secret-model"} 1\n',
+                    )
+                ),
+            )
+        )
+
+        metrics = run_benchmark(
+            MockInferenceClient(seed=11, failure_rate=0),
+            BenchmarkConfig(num_requests=1, concurrency=1, retries=0),
+            telemetry_client=telemetry_client,
+            request_path_metrics=RequestPathMetricNames(
+                ingress="private_router_ingress_total",
+                backend="private_backend_received_total",
+                success="private_backend_success_total",
+            ),
+        )
+
+        self.assertEqual(metrics["telemetry"]["endpoint_count"], 2)
+        self.assertEqual(metrics["telemetry_window"]["endpoint_count"], 2)
+        self.assertEqual(metrics["request_path"]["endpoint_count"], 2)
+        self.assertTrue(metrics["request_path_gate"]["passed"])
+        serialized = json.dumps(metrics)
+        self.assertNotIn("private_router_ingress_total", serialized)
+        self.assertNotIn("private_backend_received_total", serialized)
+        self.assertNotIn("secret-route", serialized)
+        self.assertNotIn("secret-model", serialized)
+
+    def test_multi_endpoint_builder_rejects_duplicate_urls(self) -> None:
+        telemetry_client = build_http_telemetry_client(
+            (
+                "https://router.example.test/metrics",
+                "https://backend.example.test/metrics",
+            ),
+            timeout_seconds=2,
+        )
+
+        self.assertIsInstance(
+            telemetry_client,
+            MultiEndpointPrometheusTelemetryClient,
+        )
+        allocated_bytes = sum(
+            client.max_response_bytes for client in telemetry_client.clients
+        )
+        self.assertLessEqual(
+            allocated_bytes + telemetry_client.source_count,
+            MAX_TELEMETRY_RESPONSE_BYTES,
+        )
+
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            build_http_telemetry_client(
+                (
+                    "https://metrics.example.test/metrics",
+                    "https://metrics.example.test/metrics",
+                ),
+                timeout_seconds=2,
+            )
 
     def test_bracketed_http_telemetry_artifact_omits_endpoint_token_and_raw_scrape(self) -> None:
         responses = iter(
@@ -2118,7 +2244,9 @@ class BenchmarkHarnessTest(unittest.TestCase):
             [
                 "benchmark.py",
                 "--telemetry-url",
-                "https://metrics.example.test/metrics",
+                "https://router.example.test/metrics",
+                "--telemetry-url",
+                "https://backend.example.test/metrics",
                 "--telemetry-timeout-seconds",
                 "3.5",
                 "--telemetry-sample-interval-seconds",
@@ -2133,8 +2261,11 @@ class BenchmarkHarnessTest(unittest.TestCase):
             options = parse_args()
 
         self.assertEqual(
-            options.telemetry_url,
-            "https://metrics.example.test/metrics",
+            options.telemetry_urls,
+            (
+                "https://router.example.test/metrics",
+                "https://backend.example.test/metrics",
+            ),
         )
         self.assertEqual(options.telemetry_timeout_seconds, 3.5)
         self.assertEqual(options.telemetry_sample_interval_seconds, 0.25)

@@ -121,6 +121,33 @@ class OpenAIStreamingClientTest(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.streaming, expected)
 
+    def test_retry_summary_reports_recovered_request_latency(self) -> None:
+        metrics = summarize_results(
+            [
+                InferenceResult(ok=True, latency_ms=30.0, attempt_count=2),
+                InferenceResult(ok=True, latency_ms=10.0, attempt_count=1),
+                InferenceResult(
+                    ok=False,
+                    latency_ms=20.0,
+                    error="exhausted",
+                    attempt_count=3,
+                ),
+            ],
+            duration_seconds=1.0,
+            config=BenchmarkConfig(num_requests=3, concurrency=1, retries=2),
+        )
+
+        recovery_latency = metrics["retry"]["recovered_request_latency_ms"]
+        self.assertEqual(recovery_latency["request_count"], 1)
+        self.assertEqual(recovery_latency["avg"], 30.0)
+        self.assertEqual(recovery_latency["p95"], 30.0)
+        self.assertEqual(
+            recovery_latency["scope"],
+            "client-observed end-to-end latency for measured logical requests that succeeded after retry",
+        )
+        prometheus = format_prometheus_metrics(metrics)
+        self.assertIn("triton_benchmark_recovered_request_latency_ms", prometheus)
+
     def test_summarizes_measured_streaming_metrics(self) -> None:
         results = [
             InferenceResult(

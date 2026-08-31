@@ -156,11 +156,17 @@ python benchmark.py \
 ```
 
 Review total client attempts, retry attempts, recovered requests, exhausted
-requests, and the amplification factor together. A 1.05 factor means the
+requests, recovered-request latency, and the amplification factor together. A
+1.05 factor means the
 harness made 105 client calls per 100 measured logical requests; it does not
 prove all 105 reached the server. Compare it with server counters and traces in
 the authorized environment before attributing load. Warmup retry activity stays
 under `warmup.retry` and is excluded from this gate.
+
+`retry.recovered_request_latency_ms` is the client end-to-end latency for logical
+requests that eventually succeeded, including their failed attempts. Do not
+describe it as service MTTR, process restart time, or proof of autonomous
+remediation.
 
 ### Request-path accounting
 
@@ -175,7 +181,8 @@ python benchmark.py \
   --num-requests 200 \
   --concurrency 16 \
   --retries 2 \
-  --telemetry-url http://inference.example.internal/metrics \
+  --telemetry-url http://gateway.example.internal/metrics \
+  --telemetry-url http://model-server.example.internal/metrics \
   --request-path-ingress-metric gateway_requests_received_total \
   --request-path-backend-metric model_server_requests_received_total \
   --request-path-success-metric model_server_requests_succeeded_total \
@@ -183,7 +190,9 @@ python benchmark.py \
   --prometheus
 ```
 
-The gate exits with status 7 unless ingress receipts equal measured client
+Each `--telemetry-url` is fetched concurrently at the before/after boundaries;
+one failed or oversized source aborts the run, and the artifact retains only the
+endpoint count. The gate exits with status 7 unless ingress receipts equal measured client
 attempts, ingress/backend/success counts are non-increasing, and successful
 backend completions equal successful logical requests. Missing metrics,
 non-integer values, duplicate series, label churn, and per-series counter resets
@@ -288,10 +297,11 @@ traffic.
 
 ### Harness-bracketed HTTP capture
 
-Use `--telemetry-url <http-or-https-url>` instead of the two file options when
-the benchmark process is authorized to read the Prometheus endpoint. The
-harness fetches the baseline after warmup and immediately before measured work,
-then fetches the candidate immediately after the measured futures complete.
+Use one or more `--telemetry-url <http-or-https-url>` options instead of the two
+file options when the benchmark process is authorized to read the Prometheus
+endpoints. The harness fetches every source concurrently after warmup and
+immediately before measured work, then does the same immediately after the
+measured futures complete.
 
 ```bash
 export TELEMETRY_TOKEN="..."
@@ -314,13 +324,16 @@ python benchmark.py \
 
 Authentication is disabled unless `--telemetry-api-key-env` explicitly names a
 non-empty environment variable. The client does not inspect ambient API-key
-variables. URLs containing user information are rejected. Each UTF-8 response
-is capped at 10 MiB, and a failed scrape aborts the qualification instead of
-silently producing an unbracketed artifact.
+variables. URLs containing user information are rejected. Responses share a
+10 MiB combined snapshot budget, duplicate URLs are rejected, and
+a failed scrape aborts the qualification instead of silently producing an
+unbracketed artifact. One explicitly selected bearer token is sent to every
+listed endpoint; do not combine endpoints that should not share that credential.
 
-Artifacts contain only parsed summaries, deltas, and gates. They exclude the
-endpoint URL, environment-variable name, bearer token, authorization header,
-and raw response. The alignment label proves only this process's phase order;
+Artifacts contain only the endpoint count, parsed summaries, deltas, and gates.
+They exclude endpoint URLs, the environment-variable name, bearer token,
+authorization header, and raw responses. The alignment label proves only this
+process's phase order;
 unrelated server traffic remains an external control, and the post-run DCGM
 values are still point-in-time gauges unless sampling is explicitly enabled.
 Selected counter-series churn is detected by a label-derived SHA-256 fingerprint,
