@@ -25,6 +25,8 @@ from benchmark import (
     TritonHttpInferenceClient,
     attach_telemetry_summary,
     build_http_telemetry_client,
+    build_service_lifecycle_accounting,
+    build_service_lifecycle_gate,
     build_retry_gate,
     build_constant_rate_submission_offsets,
     build_cost_model,
@@ -392,6 +394,27 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertEqual(retry["client_attempt_amplification"], 2.3333)
         self.assertNotIn("private failure detail", json.dumps(metrics))
 
+    def test_retry_delay_is_applied_only_between_failed_attempts(self) -> None:
+        class FlakyClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def infer(self) -> None:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("transient fixture failure")
+
+        with patch("benchmark.time.sleep") as sleep:
+            result = execute_with_retries(
+                FlakyClient(),
+                retries=2,
+                retry_backoff_seconds=0.25,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.attempt_count, 2)
+        sleep.assert_called_once_with(0.25)
+
     def test_retry_gate_and_prometheus_use_measured_client_attempts(self) -> None:
         metrics = summarize_results(
             [
@@ -510,6 +533,102 @@ class BenchmarkHarnessTest(unittest.TestCase):
                 patch("builtins.print"),
             ):
                 with self.assertRaisesRegex(SystemExit, "7"):
+                    main()
+
+    def test_service_lifecycle_counter_is_gated_without_persisting_identity(self) -> None:
+        metric_name = "private_backend_restarts_total"
+        before = f'{metric_name}{{supervisor="private-local"}} 9\n'
+        after = f'{metric_name}{{supervisor="private-local"}} 10\n'
+
+        accounting = build_service_lifecycle_accounting(
+            before,
+            after,
+            metric_name,
+            source="paired_http_prometheus_scrapes",
+            alignment="harness_bracketed_measured_phase",
+        )
+        gate = build_service_lifecycle_gate(
+            accounting,
+            min_service_restarts=1,
+            max_service_restarts=1,
+        )
+
+        self.assertTrue(accounting["valid"])
+        self.assertEqual(accounting["restart_count"], 1)
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["checks"]["minimum_restarts"]["minimum"], 1)
+        self.assertEqual(gate["checks"]["maximum_restarts"]["maximum"], 1)
+
+        exported = format_prometheus_metrics(
+            {
+                "mode": "openai",
+                "model_name": "fixture-model",
+                "service_lifecycle": accounting,
+                "service_lifecycle_gate": gate,
+            }
+        )
+        self.assertIn("triton_benchmark_service_restart_delta", exported)
+        self.assertIn("triton_benchmark_service_lifecycle_gate_passed", exported)
+        self.assertIn("triton_benchmark_service_lifecycle_min_restarts", exported)
+        self.assertIn("triton_benchmark_service_lifecycle_max_restarts", exported)
+        serialized = json.dumps(accounting) + exported
+        self.assertNotIn(metric_name, serialized)
+        self.assertNotIn("private-local", serialized)
+
+    def test_service_lifecycle_counter_fails_closed_on_reset_and_membership_churn(self) -> None:
+        accounting = build_service_lifecycle_accounting(
+            'restarts_total{worker="a"} 2\n',
+            'restarts_total{worker="b"} 1\n',
+            "restarts_total",
+        )
+        gate = build_service_lifecycle_gate(
+            accounting,
+            min_service_restarts=1,
+            max_service_restarts=1,
+        )
+
+        self.assertFalse(accounting["valid"])
+        self.assertIsNone(accounting["restart_count"])
+        self.assertIn("series_membership_changed", accounting["issues"])
+        self.assertFalse(gate["passed"])
+
+    def test_service_lifecycle_gate_cli_exits_eight_on_bound_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            before_path = root / "before.prom"
+            after_path = root / "after.prom"
+            output_dir = root / "results"
+            before_path.write_text("restarts_total 4\n", encoding="utf-8")
+            after_path.write_text("restarts_total 4\n", encoding="utf-8")
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "benchmark.py",
+                        "--num-requests",
+                        "1",
+                        "--concurrency",
+                        "1",
+                        "--retries",
+                        "0",
+                        "--telemetry-baseline-prometheus",
+                        str(before_path),
+                        "--telemetry-prometheus",
+                        str(after_path),
+                        "--service-restart-metric",
+                        "restarts_total",
+                        "--min-service-restarts",
+                        "1",
+                        "--max-service-restarts",
+                        "1",
+                        "--fail-on-service-lifecycle-gap",
+                        "--output-dir",
+                        str(output_dir),
+                    ],
+                ),
+                patch("builtins.print"),
+            ):
+                with self.assertRaisesRegex(SystemExit, "8"):
                     main()
 
     def test_trace_context_summary_and_prometheus_omit_identifiers(self) -> None:

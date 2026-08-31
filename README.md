@@ -18,10 +18,12 @@ inference endpoint.
   scoped to the measured phase.
 - Retry-aware request execution with measured client-attempt amplification,
   recovery/exhaustion accounting, client-observed recovered-request latency,
-  and an optional fail gate.
+  an optional fixed between-attempt delay, and a fail gate.
 - Opt-in ingress/backend/success counter accounting that can scrape independent
   telemetry endpoints concurrently and reconcile measured client attempts with
   privacy-safe aggregate serving-path evidence.
+- Opt-in service-restart counter accounting with minimum/maximum gates, stable
+  series validation, and no raw metric identities or endpoint URLs in artifacts.
 - Latency metrics: average, p50, p95, p99, min, max, plus throughput and success rate.
 - JSON output and Prometheus text export for trend tracking.
 - Baseline-versus-candidate comparison with p95 and success-rate gates.
@@ -121,6 +123,7 @@ python benchmark.py \
   --num-requests 200 \
   --concurrency 16 \
   --retries 2 \
+  --retry-backoff-seconds 0.25 \
   --max-client-attempt-amplification 1.05 \
   --fail-on-retry-gate \
   --prometheus
@@ -135,6 +138,11 @@ so this is harness-attempt evidence rather than a server request count or proof
 of retry traffic reaching a router, model server, or accelerator. Recovered-
 request latency is client-observed and includes failed attempts; it is not
 service MTTR or proof that a process recovered.
+
+`--retry-backoff-seconds` adds the configured fixed delay only after a failed
+attempt when another attempt remains. It is a client policy input recorded with
+the run, not measured recovery time, adaptive backoff, or proof that the service
+was ready before the next attempt.
 
 Reconcile client attempts with counters from an isolated serving path:
 
@@ -170,6 +178,40 @@ counter agreement does not establish per-request causality, correct metric
 instrumentation, process identity, traffic isolation, or synchronized clocks.
 The same accounting can consume explicitly paired snapshot files, but their
 timing is labeled operator-supplied and unverified.
+
+Gate a lifecycle counter alongside the request path when a controller or
+orchestrator exposes completed restarts:
+
+```bash
+python benchmark.py \
+  --mode openai \
+  --server-url http://localhost:8000/v1 \
+  --model-name local-model \
+  --num-requests 200 \
+  --concurrency 16 \
+  --retries 2 \
+  --retry-backoff-seconds 0.25 \
+  --telemetry-url http://gateway.local:8000/metrics \
+  --telemetry-url http://model-server.local:8001/metrics \
+  --telemetry-url http://supervisor.local:8002/metrics \
+  --request-path-ingress-metric gateway_requests_received_total \
+  --request-path-backend-metric model_server_requests_received_total \
+  --request-path-success-metric model_server_requests_succeeded_total \
+  --fail-on-request-path-gap \
+  --service-restart-metric model_server_completed_restarts_total \
+  --min-service-restarts 1 \
+  --max-service-restarts 1 \
+  --fail-on-service-lifecycle-gap \
+  --prometheus
+```
+
+Use a maximum of zero for a no-restart reliability gate, or equal minimum and
+maximum values for a controlled fault-injection run. The selected family must be
+a cumulative integer counter with stable series membership; a missing counter,
+reset, duplicate series, or label churn invalidates the gate. The report stores
+only the aggregate delta and SHA-256 identity/membership fingerprints. Counter
+agreement does not prove process identity, health readiness, per-request
+causality, autonomous remediation, traffic isolation, or restart duration.
 
 Compare a candidate run against a saved baseline and fail on regression:
 

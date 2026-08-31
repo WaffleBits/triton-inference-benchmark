@@ -132,6 +132,7 @@ class BenchmarkConfig:
     num_requests: int = 200
     concurrency: int = 10
     retries: int = 2
+    retry_backoff_seconds: float = 0.0
     request_rate_rps: float = 0.0
     propagate_trace_context: bool = False
     output_dir: str = "benchmark_results"
@@ -246,6 +247,9 @@ class CliOptions:
     max_server_failure_rate: float | None = None
     max_server_queue_fraction: float | None = None
     request_path_metrics: RequestPathMetricNames | None = None
+    service_restart_metric: str | None = None
+    min_service_restarts: int | None = None
+    max_service_restarts: int | None = None
     batch_invariance_probes: int = 0
     batch_output_atol: float = 0.0
     batch_output_rtol: float = 0.0
@@ -259,6 +263,7 @@ class CliOptions:
     fail_on_trace_context_gap: bool = False
     fail_on_retry_gate: bool = False
     fail_on_request_path_gap: bool = False
+    fail_on_service_lifecycle_gap: bool = False
 
 
 @dataclass(frozen=True)
@@ -784,7 +789,13 @@ def percentile(values: list[float], percentile_rank: float) -> float:
     return sorted_values[index]
 
 
-def execute_with_retries(client: InferenceClient, retries: int) -> InferenceResult:
+def execute_with_retries(
+    client: InferenceClient,
+    retries: int,
+    retry_backoff_seconds: float = 0.0,
+) -> InferenceResult:
+    if not math.isfinite(retry_backoff_seconds) or retry_backoff_seconds < 0:
+        raise ValueError("retry backoff must be finite and non-negative")
     start = time.perf_counter()
     last_error: str | None = None
 
@@ -805,6 +816,8 @@ def execute_with_retries(client: InferenceClient, retries: int) -> InferenceResu
             )
         except Exception as exc:  # noqa: BLE001 - benchmark harness records client failures.
             last_error = str(exc)
+            if attempt_count <= retries and retry_backoff_seconds:
+                time.sleep(retry_backoff_seconds)
 
     latency_ms = (time.perf_counter() - start) * 1000
     return InferenceResult(
@@ -1255,6 +1268,7 @@ def _run_request_phase(
     request_count: int,
     concurrency: int,
     retries: int,
+    retry_backoff_seconds: float = 0.0,
     phase_started: threading.Event | None = None,
     request_rate_rps: float = 0.0,
 ) -> tuple[list[InferenceResult], float, dict[str, object] | None]:
@@ -1277,7 +1291,12 @@ def _run_request_phase(
                 if remaining > 0:
                     time.sleep(remaining)
                 submission_offsets.append(time.perf_counter() - start)
-            future = executor.submit(execute_with_retries, client, retries)
+            future = executor.submit(
+                execute_with_retries,
+                client,
+                retries,
+                retry_backoff_seconds,
+            )
             futures[future] = request_index
             if request_index == 0 and phase_started is not None:
                 phase_started.set()
@@ -1476,6 +1495,9 @@ def run_benchmark(
     telemetry_sample_interval_seconds: float = 0.0,
     max_client_attempt_amplification: float | None = None,
     request_path_metrics: RequestPathMetricNames | None = None,
+    service_restart_metric: str | None = None,
+    min_service_restarts: int | None = None,
+    max_service_restarts: int | None = None,
 ) -> dict[str, object]:
     if telemetry_sample_interval_seconds < 0:
         raise ValueError("telemetry sample interval must be zero or greater")
@@ -1483,6 +1505,26 @@ def run_benchmark(
         raise ValueError("telemetry sampling requires a telemetry client")
     if request_path_metrics is not None and telemetry_client is None:
         raise ValueError("request-path accounting requires a telemetry client")
+    if service_restart_metric is not None and telemetry_client is None:
+        raise ValueError("service lifecycle accounting requires a telemetry client")
+    for label, value in (
+        ("minimum", min_service_restarts),
+        ("maximum", max_service_restarts),
+    ):
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise ValueError(f"{label} service restarts must be a non-negative integer")
+    if (
+        min_service_restarts is not None
+        and max_service_restarts is not None
+        and min_service_restarts > max_service_restarts
+    ):
+        raise ValueError("minimum service restarts must not exceed maximum")
+    if (
+        min_service_restarts is not None or max_service_restarts is not None
+    ) and service_restart_metric is None:
+        raise ValueError("service restart bounds require a restart metric")
 
     warmup_results: list[InferenceResult] = []
     warmup_duration_seconds = 0.0
@@ -1492,6 +1534,7 @@ def run_benchmark(
             request_count=config.warmup_requests,
             concurrency=config.concurrency,
             retries=config.retries,
+            retry_backoff_seconds=config.retry_backoff_seconds,
         )
 
     telemetry_before = telemetry_client.scrape() if telemetry_client else None
@@ -1522,6 +1565,7 @@ def run_benchmark(
             request_count=config.num_requests,
             concurrency=config.concurrency,
             retries=config.retries,
+            retry_backoff_seconds=config.retry_backoff_seconds,
             phase_started=phase_started if sampler is not None else None,
             request_rate_rps=config.request_rate_rps,
         )
@@ -1580,8 +1624,16 @@ def run_benchmark(
             max_server_failure_rate=max_server_failure_rate,
             max_server_queue_fraction=max_server_queue_fraction,
             request_path_metrics=request_path_metrics,
+            service_restart_metric=service_restart_metric,
+            min_service_restarts=min_service_restarts,
+            max_service_restarts=max_service_restarts,
         )
-        for artifact_key in ("telemetry", "telemetry_window", "request_path"):
+        for artifact_key in (
+            "telemetry",
+            "telemetry_window",
+            "request_path",
+            "service_lifecycle",
+        ):
             artifact = summary.get(artifact_key)
             if isinstance(artifact, dict):
                 artifact["endpoint_count"] = endpoint_count
@@ -2469,6 +2521,120 @@ def build_request_path_gate(accounting: dict[str, object]) -> dict[str, object]:
     }
 
 
+def build_service_lifecycle_accounting(
+    before_prometheus_text: str,
+    after_prometheus_text: str,
+    metric_name: str,
+    *,
+    source: str = "paired_prometheus_counter_snapshots",
+    alignment: str = "operator_supplied_unverified",
+) -> dict[str, object]:
+    """Derive a privacy-safe completed service-restart counter delta."""
+    if PROMETHEUS_METRIC_NAME_PATTERN.fullmatch(metric_name) is None:
+        raise ValueError(f"invalid Prometheus metric name: {metric_name!r}")
+
+    before_samples = parse_prometheus_samples(before_prometheus_text)
+    after_samples = parse_prometheus_samples(after_prometheus_text)
+    window = _build_request_path_stage_window(
+        "service_restart",
+        metric_name,
+        before_samples,
+        after_samples,
+    )
+    issues = window.get("issues", [])
+    notes = [
+        "the selected cumulative counter is an aggregate observation",
+        "a restart delta does not prove which request, retry, or outcome it affected",
+        "restart count is not process downtime, readiness duration, or service MTTR",
+        "the metric name and labels are represented only by SHA-256 fingerprints",
+    ]
+    if alignment == "harness_bracketed_measured_phase":
+        notes.insert(
+            0,
+            "the harness fetched the counter immediately before and after measured requests",
+        )
+    else:
+        notes.insert(0, "snapshot timing is operator supplied and not verified by the harness")
+
+    return {
+        "source": source,
+        "alignment": alignment,
+        "valid": window.get("valid") is True,
+        "restart_count": window.get("delta"),
+        "metric_name_sha256": window.get("metric_name_sha256"),
+        "series_membership": window.get("series_membership"),
+        "issues": list(issues) if isinstance(issues, list) else [],
+        "notes": notes,
+    }
+
+
+def build_service_lifecycle_gate(
+    accounting: dict[str, object],
+    *,
+    min_service_restarts: int | None = None,
+    max_service_restarts: int | None = None,
+) -> dict[str, object]:
+    """Gate a bracketed service-restart count against explicit run bounds."""
+    if min_service_restarts is None and max_service_restarts is None:
+        raise ValueError("service lifecycle gate requires a restart bound")
+    for label, value in (
+        ("minimum", min_service_restarts),
+        ("maximum", max_service_restarts),
+    ):
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise ValueError(f"{label} service restarts must be a non-negative integer")
+    if (
+        min_service_restarts is not None
+        and max_service_restarts is not None
+        and min_service_restarts > max_service_restarts
+    ):
+        raise ValueError("minimum service restarts must not exceed maximum")
+
+    observed = _nonnegative_int(accounting.get("restart_count"))
+    checks: dict[str, dict[str, object]] = {}
+    if min_service_restarts is not None:
+        checks["minimum_restarts"] = {
+            "observed": observed,
+            "minimum": min_service_restarts,
+            "evaluable": observed is not None,
+            "passed": observed is not None and observed >= min_service_restarts,
+        }
+    if max_service_restarts is not None:
+        checks["maximum_restarts"] = {
+            "observed": observed,
+            "maximum": max_service_restarts,
+            "evaluable": observed is not None,
+            "passed": observed is not None and observed <= max_service_restarts,
+        }
+
+    failure_reasons: list[str] = []
+    if accounting.get("valid") is not True:
+        failure_reasons.append("service lifecycle counter evidence is invalid")
+    if observed is None:
+        failure_reasons.append("service restart count is unavailable")
+    else:
+        if min_service_restarts is not None and observed < min_service_restarts:
+            failure_reasons.append(
+                f"service restart count {observed} was below {min_service_restarts} minimum"
+            )
+        if max_service_restarts is not None and observed > max_service_restarts:
+            failure_reasons.append(
+                f"service restart count {observed} exceeded {max_service_restarts} maximum"
+            )
+
+    return {
+        "passed": not failure_reasons,
+        "checks": checks,
+        "failure_reasons": failure_reasons,
+        "scope": (
+            "aggregate completed-restart counter delta inside the selected telemetry "
+            "window; no request-level causality or MTTR is claimed"
+        ),
+    }
+
+
 def _stat_summary(values: list[float]) -> dict[str, float]:
     if not values:
         return {}
@@ -2941,6 +3107,9 @@ def attach_telemetry_summary(
     max_server_failure_rate: float | None = None,
     max_server_queue_fraction: float | None = None,
     request_path_metrics: RequestPathMetricNames | None = None,
+    service_restart_metric: str | None = None,
+    min_service_restarts: int | None = None,
+    max_service_restarts: int | None = None,
 ) -> dict[str, object]:
     path = Path(telemetry_prometheus_path)
     baseline_text = None
@@ -2954,6 +3123,9 @@ def attach_telemetry_summary(
         max_server_failure_rate=max_server_failure_rate,
         max_server_queue_fraction=max_server_queue_fraction,
         request_path_metrics=request_path_metrics,
+        service_restart_metric=service_restart_metric,
+        min_service_restarts=min_service_restarts,
+        max_service_restarts=max_service_restarts,
     )
 
 
@@ -2968,7 +3140,14 @@ def attach_telemetry_snapshots(
     max_server_failure_rate: float | None = None,
     max_server_queue_fraction: float | None = None,
     request_path_metrics: RequestPathMetricNames | None = None,
+    service_restart_metric: str | None = None,
+    min_service_restarts: int | None = None,
+    max_service_restarts: int | None = None,
 ) -> dict[str, object]:
+    if (
+        min_service_restarts is not None or max_service_restarts is not None
+    ) and service_restart_metric is None:
+        raise ValueError("service restart bounds require a restart metric")
     enriched_metrics = dict(metrics)
     model_name = str(metrics.get("model_name", "unknown"))
     enriched_metrics["telemetry"] = build_telemetry_summary(
@@ -3009,10 +3188,32 @@ def attach_telemetry_snapshots(
             )
             enriched_metrics["request_path"] = request_path
             enriched_metrics["request_path_gate"] = build_request_path_gate(request_path)
-    elif max_server_failure_rate is not None or max_server_queue_fraction is not None:
-        raise ValueError("telemetry thresholds require paired pre-run and post-run snapshots")
-    elif request_path_metrics is not None:
-        raise ValueError("request-path accounting requires paired counter snapshots")
+        if service_restart_metric is not None:
+            service_lifecycle = build_service_lifecycle_accounting(
+                baseline_prometheus_text,
+                prometheus_text,
+                service_restart_metric,
+                source=counter_window_source,
+                alignment=alignment,
+            )
+            enriched_metrics["service_lifecycle"] = service_lifecycle
+            if min_service_restarts is not None or max_service_restarts is not None:
+                enriched_metrics["service_lifecycle_gate"] = (
+                    build_service_lifecycle_gate(
+                        service_lifecycle,
+                        min_service_restarts=min_service_restarts,
+                        max_service_restarts=max_service_restarts,
+                    )
+                )
+    else:
+        if max_server_failure_rate is not None or max_server_queue_fraction is not None:
+            raise ValueError(
+                "telemetry thresholds require paired pre-run and post-run snapshots"
+            )
+        if request_path_metrics is not None:
+            raise ValueError("request-path accounting requires paired counter snapshots")
+        if service_restart_metric is not None:
+            raise ValueError("service lifecycle accounting requires paired counter snapshots")
     return enriched_metrics
 
 
@@ -3261,6 +3462,68 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
                     "# HELP triton_benchmark_request_path_gate_passed Whether isolated request-path counters exactly reconciled with harness outcomes.",
                     "# TYPE triton_benchmark_request_path_gate_passed gauge",
                     f"triton_benchmark_request_path_gate_passed{{{labels}}} {int(passed)}",
+                ]
+            )
+
+    service_lifecycle = typed_metrics.get("service_lifecycle")
+    if isinstance(service_lifecycle, dict):
+        restart_count = service_lifecycle.get("restart_count")
+        if isinstance(restart_count, int) and not isinstance(restart_count, bool):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_service_restart_delta Aggregate completed service restarts in the paired telemetry window.",
+                    "# TYPE triton_benchmark_service_restart_delta gauge",
+                    f"triton_benchmark_service_restart_delta{{{labels}}} {restart_count}",
+                ]
+            )
+        valid = service_lifecycle.get("valid")
+        if isinstance(valid, bool):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_service_lifecycle_valid Whether the selected restart counter window was valid.",
+                    "# TYPE triton_benchmark_service_lifecycle_valid gauge",
+                    f"triton_benchmark_service_lifecycle_valid{{{labels}}} {int(valid)}",
+                ]
+            )
+
+    service_lifecycle_gate = typed_metrics.get("service_lifecycle_gate")
+    if isinstance(service_lifecycle_gate, dict):
+        checks = service_lifecycle_gate.get("checks")
+        checks = checks if isinstance(checks, dict) else {}
+        for check_name, bound_key, metric_name, help_text in (
+            (
+                "minimum_restarts",
+                "minimum",
+                "triton_benchmark_service_lifecycle_min_restarts",
+                "Configured minimum completed service restarts in the telemetry window.",
+            ),
+            (
+                "maximum_restarts",
+                "maximum",
+                "triton_benchmark_service_lifecycle_max_restarts",
+                "Configured maximum completed service restarts in the telemetry window.",
+            ),
+        ):
+            check = checks.get(check_name)
+            bound = check.get(bound_key) if isinstance(check, dict) else None
+            if isinstance(bound, int) and not isinstance(bound, bool):
+                lines.extend(
+                    [
+                        f"# HELP {metric_name} {help_text}",
+                        f"# TYPE {metric_name} gauge",
+                        f"{metric_name}{{{labels}}} {bound}",
+                    ]
+                )
+        passed = service_lifecycle_gate.get("passed")
+        if isinstance(passed, bool):
+            lines.extend(
+                [
+                    "# HELP triton_benchmark_service_lifecycle_gate_passed Whether the aggregate restart count stayed within configured bounds.",
+                    "# TYPE triton_benchmark_service_lifecycle_gate_passed gauge",
+                    (
+                        "triton_benchmark_service_lifecycle_gate_passed"
+                        f"{{{labels}}} {int(passed)}"
+                    ),
                 ]
             )
 
@@ -4167,6 +4430,15 @@ def parse_args() -> CliOptions:
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument(
+        "--retry-backoff-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Fixed client delay between failed attempts; a zero value retries immediately. "
+            "The configured delay is not measured service recovery time."
+        ),
+    )
+    parser.add_argument(
         "--max-client-attempt-amplification",
         type=float,
         help=(
@@ -4392,6 +4664,31 @@ def parse_args() -> CliOptions:
         ),
     )
     parser.add_argument(
+        "--service-restart-metric",
+        help=(
+            "Cumulative Prometheus counter for completed service restarts; the metric "
+            "name and labels are not persisted."
+        ),
+    )
+    parser.add_argument(
+        "--min-service-restarts",
+        type=int,
+        help="Minimum completed service restarts required in the paired counter window.",
+    )
+    parser.add_argument(
+        "--max-service-restarts",
+        type=int,
+        help="Maximum completed service restarts allowed in the paired counter window.",
+    )
+    parser.add_argument(
+        "--fail-on-service-lifecycle-gap",
+        action="store_true",
+        help=(
+            "Exit with status 8 unless the selected restart counter is valid and "
+            "within the configured bounds."
+        ),
+    )
+    parser.add_argument(
         "--max-server-failure-rate",
         type=float,
         help="Maximum failed-request fraction in the paired Triton counter window.",
@@ -4470,6 +4767,8 @@ def parse_args() -> CliOptions:
         parser.error("--request-rate-rps must be zero or greater")
     if args.retries < 0:
         parser.error("--retries must be zero or greater")
+    if not math.isfinite(args.retry_backoff_seconds) or args.retry_backoff_seconds < 0:
+        parser.error("--retry-backoff-seconds must be finite and non-negative")
     if args.max_client_attempt_amplification is not None and (
         not math.isfinite(args.max_client_attempt_amplification)
         or args.max_client_attempt_amplification < 1
@@ -4541,6 +4840,44 @@ def parse_args() -> CliOptions:
             )
     if args.fail_on_request_path_gap and request_path_metrics is None:
         parser.error("--fail-on-request-path-gap requires request-path metric names")
+    service_restart_bounds = (
+        args.min_service_restarts,
+        args.max_service_restarts,
+    )
+    if any(value is not None and value < 0 for value in service_restart_bounds):
+        parser.error("service restart bounds must be zero or greater")
+    if (
+        args.min_service_restarts is not None
+        and args.max_service_restarts is not None
+        and args.min_service_restarts > args.max_service_restarts
+    ):
+        parser.error("--min-service-restarts must not exceed --max-service-restarts")
+    if args.service_restart_metric is not None and (
+        PROMETHEUS_METRIC_NAME_PATTERN.fullmatch(args.service_restart_metric) is None
+    ):
+        parser.error("--service-restart-metric must be a valid Prometheus name")
+    if any(value is not None for value in service_restart_bounds) and (
+        args.service_restart_metric is None
+    ):
+        parser.error("service restart bounds require --service-restart-metric")
+    if args.service_restart_metric is not None and not (
+        paired_snapshot_files or telemetry_urls
+    ):
+        parser.error(
+            "service lifecycle accounting requires --telemetry-url or paired telemetry snapshots"
+        )
+    if args.fail_on_service_lifecycle_gap and (
+        args.service_restart_metric is None
+        or not any(value is not None for value in service_restart_bounds)
+    ):
+        parser.error(
+            "--fail-on-service-lifecycle-gap requires a service restart metric and bound"
+        )
+    if (
+        request_path_metrics is not None
+        and args.service_restart_metric in request_path_metrics.by_stage().values()
+    ):
+        parser.error("service restart and request-path metric names must be distinct")
     if telemetry_urls and (
         args.telemetry_baseline_prometheus or args.telemetry_prometheus
     ):
@@ -4720,6 +5057,7 @@ def parse_args() -> CliOptions:
             num_requests=args.num_requests,
             concurrency=args.concurrency,
             retries=args.retries,
+            retry_backoff_seconds=args.retry_backoff_seconds,
             request_rate_rps=args.request_rate_rps,
             propagate_trace_context=args.propagate_trace_context,
             output_dir=args.output_dir,
@@ -4762,6 +5100,9 @@ def parse_args() -> CliOptions:
         max_server_failure_rate=args.max_server_failure_rate,
         max_server_queue_fraction=args.max_server_queue_fraction,
         request_path_metrics=request_path_metrics,
+        service_restart_metric=args.service_restart_metric,
+        min_service_restarts=args.min_service_restarts,
+        max_service_restarts=args.max_service_restarts,
         batch_invariance_probes=args.batch_invariance_probes,
         batch_output_atol=args.batch_output_atol,
         batch_output_rtol=args.batch_output_rtol,
@@ -4775,6 +5116,7 @@ def parse_args() -> CliOptions:
         fail_on_trace_context_gap=args.fail_on_trace_context_gap,
         fail_on_retry_gate=args.fail_on_retry_gate,
         fail_on_request_path_gap=args.fail_on_request_path_gap,
+        fail_on_service_lifecycle_gap=args.fail_on_service_lifecycle_gap,
     )
 
 
@@ -4804,6 +5146,15 @@ def main() -> None:
         request_path_metrics=(
             options.request_path_metrics if options.telemetry_urls else None
         ),
+        service_restart_metric=(
+            options.service_restart_metric if options.telemetry_urls else None
+        ),
+        min_service_restarts=(
+            options.min_service_restarts if options.telemetry_urls else None
+        ),
+        max_service_restarts=(
+            options.max_service_restarts if options.telemetry_urls else None
+        ),
     )
     if options.workload_profile:
         metrics["workload_profile"] = asdict(options.workload_profile)
@@ -4825,6 +5176,9 @@ def main() -> None:
             max_server_failure_rate=options.max_server_failure_rate,
             max_server_queue_fraction=options.max_server_queue_fraction,
             request_path_metrics=options.request_path_metrics,
+            service_restart_metric=options.service_restart_metric,
+            min_service_restarts=options.min_service_restarts,
+            max_service_restarts=options.max_service_restarts,
         )
     if options.batch_invariance_probes:
         metrics["batch_invariance"] = run_batch_invariance_probe(
@@ -4908,6 +5262,17 @@ def main() -> None:
         and exit_code == 0
     ):
         exit_code = 7
+
+    service_lifecycle_gate = metrics.get("service_lifecycle_gate")
+    if (
+        options.fail_on_service_lifecycle_gap
+        and (
+            not isinstance(service_lifecycle_gate, dict)
+            or not service_lifecycle_gate.get("passed", False)
+        )
+        and exit_code == 0
+    ):
+        exit_code = 8
 
     if exit_code:
         raise SystemExit(exit_code)

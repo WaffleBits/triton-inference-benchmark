@@ -150,6 +150,7 @@ python benchmark.py \
   --num-requests 200 \
   --concurrency 16 \
   --retries 2 \
+  --retry-backoff-seconds 0.25 \
   --max-client-attempt-amplification 1.05 \
   --fail-on-retry-gate \
   --prometheus
@@ -167,6 +168,11 @@ under `warmup.retry` and is excluded from this gate.
 requests that eventually succeeded, including their failed attempts. Do not
 describe it as service MTTR, process restart time, or proof of autonomous
 remediation.
+
+The optional fixed `--retry-backoff-seconds` delay applies between failed client
+attempts. Record the same value for baseline and candidate runs. It is a
+configured retry policy, not a measured recovery interval or an adaptive
+backoff implementation.
 
 ### Request-path accounting
 
@@ -205,6 +211,47 @@ event. Review the backend-per-ingress ratio to see where aggregate attempts were
 absorbed, then use authorized traces and logs for causal diagnosis. Metric names,
 labels, raw scrapes, endpoint URLs, credentials, and trace identifiers stay out
 of the result artifact.
+
+### Service-lifecycle counter gate
+
+When an authorized service supervisor exposes a completed-restart counter, add
+it as another telemetry source and bound its paired-window delta:
+
+```bash
+python benchmark.py \
+  --mode openai \
+  --server-url http://inference.example.internal/v1 \
+  --model-name my-model \
+  --num-requests 200 \
+  --concurrency 16 \
+  --retries 2 \
+  --retry-backoff-seconds 0.25 \
+  --telemetry-url http://gateway.example.internal/metrics \
+  --telemetry-url http://model-server.example.internal/metrics \
+  --telemetry-url http://supervisor.example.internal/metrics \
+  --request-path-ingress-metric gateway_requests_received_total \
+  --request-path-backend-metric model_server_requests_received_total \
+  --request-path-success-metric model_server_requests_succeeded_total \
+  --fail-on-request-path-gap \
+  --service-restart-metric model_server_completed_restarts_total \
+  --min-service-restarts 1 \
+  --max-service-restarts 1 \
+  --fail-on-service-lifecycle-gap \
+  --prometheus
+```
+
+For normal release qualification, `--max-service-restarts 0` is the conservative
+boundary. Equal minimum and maximum values are useful only when the run includes
+an intentional external lifecycle event. Exit status 8 indicates an invalid or
+out-of-bounds lifecycle gate. The metric must be a cumulative integer counter;
+missing data, duplicate series, resets, and label churn fail closed.
+
+The JSON and Prometheus artifacts retain the completed-restart delta, bounds,
+gate result, and hashed identity/membership only. They do not retain raw metric
+names, labels, endpoint URLs, or scrapes. A restart delta plus recovered client
+requests is aggregate coexistence, not proof that a specific restart caused a
+specific recovery, that the replacement was healthy, or that the observed
+client latency was MTTR.
 
 ### Trace correlation
 
@@ -251,6 +298,7 @@ Use `--prometheus` to write a `.prom` file next to the JSON result. The text-for
 - separate warmup outcomes, duration, throughput, and latency when configured
 - privacy-safe ingress/backend/success deltas, adjacent-stage ratios, and the
   isolated-scope request-path gate when configured
+- privacy-safe completed-service-restart deltas and lifecycle bounds when configured
 
 The artifact can be pushed to a metrics gateway, archived by CI, or scraped from a shared results volume.
 
