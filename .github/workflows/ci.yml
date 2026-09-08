@@ -233,6 +233,9 @@ jobs:
       - name: Run supervised process-lifecycle qualification
         run: python tests/run_multi_process_path_fixture.py
 
+      - name: Run coordinated multi-client qualification
+        run: python tests/run_coordinated_client_fixture.py
+
       - name: Run bracketed-telemetry mock benchmark
         shell: bash
         run: |

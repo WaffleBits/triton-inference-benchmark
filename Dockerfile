@@ -6,7 +6,7 @@ COPY requirements.txt /app/
 RUN python -m pip install --no-cache-dir --upgrade pip==26.2.1 \
     && pip install --no-cache-dir -r /app/requirements.txt
 
-COPY benchmark.py /app/
+COPY benchmark.py coordinated_benchmark.py /app/
 
 RUN useradd --create-home --uid 10001 benchmark \
     && mkdir -p /app/benchmark_results \
