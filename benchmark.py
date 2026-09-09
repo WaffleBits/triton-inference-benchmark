@@ -144,6 +144,16 @@ class BenchmarkConfig:
 
 
 @dataclass(frozen=True)
+class CoordinatedClientConfig:
+    """Process-local inputs supplied by the single-host coordinator."""
+
+    run_id: str
+    client_index: int
+    client_count: int
+    planned_start_unix_ns: int
+
+
+@dataclass(frozen=True)
 class CostModelConfig:
     input_tokens_per_request: int = 0
     output_tokens_per_request: int = 0
@@ -234,6 +244,7 @@ class RequestPathMetricNames:
 @dataclass(frozen=True)
 class CliOptions:
     config: BenchmarkConfig
+    coordination: CoordinatedClientConfig | None = None
     workload_profile: WorkloadProfile | None = None
     cost_model_config: CostModelConfig | None = None
     llm_metrics_config: LlmMetricsConfig | None = None
@@ -1498,6 +1509,7 @@ def run_benchmark(
     service_restart_metric: str | None = None,
     min_service_restarts: int | None = None,
     max_service_restarts: int | None = None,
+    coordination: CoordinatedClientConfig | None = None,
 ) -> dict[str, object]:
     if telemetry_sample_interval_seconds < 0:
         raise ValueError("telemetry sample interval must be zero or greater")
@@ -1525,6 +1537,27 @@ def run_benchmark(
         min_service_restarts is not None or max_service_restarts is not None
     ) and service_restart_metric is None:
         raise ValueError("service restart bounds require a restart metric")
+    if coordination is not None:
+        if not coordination.run_id or len(coordination.run_id) > 256:
+            raise ValueError("coordinated run ID must contain 1 to 256 characters")
+        if (
+            not isinstance(coordination.client_count, int)
+            or isinstance(coordination.client_count, bool)
+            or not 2 <= coordination.client_count <= 64
+        ):
+            raise ValueError("coordinated client count must be between 2 and 64")
+        if (
+            not isinstance(coordination.client_index, int)
+            or isinstance(coordination.client_index, bool)
+            or not 0 <= coordination.client_index < coordination.client_count
+        ):
+            raise ValueError("coordinated client index is outside the client set")
+        if (
+            not isinstance(coordination.planned_start_unix_ns, int)
+            or isinstance(coordination.planned_start_unix_ns, bool)
+            or coordination.planned_start_unix_ns <= 0
+        ):
+            raise ValueError("coordinated start must be a positive Unix nanosecond value")
 
     warmup_results: list[InferenceResult] = []
     warmup_duration_seconds = 0.0
@@ -1559,6 +1592,14 @@ def run_benchmark(
         )
         sampler.start()
 
+    if coordination is not None:
+        remaining_ns = coordination.planned_start_unix_ns - time.time_ns()
+        if remaining_ns > 0:
+            time.sleep(remaining_ns / 1_000_000_000)
+        measured_start_unix_ns = time.time_ns()
+    else:
+        measured_start_unix_ns = None
+
     try:
         results, duration_seconds, load_schedule = _run_request_phase(
             client,
@@ -1568,6 +1609,9 @@ def run_benchmark(
             retry_backoff_seconds=config.retry_backoff_seconds,
             phase_started=phase_started if sampler is not None else None,
             request_rate_rps=config.request_rate_rps,
+        )
+        measured_end_unix_ns = (
+            time.time_ns() if coordination is not None else None
         )
     finally:
         stop_sampling.set()
@@ -1597,6 +1641,38 @@ def run_benchmark(
     }
     if load_schedule is not None:
         summary["load_schedule"] = load_schedule
+    if coordination is not None:
+        assert measured_start_unix_ns is not None
+        assert measured_end_unix_ns is not None
+        persisted_config = summary.get("config")
+        assert isinstance(persisted_config, dict)
+        fingerprint_config = dict(persisted_config)
+        fingerprint_config.pop("output_dir", None)
+        config_fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_config,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        summary["coordination"] = {
+            "run_id_sha256": hashlib.sha256(
+                coordination.run_id.encode("utf-8")
+            ).hexdigest(),
+            "run_id_persisted": False,
+            "config_fingerprint_sha256": config_fingerprint,
+            "client_index": coordination.client_index,
+            "client_count": coordination.client_count,
+            "planned_start_unix_ns": coordination.planned_start_unix_ns,
+            "measured_start_unix_ns": measured_start_unix_ns,
+            "measured_end_unix_ns": measured_end_unix_ns,
+            "clock": "host_wall_clock",
+            "scope": "single-host child process measured-request window",
+            "note": (
+                "Wall-clock timestamps support same-host coordination only; they do not "
+                "establish synchronized clocks across hosts."
+            ),
+        }
     if warmup_results:
         summary["warmup"] = _summarize_request_phase(
             warmup_results,
@@ -4482,6 +4558,16 @@ def parse_args() -> CliOptions:
     parser.add_argument("--output-dir", default="benchmark_results")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
+        "--coordinated-run-id",
+        help=(
+            "Coordinator-issued run identifier; only its SHA-256 fingerprint is "
+            "written to the child artifact."
+        ),
+    )
+    parser.add_argument("--coordinated-client-index", type=int)
+    parser.add_argument("--coordinated-client-count", type=int)
+    parser.add_argument("--coordinated-start-unix-ns", type=int)
+    parser.add_argument(
         "--openai-prompt",
         default="Return a short deterministic benchmark response.",
         help="Synthetic prompt used only by OpenAI-compatible streaming mode.",
@@ -4767,6 +4853,36 @@ def parse_args() -> CliOptions:
         parser.error("--request-rate-rps must be zero or greater")
     if args.retries < 0:
         parser.error("--retries must be zero or greater")
+    coordination_values = (
+        args.coordinated_run_id,
+        args.coordinated_client_index,
+        args.coordinated_client_count,
+        args.coordinated_start_unix_ns,
+    )
+    coordination: CoordinatedClientConfig | None = None
+    if any(value is not None for value in coordination_values) and not all(
+        value is not None for value in coordination_values
+    ):
+        parser.error("coordinated client options must be supplied together")
+    if all(value is not None for value in coordination_values):
+        assert args.coordinated_run_id is not None
+        assert args.coordinated_client_index is not None
+        assert args.coordinated_client_count is not None
+        assert args.coordinated_start_unix_ns is not None
+        if not args.coordinated_run_id or len(args.coordinated_run_id) > 256:
+            parser.error("--coordinated-run-id must contain 1 to 256 characters")
+        if not 2 <= args.coordinated_client_count <= 64:
+            parser.error("--coordinated-client-count must be between 2 and 64")
+        if not 0 <= args.coordinated_client_index < args.coordinated_client_count:
+            parser.error("--coordinated-client-index is outside the client set")
+        if args.coordinated_start_unix_ns <= 0:
+            parser.error("--coordinated-start-unix-ns must be positive")
+        coordination = CoordinatedClientConfig(
+            run_id=args.coordinated_run_id,
+            client_index=args.coordinated_client_index,
+            client_count=args.coordinated_client_count,
+            planned_start_unix_ns=args.coordinated_start_unix_ns,
+        )
     if not math.isfinite(args.retry_backoff_seconds) or args.retry_backoff_seconds < 0:
         parser.error("--retry-backoff-seconds must be finite and non-negative")
     if args.max_client_attempt_amplification is not None and (
@@ -5067,6 +5183,7 @@ def parse_args() -> CliOptions:
             openai_timeout_seconds=args.openai_timeout_seconds,
             openai_api_key_env=args.openai_api_key_env,
         ),
+        coordination=coordination,
         cost_model_config=CostModelConfig(
             input_tokens_per_request=input_tokens_per_request,
             output_tokens_per_request=output_tokens_per_request,
@@ -5155,6 +5272,7 @@ def main() -> None:
         max_service_restarts=(
             options.max_service_restarts if options.telemetry_urls else None
         ),
+        coordination=options.coordination,
     )
     if options.workload_profile:
         metrics["workload_profile"] = asdict(options.workload_profile)

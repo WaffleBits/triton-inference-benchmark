@@ -42,6 +42,30 @@ completion throughput remains a separate metric. The scheduler does not
 establish exact server arrival times, queue isolation, synchronized clocks,
 distributed traffic, or service capacity.
 
+## Same-Host Multi-Client Coordination
+
+`coordinated_benchmark.py` launches independent `benchmark.py` processes and
+assigns one future host-wall-clock start. Child artifacts retain a run-ID hash,
+a configuration hash, a numeric index/count, and their measured wall-clock
+window. The raw run ID is never serialized. The aggregate requires a complete,
+unique client-index set plus matching run/configuration fingerprints and planned
+starts. It gates actual start skew and requires overlapping request windows.
+
+Aggregate request, outcome, and retry values are sums of reconciled child
+counters. Aggregate successful-completion throughput divides all child successes
+by the union of the same-host measured windows. Per-client open-loop offered
+rates may be summed because their configuration and common window are checked.
+Latency percentiles are deliberately not merged: percentile summaries do not
+contain enough information for a valid global percentile, and averaging them
+would create a false measurement.
+
+The coordinator omits child paths, server URLs, prompts, outputs, and trace
+identifiers. It rejects telemetry, request-path, and service-lifecycle options:
+overlapping child snapshots of shared cumulative counters are not attributable
+to one child and would violate the existing isolation semantics. The protocol is
+single-host evidence. Wall-clock timestamps from different hosts are not accepted
+as synchronized, and the implementation does not claim multi-node load.
+
 ## Metrics
 
 The tool reports:
@@ -249,6 +273,7 @@ AI infrastructure repos often fail basic review because they cannot run without 
 
 - Add server-lifecycle hooks for controlled cold-start measurements.
 - Add request payload profiles by model family.
-- Add distributed load generation across multiple clients.
+- Extend coordinated clients beyond one host only with authenticated agents and
+  an explicit clock-quality protocol.
 - Exercise multi-source request-path accounting in an orchestrated router and
   model-server deployment rather than only the committed single-host fixture.

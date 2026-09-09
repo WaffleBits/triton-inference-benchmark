@@ -4,15 +4,18 @@
 
 Load-generation harness for Triton-style model serving. It drives concurrent
 requests, records latency percentiles, accounts for retries and failures,
-exports Prometheus text, and gates candidate runs against a saved baseline. A
-dependency-free mock backend runs in CI; an optional HTTP mode drives a real
-inference endpoint.
+coordinates independent client processes on one host, exports Prometheus text,
+and gates candidate runs against a saved baseline. A dependency-free mock
+backend runs in CI; an optional HTTP mode drives a real inference endpoint.
 
 ## Features
 
 - Concurrent load generation with configurable request and worker counts.
 - Optional open-loop constant-rate pacing for measured submissions, with
   client-side submission-lag statistics kept separate from completion throughput.
+- Same-host coordination for independent benchmark CLI processes, with common
+  start timing, complete-client/configuration validation, start-skew and overlap
+  gates, and privacy-safe aggregate request/retry/window artifacts.
 - Optional phase-separated warmup requests with their own outcomes, latency,
   throughput, JSON, and Prometheus records; headline and cost metrics remain
   scoped to the measured phase.
@@ -112,6 +115,41 @@ throughput. Concurrency remains the worker cap; requests can queue in the client
 executor if service time exceeds that capacity. This is single-process
 scheduling evidence, not proof of exact server arrival times, isolated server
 queues, synchronized clocks, or distributed load.
+
+Coordinate multiple independent benchmark processes against the same endpoint:
+
+```bash
+python coordinated_benchmark.py \
+  --clients 4 \
+  --output-dir coordinated_results \
+  --max-start-skew-ms 100 \
+  -- \
+  --mode openai \
+  --server-url http://localhost:8000/v1 \
+  --model-name local-model \
+  --num-requests 100 \
+  --concurrency 8 \
+  --request-rate-rps 25 \
+  --propagate-trace-context \
+  --fail-on-trace-context-gap \
+  --prometheus
+```
+
+The coordinator launches separate `benchmark.py` processes and gives them one
+future host-wall-clock start. Every child stores only SHA-256 fingerprints for
+the run ID and benchmark configuration, plus its numeric client index and
+measured window. The aggregate fails unless indexes are unique and complete,
+fingerprints and planned starts agree, actual starts stay within the configured
+skew, and the measured windows overlap. Aggregate completion throughput uses
+the union of the same-host child windows; configured open-loop rates are summed.
+
+Child percentile summaries cannot be merged exactly, so the aggregate does not
+average or relabel them as a global latency percentile. It also omits child
+paths, endpoint URLs, prompts, outputs, and trace identifiers. Shared server-
+counter windows are intentionally rejected by this coordinator because they
+cannot be attributed to an individual child. The checked fixture proves local
+multi-process coordination against a synthetic SSE server—not multi-node load,
+cross-host clock synchronization, a real model/GPU, or production isolation.
 
 Gate the extra client work used to recover failed logical requests:
 
@@ -437,6 +475,7 @@ server under test rather than the mock generator.
 
 ```bash
 python -m unittest discover -s tests
+python tests/run_coordinated_client_fixture.py
 ```
 
 ## More
@@ -448,6 +487,7 @@ python -m unittest discover -s tests
 ## Roadmap
 
 - Server-lifecycle hooks for controlled cold-start measurements.
-- Coordinated distributed load generation for multi-client benchmarking.
+- Extend same-host multi-client coordination to authenticated multi-node agents
+  with an explicit cross-host clock-quality protocol.
 - Exercise the multi-source path gate in a real orchestrated router/model-server
   deployment; the committed qualification remains a synthetic single-host fixture.
