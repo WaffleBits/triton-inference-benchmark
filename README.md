@@ -4,9 +4,10 @@
 
 Load-generation harness for Triton-style model serving. It drives concurrent
 requests, records latency percentiles, accounts for retries and failures,
-coordinates independent client processes on one host, exports Prometheus text,
-and gates candidate runs against a saved baseline. A dependency-free mock
-backend runs in CI; an optional HTTP mode drives a real inference endpoint.
+coordinates independent client processes locally or through authenticated
+agents, exports Prometheus text, and gates candidate runs against a saved
+baseline. A dependency-free mock backend runs in CI; an optional HTTP mode
+drives a real inference endpoint.
 
 ## Features
 
@@ -16,6 +17,9 @@ backend runs in CI; an optional HTTP mode drives a real inference endpoint.
 - Same-host coordination for independent benchmark CLI processes, with common
   start timing, complete-client/configuration validation, start-skew and overlap
   gates, and privacy-safe aggregate request/retry/window artifacts.
+- Authenticated remote-agent coordination with explicit opt-in credentials,
+  NTP-style clock sampling, conservative skew/overlap/throughput bounds, replay
+  rejection, and no agent URLs or authorization data in aggregate artifacts.
 - Optional phase-separated warmup requests with their own outcomes, latency,
   throughput, JSON, and Prometheus records; headline and cost metrics remain
   scoped to the measured phase.
@@ -150,6 +154,77 @@ counter windows are intentionally rejected by this coordinator because they
 cannot be attributed to an individual child. The checked fixture proves local
 multi-process coordination against a synthetic SSE server—not multi-node load,
 cross-host clock synchronization, a real model/GPU, or production isolation.
+
+### Coordinate authenticated agents
+
+Start the same checked-in agent on each authorized load-generator host. Put it
+behind TLS for every non-loopback deployment; the client rejects cleartext
+non-loopback agent URLs. The bearer key is read only from the environment
+variable explicitly named on both sides.
+
+```bash
+export BENCHMARK_AGENT_KEY="replace-with-an-operator-managed-secret"
+
+python remote_agent.py \
+  --listen-host 127.0.0.1 \
+  --port 8081 \
+  --agent-id loadgen-a \
+  --api-key-env BENCHMARK_AGENT_KEY
+```
+
+Repeat `--agent-url` once per client when launching the coordinator:
+
+```bash
+python coordinated_benchmark.py \
+  --clients 2 \
+  --agent-url https://loadgen-a.example.internal \
+  --agent-url https://loadgen-b.example.internal \
+  --agent-api-key-env BENCHMARK_AGENT_KEY \
+  --clock-samples 5 \
+  --max-clock-uncertainty-ms 25 \
+  --max-start-skew-ms 100 \
+  --output-dir coordinated_results \
+  -- \
+  --mode openai \
+  --server-url https://inference.example.internal/v1 \
+  --model-name local-model \
+  --num-requests 100 \
+  --concurrency 8 \
+  --request-rate-rps 25 \
+  --propagate-trace-context \
+  --fail-on-trace-context-gap \
+  --prometheus
+```
+
+Before workload launch, the coordinator sends multiple authenticated clock
+challenges and chooses each agent's minimum-network-delay sample. It estimates
+agent-minus-coordinator offset and an uncertainty bound, translates planned and
+measured windows into the coordinator clock domain, and fails before launch if
+clock uncertainty exceeds the configured limit. The final gate uses the sum of
+two worst-case clock uncertainties to report a start-skew upper bound and an
+overlap lower bound. It reports normalized observed throughput separately from
+a conservative lower bound based on the union-duration upper bound.
+
+The agent accepts a bounded JSON protocol, invokes only this repository's
+`benchmark.py`, rejects coordinator-owned/shared-counter options, and remembers
+a bounded set of hashed run/client identities to reject replays. One explicitly
+selected bearer key is sent to every configured agent, so combine only agents
+authorized to receive that credential. Authenticated requests do not follow
+redirects, keeping the bearer key pinned to the selected agent origin. Benchmark
+children receive only `PATH`, `PYTHONIOENCODING`, and values named by an
+agent-side `--allow-child-env`; the agent's own API-key variable cannot be
+allowed. A live target credential therefore requires opt-in by both the agent
+operator and the benchmark CLI.
+Raw keys, challenges, agent IDs, URLs, child paths, endpoints, prompts, outputs,
+and trace IDs are absent from the aggregate. Hashed agent identities establish
+protocol-level distinctness, not proof of separate physical machines.
+
+CI exercises two agent services, two real benchmark child processes, and one
+synthetic SSE target on a single host. That fixture proves authentication,
+replay rejection, CLI wiring, clock accounting, trace uniqueness, and artifact
+redaction over loopback. It does not prove multi-host or production-network
+behavior, hardware clock synchronization, a model/GPU, traffic isolation, or
+fleet scale.
 
 Gate the extra client work used to recover failed logical requests:
 
@@ -476,6 +551,7 @@ server under test rather than the mock generator.
 ```bash
 python -m unittest discover -s tests
 python tests/run_coordinated_client_fixture.py
+python tests/run_remote_agent_fixture.py
 ```
 
 ## More
@@ -487,7 +563,8 @@ python tests/run_coordinated_client_fixture.py
 ## Roadmap
 
 - Server-lifecycle hooks for controlled cold-start measurements.
-- Extend same-host multi-client coordination to authenticated multi-node agents
-  with an explicit cross-host clock-quality protocol.
+- Exercise authenticated agents on separate authorized hosts behind TLS, then
+  qualify clock drift and controlled network faults without weakening the
+  conservative time bounds.
 - Exercise the multi-source path gate in a real orchestrated router/model-server
   deployment; the committed qualification remains a synthetic single-host fixture.

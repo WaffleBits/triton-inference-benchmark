@@ -59,12 +59,49 @@ Latency percentiles are deliberately not merged: percentile summaries do not
 contain enough information for a valid global percentile, and averaging them
 would create a false measurement.
 
-The coordinator omits child paths, server URLs, prompts, outputs, and trace
+The local coordinator omits child paths, server URLs, prompts, outputs, and trace
 identifiers. It rejects telemetry, request-path, and service-lifecycle options:
 overlapping child snapshots of shared cumulative counters are not attributable
-to one child and would violate the existing isolation semantics. The protocol is
-single-host evidence. Wall-clock timestamps from different hosts are not accepted
-as synchronized, and the implementation does not claim multi-node load.
+to one child and would violate the existing isolation semantics. Local mode is
+single-host evidence and does not accept its wall-clock timestamps as evidence
+about synchronized clocks on different hosts.
+
+## Authenticated Remote-Agent Coordination
+
+Remote mode keeps the existing benchmark and shard contracts but replaces local
+child launch with an authenticated HTTP agent. The operator must explicitly name
+the bearer-key environment variable; no ambient credential is selected. Agent
+URLs may use cleartext HTTP only on loopback and otherwise require HTTPS. The
+authenticated client refuses redirects so the bearer key cannot move to a
+different origin. The aggregate excludes authorization data, raw challenges,
+agent URLs, raw agent IDs, child paths, target endpoints, prompts, outputs, and
+trace identifiers.
+
+Before choosing a start time, the coordinator sends 1 to 20 authenticated clock
+challenges to each agent. For each exchange it records coordinator send/receive
+and agent receive/send times in memory. Agent processing time is subtracted from
+the round trip. The minimum-network-delay sample supplies the NTP-style midpoint
+offset and half-delay uncertainty. Raw challenges do not survive the exchange;
+the response echoes only a SHA-256 challenge fingerprint.
+
+The coordinator translates each planned start and measured window from agent
+time into its own wall-clock domain. Because sampled clock offsets are uncertain,
+it does not treat normalized boundaries as exact: the aggregate adds twice the
+largest selected uncertainty to observed start skew and union duration, and
+subtracts the same margin from observed overlap. The gate uses that start-skew
+upper bound and overlap lower bound. Successful-completion throughput over the
+normalized observed union is reported separately from a conservative lower bound
+that uses the union-duration upper bound.
+
+The service invokes only the repository's `benchmark.py`, bounds request and
+argument sizes, gives children a minimal environment plus explicitly allowed
+variables, serializes one job at a time, and retains a bounded set of hashed
+run/client identities to reject replay. The agent authentication variable is
+never eligible for child inheritance. A hashed agent ID must be stable across
+clock probes and execution, and every shard needs a unique hash. Those checks
+show protocol identity, not separate physical hosts, trustworthy time hardware,
+or production network isolation. The deterministic fixture runs two agents and
+two child processes over loopback; actual multi-host behavior remains unmeasured.
 
 ## Metrics
 
