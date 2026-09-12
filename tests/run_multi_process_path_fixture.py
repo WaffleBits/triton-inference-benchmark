@@ -93,7 +93,7 @@ def validate_artifacts(
     assert metrics["request_path_gate"]["passed"] is True
     assert metrics["retry_gate"]["passed"] is True
     assert metrics["trace_context_gate"]["passed"] is True
-    assert metrics["config"]["retry_backoff_seconds"] == 0.25
+    assert metrics["config"]["retry_backoff_seconds"] == 0.75
 
     backend_state = json.loads(backend_state_path.read_text(encoding="utf-8"))
     assert backend_state == {
@@ -219,7 +219,9 @@ def main() -> None:
                 "--retries",
                 "2",
                 "--retry-backoff-seconds",
-                "0.25",
+                # Leave enough time for a fresh Python backend process on
+                # constrained CI hosts; this is configured fixture delay, not MTTR.
+                "0.75",
                 "--propagate-trace-context",
                 "--fail-on-trace-context-gap",
                 "--telemetry-url",

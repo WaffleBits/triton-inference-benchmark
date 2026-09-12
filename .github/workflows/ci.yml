@@ -236,6 +236,9 @@ jobs:
       - name: Run coordinated multi-client qualification
         run: python tests/run_coordinated_client_fixture.py
 
+      - name: Run authenticated remote-agent qualification
+        run: python tests/run_remote_agent_fixture.py
+
       - name: Run bracketed-telemetry mock benchmark
         shell: bash
         run: |

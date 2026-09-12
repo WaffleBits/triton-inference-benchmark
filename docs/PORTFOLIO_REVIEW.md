@@ -27,6 +27,12 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
   privacy-safe fingerprints, and an exact isolated-scope gate.
 - A real CLI qualification through separate local router and backend processes,
   with controlled failures at both boundaries and independent counters.
+- Authenticated remote-agent execution with explicit credential selection,
+  bounded/replay-resistant requests, sampled clock offset and uncertainty, and
+  conservative start-skew, overlap, and throughput bounds.
+- A real loopback qualification through two agent services and two benchmark
+  child processes, with invalid-auth and replay-negative checks. It is protocol
+  evidence, not a multi-host or production-network measurement.
 - Phase-separated warmup evidence that is excluded from measured latency,
   throughput, regression, streaming-token, and cost results.
 - A live Triton HTTP path and an OpenAI-compatible streaming path for authorized model-serving infrastructure.
@@ -58,7 +64,8 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 ## Gaps Worth Closing Next
 
 - Add controlled server-lifecycle hooks for defensible cold-start measurements.
-- Add coordinated distributed load generation across multiple clients.
+- Exercise the authenticated agent path on separate authorized hosts behind TLS
+  and test bounded clock drift and network faults.
 - Exercise the multi-source path qualification in an orchestrated router and
   model-server deployment; the committed fixture is synthetic and single-host.
 - Add saved benchmark reports with trend comparisons over time.

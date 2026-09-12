@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
+import os
 import re
 import secrets
 import subprocess
@@ -12,6 +14,12 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+
+from remote_agent import (
+    probe_agent_clock,
+    run_agent_benchmark,
+    validate_agent_base_url,
+)
 
 ROOT = Path(__file__).resolve().parent
 HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -344,8 +352,338 @@ def build_coordinated_summary(
     }
 
 
+def _integer_value(
+    mapping: dict[str, Any], key: str, scope: str, *, nonnegative: bool = False
+) -> int:
+    value = mapping.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{scope}.{key} must be an integer")
+    if nonnegative and value < 0:
+        raise ValueError(f"{scope}.{key} must be non-negative")
+    return value
+
+
+def build_remote_coordinated_summary(
+    shards: list[dict[str, object]],
+    max_start_skew_ms: float,
+    max_clock_uncertainty_ms: float,
+) -> dict[str, object]:
+    """Normalize authenticated agent windows and report conservative time bounds."""
+    if (
+        not math.isfinite(max_clock_uncertainty_ms)
+        or max_clock_uncertainty_ms < 0
+    ):
+        raise ValueError("maximum clock uncertainty must be finite and non-negative")
+
+    normalized_shards: list[dict[str, object]] = []
+    agent_records: list[dict[str, object]] = []
+    agent_hashes: set[str] = set()
+    planned_starts: set[int] = set()
+    uncertainties_ns: list[int] = []
+
+    for position, raw_shard in enumerate(shards):
+        shard_data = dict(raw_shard)
+        remote = _mapping(
+            shard_data.pop("_remote_agent", None), f"shard[{position}]._remote_agent"
+        )
+        coordination = _mapping(
+            shard_data.get("coordination"), f"shard[{position}].coordination"
+        )
+        if coordination.get("clock") != "host_wall_clock":
+            raise ValueError("remote child artifact must use its agent wall clock")
+
+        agent_hash = remote.get("agent_id_sha256")
+        if not isinstance(agent_hash, str) or HASH_PATTERN.fullmatch(agent_hash) is None:
+            raise ValueError("remote agent identity must be lowercase SHA-256")
+        if remote.get("agent_id_persisted") is not False:
+            raise ValueError("remote agent did not confirm raw identity redaction")
+        if remote.get("clock_selection") != "minimum_network_delay":
+            raise ValueError("remote clock selection method is unsupported")
+        offset_ns = _integer_value(
+            remote,
+            "clock_offset_agent_minus_coordinator_ns",
+            f"shard[{position}]._remote_agent",
+        )
+        network_delay_ns = _integer_value(
+            remote,
+            "clock_network_delay_ns",
+            f"shard[{position}]._remote_agent",
+            nonnegative=True,
+        )
+        uncertainty_ns = _integer_value(
+            remote,
+            "clock_uncertainty_ns",
+            f"shard[{position}]._remote_agent",
+            nonnegative=True,
+        )
+        sample_count = _integer_value(
+            remote,
+            "clock_sample_count",
+            f"shard[{position}]._remote_agent",
+            nonnegative=True,
+        )
+        if sample_count <= 0:
+            raise ValueError("remote clock sample count must be positive")
+        if uncertainty_ns != (network_delay_ns + 1) // 2:
+            raise ValueError("remote clock uncertainty did not match network delay")
+        planned_coordinator_ns = _integer_value(
+            remote,
+            "planned_start_coordinator_unix_ns",
+            f"shard[{position}]._remote_agent",
+            nonnegative=True,
+        )
+        if planned_coordinator_ns <= 0:
+            raise ValueError("remote coordinator planned start must be positive")
+
+        planned_agent_ns = _positive_int(
+            coordination,
+            "planned_start_unix_ns",
+            f"shard[{position}].coordination",
+        )
+        if planned_agent_ns - offset_ns != planned_coordinator_ns:
+            raise ValueError("remote planned start did not reconcile across clock domains")
+        measured_start_agent_ns = _positive_int(
+            coordination,
+            "measured_start_unix_ns",
+            f"shard[{position}].coordination",
+        )
+        measured_end_agent_ns = _positive_int(
+            coordination,
+            "measured_end_unix_ns",
+            f"shard[{position}].coordination",
+        )
+        normalized_start_ns = measured_start_agent_ns - offset_ns
+        normalized_end_ns = measured_end_agent_ns - offset_ns
+        if normalized_start_ns <= 0 or normalized_end_ns <= normalized_start_ns:
+            raise ValueError("remote normalized measured window is invalid")
+
+        normalized_coordination = dict(coordination)
+        normalized_coordination.update(
+            {
+                "planned_start_unix_ns": planned_coordinator_ns,
+                "measured_start_unix_ns": normalized_start_ns,
+                "measured_end_unix_ns": normalized_end_ns,
+                "clock": "host_wall_clock",
+            }
+        )
+        shard_data["coordination"] = normalized_coordination
+        normalized_shards.append(shard_data)
+        agent_hashes.add(agent_hash)
+        planned_starts.add(planned_coordinator_ns)
+        uncertainties_ns.append(uncertainty_ns)
+        agent_records.append(
+            {
+                "agent_id_sha256": agent_hash,
+                "clock_offset_agent_minus_coordinator_ns": offset_ns,
+                "clock_network_delay_ms": round(network_delay_ns / 1_000_000, 6),
+                "clock_uncertainty_ms": round(uncertainty_ns / 1_000_000, 6),
+                "clock_sample_count": sample_count,
+            }
+        )
+
+    if len(agent_hashes) != len(shards):
+        raise ValueError("remote coordination requires unique agent identities")
+    if len(planned_starts) != 1:
+        raise ValueError("remote coordinator planned-start mismatch")
+
+    summary = build_coordinated_summary(normalized_shards, max_start_skew_ms)
+    window = _mapping(summary.get("window"), "window")
+    observed_union_seconds = _finite_number(
+        window, "union_duration_seconds", "window"
+    )
+    observed_overlap_seconds = _finite_number(
+        window, "overlap_duration_seconds", "window"
+    )
+    observed_start_skew_ms = _finite_number(window, "start_skew_ms", "window")
+    max_uncertainty_ns = max(uncertainties_ns)
+    two_clock_margin_ns = 2 * max_uncertainty_ns
+    start_skew_upper_bound_ms = observed_start_skew_ms + (
+        two_clock_margin_ns / 1_000_000
+    )
+    union_upper_bound_seconds = observed_union_seconds + (
+        two_clock_margin_ns / 1_000_000_000
+    )
+    overlap_lower_bound_seconds = max(
+        0.0,
+        observed_overlap_seconds - (two_clock_margin_ns / 1_000_000_000),
+    )
+    max_uncertainty_ms = max_uncertainty_ns / 1_000_000
+
+    failure_reasons: list[str] = []
+    if max_uncertainty_ms > max_clock_uncertainty_ms:
+        failure_reasons.append(
+            f"clock uncertainty {max_uncertainty_ms:g} ms exceeded "
+            f"{max_clock_uncertainty_ms:g} ms"
+        )
+    if start_skew_upper_bound_ms > max_start_skew_ms:
+        failure_reasons.append(
+            f"conservative client start skew {start_skew_upper_bound_ms:g} ms "
+            f"exceeded {max_start_skew_ms:g} ms"
+        )
+    if overlap_lower_bound_seconds <= 0:
+        failure_reasons.append(
+            "client windows did not conservatively overlap after clock uncertainty"
+        )
+
+    observed_throughput = _finite_number(summary, "throughput_rps", "summary")
+    successful_requests = _nonnegative_int(
+        summary, "successful_requests", "summary"
+    )
+    summary.pop("throughput_rps")
+    summary.update(
+        {
+            "schema_version": 2,
+            "scope": "authenticated_remote_agents",
+            "agent_protocol": {
+                "schema_version": 1,
+                "authentication": "explicit_bearer_key_environment_variable",
+                "transport_policy": "https_or_loopback_http",
+                "replay_identity": "sha256_run_id_and_client_index",
+            },
+            "agent_identity_fingerprints_sha256": sorted(agent_hashes),
+            "clock_quality": {
+                "method": "ntp_style_minimum_network_delay_sample",
+                "max_uncertainty_ms": round(max_uncertainty_ms, 6),
+                "max_allowed_uncertainty_ms": max_clock_uncertainty_ms,
+                "passed": max_uncertainty_ms <= max_clock_uncertainty_ms,
+                "agents": sorted(
+                    agent_records, key=lambda item: str(item["agent_id_sha256"])
+                ),
+            },
+            "window": {
+                "clock": "coordinator_wall_clock_estimated_from_agent_samples",
+                "planned_start_unix_ns": next(iter(planned_starts)),
+                "observed_earliest_normalized_start_unix_ns": window[
+                    "earliest_measured_start_unix_ns"
+                ],
+                "observed_latest_normalized_end_unix_ns": window[
+                    "latest_measured_end_unix_ns"
+                ],
+                "observed_union_duration_seconds": round(
+                    observed_union_seconds, 6
+                ),
+                "union_duration_upper_bound_seconds": round(
+                    union_upper_bound_seconds, 6
+                ),
+                "observed_overlap_duration_seconds": round(
+                    observed_overlap_seconds, 6
+                ),
+                "overlap_duration_lower_bound_seconds": round(
+                    overlap_lower_bound_seconds, 6
+                ),
+                "observed_start_skew_ms": round(observed_start_skew_ms, 6),
+                "start_skew_upper_bound_ms": round(
+                    start_skew_upper_bound_ms, 6
+                ),
+            },
+            "throughput": {
+                "observed_normalized_rps": round(observed_throughput, 4),
+                "conservative_lower_bound_rps": round(
+                    successful_requests / union_upper_bound_seconds, 4
+                ),
+                "note": (
+                    "Both values use clock-normalized agent windows. The lower bound "
+                    "uses the union-duration upper bound from sampled clock uncertainty."
+                ),
+            },
+            "coordination_gate": {
+                "passed": not failure_reasons,
+                "max_start_skew_ms": max_start_skew_ms,
+                "max_clock_uncertainty_ms": max_clock_uncertainty_ms,
+                "requires_conservative_overlapping_windows": True,
+                "failure_reasons": failure_reasons,
+            },
+            "claim_boundary": (
+                "This artifact proves authenticated agent protocol execution, sampled "
+                "clock normalization, and conservative shard reconciliation. Agent "
+                "identity fingerprints do not prove separate physical hosts. It does "
+                "not prove production-network behavior, synchronized hardware clocks, "
+                "a model or GPU, traffic isolation, or fleet scale."
+            ),
+        }
+    )
+    privacy = _mapping(summary.get("privacy"), "privacy")
+    privacy.update(
+        {
+            "agent_urls_persisted": False,
+            "authorization_persisted": False,
+            "clock_challenges_persisted": False,
+            "raw_agent_ids_persisted": False,
+        }
+    )
+    summary["privacy"] = privacy
+    return summary
+
+
+def _format_remote_prometheus(summary: dict[str, object]) -> str:
+    window = _mapping(summary.get("window"), "window")
+    throughput = _mapping(summary.get("throughput"), "throughput")
+    clock = _mapping(summary.get("clock_quality"), "clock_quality")
+    gate = _mapping(summary.get("coordination_gate"), "coordination_gate")
+    lines = [
+        "# HELP triton_coordinated_clients Authenticated benchmark agent clients.",
+        "# TYPE triton_coordinated_clients gauge",
+        f"triton_coordinated_clients {_nonnegative_int(summary, 'client_count', 'summary')}",
+        "# HELP triton_coordinated_requests_total Measured logical requests by outcome.",
+        "# TYPE triton_coordinated_requests_total counter",
+        'triton_coordinated_requests_total{outcome="success"} '
+        f"{_nonnegative_int(summary, 'successful_requests', 'summary')}",
+        'triton_coordinated_requests_total{outcome="failure"} '
+        f"{_nonnegative_int(summary, 'failed_requests', 'summary')}",
+        "# HELP triton_coordinated_client_attempts_total Physical client attempts across all agents.",
+        "# TYPE triton_coordinated_client_attempts_total counter",
+        f"triton_coordinated_client_attempts_total {_nonnegative_int(summary, 'client_attempts', 'summary')}",
+        "# HELP triton_coordinated_window_observed_duration_seconds Clock-normalized observed union window.",
+        "# TYPE triton_coordinated_window_observed_duration_seconds gauge",
+        "triton_coordinated_window_observed_duration_seconds "
+        f"{_finite_number(window, 'observed_union_duration_seconds', 'window'):g}",
+        "# HELP triton_coordinated_window_duration_upper_bound_seconds Conservative union window after clock uncertainty.",
+        "# TYPE triton_coordinated_window_duration_upper_bound_seconds gauge",
+        "triton_coordinated_window_duration_upper_bound_seconds "
+        f"{_finite_number(window, 'union_duration_upper_bound_seconds', 'window'):g}",
+        "# HELP triton_coordinated_throughput_observed_rps Successful requests over the normalized observed union window.",
+        "# TYPE triton_coordinated_throughput_observed_rps gauge",
+        "triton_coordinated_throughput_observed_rps "
+        f"{_finite_number(throughput, 'observed_normalized_rps', 'throughput'):g}",
+        "# HELP triton_coordinated_throughput_lower_bound_rps Successful requests over the conservative union-window upper bound.",
+        "# TYPE triton_coordinated_throughput_lower_bound_rps gauge",
+        "triton_coordinated_throughput_lower_bound_rps "
+        f"{_finite_number(throughput, 'conservative_lower_bound_rps', 'throughput'):g}",
+        "# HELP triton_coordinated_start_skew_observed_ms Clock-normalized observed client start skew.",
+        "# TYPE triton_coordinated_start_skew_observed_ms gauge",
+        "triton_coordinated_start_skew_observed_ms "
+        f"{_finite_number(window, 'observed_start_skew_ms', 'window'):g}",
+        "# HELP triton_coordinated_start_skew_upper_bound_ms Conservative client start skew after clock uncertainty.",
+        "# TYPE triton_coordinated_start_skew_upper_bound_ms gauge",
+        "triton_coordinated_start_skew_upper_bound_ms "
+        f"{_finite_number(window, 'start_skew_upper_bound_ms', 'window'):g}",
+        "# HELP triton_coordinated_clock_uncertainty_max_ms Maximum selected agent clock uncertainty.",
+        "# TYPE triton_coordinated_clock_uncertainty_max_ms gauge",
+        "triton_coordinated_clock_uncertainty_max_ms "
+        f"{_finite_number(clock, 'max_uncertainty_ms', 'clock_quality'):g}",
+        "# HELP triton_coordinated_gate_passed Whether authentication, clock, overlap, and start-skew checks passed.",
+        "# TYPE triton_coordinated_gate_passed gauge",
+        f"triton_coordinated_gate_passed {1 if gate.get('passed') is True else 0}",
+    ]
+    configured_rate = summary.get("configured_aggregate_request_rate_rps")
+    if isinstance(configured_rate, (int, float)) and not isinstance(
+        configured_rate, bool
+    ):
+        lines.extend(
+            [
+                "# HELP triton_coordinated_configured_request_rate_rps Sum of configured per-agent open-loop request rates.",
+                "# TYPE triton_coordinated_configured_request_rate_rps gauge",
+                f"triton_coordinated_configured_request_rate_rps {float(configured_rate):g}",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
 def format_coordinated_prometheus(summary: dict[str, object]) -> str:
     """Export aggregate scalar evidence without run IDs, paths, or endpoints."""
+    if summary.get("scope") == "authenticated_remote_agents":
+        return _format_remote_prometheus(summary)
+
     window = _mapping(summary.get("window"), "window")
     gate = _mapping(summary.get("coordination_gate"), "coordination_gate")
     lines = [
@@ -395,13 +733,28 @@ def format_coordinated_prometheus(summary: dict[str, object]) -> str:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Coordinate independent same-host benchmark client processes."
+        description=(
+            "Coordinate independent benchmark client processes locally or through "
+            "authenticated remote agents."
+        )
     )
     parser.add_argument("--clients", type=int, default=2)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--lead-time-ms", type=float, default=750.0)
     parser.add_argument("--max-start-skew-ms", type=float, default=100.0)
     parser.add_argument("--timeout-seconds", type=float, default=120.0)
+    parser.add_argument(
+        "--agent-url",
+        action="append",
+        default=[],
+        help="Authenticated agent base URL; repeat once per client.",
+    )
+    parser.add_argument(
+        "--agent-api-key-env",
+        help="Environment variable containing the bearer key for all selected agents.",
+    )
+    parser.add_argument("--clock-samples", type=int, default=5)
+    parser.add_argument("--max-clock-uncertainty-ms", type=float, default=25.0)
     parser.add_argument("benchmark_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if not 2 <= args.clients <= MAX_CLIENTS:
@@ -412,6 +765,42 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--max-start-skew-ms must be finite and non-negative")
     if not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be finite and greater than zero")
+    if not 1 <= args.clock_samples <= 20:
+        parser.error("--clock-samples must be between 1 and 20")
+    if (
+        not math.isfinite(args.max_clock_uncertainty_ms)
+        or args.max_clock_uncertainty_ms < 0
+    ):
+        parser.error("--max-clock-uncertainty-ms must be finite and non-negative")
+
+    try:
+        args.agent_url = [validate_agent_base_url(url) for url in args.agent_url]
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.agent_url:
+        if len(args.agent_url) != args.clients:
+            parser.error("--agent-url must be repeated exactly once per client")
+        if len(set(args.agent_url)) != len(args.agent_url):
+            parser.error("agent URLs must be unique")
+        if not args.agent_api_key_env:
+            parser.error("--agent-api-key-env is required with --agent-url")
+        api_key = os.environ.get(args.agent_api_key_env)
+        if (
+            api_key is None
+            or not 16 <= len(api_key) <= 4096
+            or "\r" in api_key
+            or "\n" in api_key
+        ):
+            parser.error(
+                "the selected agent API-key environment variable must contain "
+                "16 to 4096 characters"
+            )
+        args.agent_api_key = api_key
+    else:
+        if args.agent_api_key_env:
+            parser.error("--agent-api-key-env requires at least one --agent-url")
+        args.agent_api_key = None
+
     benchmark_args = list(args.benchmark_args)
     if benchmark_args and benchmark_args[0] == "--":
         benchmark_args = benchmark_args[1:]
@@ -436,13 +825,7 @@ def _stop_processes(processes: list[subprocess.Popen[str]]) -> None:
                 process.wait(timeout=3)
 
 
-def main() -> None:
-    args = _parse_args()
-    output_dir = Path(args.output_dir)
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise SystemExit("coordinated output directory must be empty")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+def _run_local_clients(args: argparse.Namespace, output_dir: Path) -> dict[str, object]:
     run_id = secrets.token_hex(32)
     planned_start_ns = time.time_ns() + int(args.lead_time_ms * 1_000_000)
     processes: list[subprocess.Popen[str]] = []
@@ -506,8 +889,103 @@ def main() -> None:
         if not isinstance(raw, dict):
             raise RuntimeError("coordinated client artifact must contain a JSON object")
         shards.append(raw)
+    return build_coordinated_summary(shards, args.max_start_skew_ms)
 
-    summary = build_coordinated_summary(shards, args.max_start_skew_ms)
+
+def _run_remote_clients(args: argparse.Namespace) -> dict[str, object]:
+    api_key = args.agent_api_key
+    if not isinstance(api_key, str):
+        raise RuntimeError("remote agent authentication was not configured")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.clients) as executor:
+        clock_futures = [
+            executor.submit(
+                probe_agent_clock,
+                agent_url,
+                api_key=api_key,
+                sample_count=args.clock_samples,
+                timeout_seconds=min(args.timeout_seconds, 10.0),
+            )
+            for agent_url in args.agent_url
+        ]
+        clock_profiles = [future.result() for future in clock_futures]
+
+    agent_hashes = [profile.get("agent_id_sha256") for profile in clock_profiles]
+    if (
+        any(
+            not isinstance(value, str) or HASH_PATTERN.fullmatch(value) is None
+            for value in agent_hashes
+        )
+        or len(set(agent_hashes)) != args.clients
+    ):
+        raise RuntimeError("remote coordination requires unique stable agent identities")
+    uncertainties_ns = [
+        profile.get("clock_uncertainty_ns") for profile in clock_profiles
+    ]
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in uncertainties_ns
+    ):
+        raise RuntimeError("remote agent returned invalid clock uncertainty")
+    max_uncertainty_ms = max(int(value) for value in uncertainties_ns) / 1_000_000
+    if max_uncertainty_ms > args.max_clock_uncertainty_ms:
+        raise RuntimeError(
+            f"remote clock uncertainty {max_uncertainty_ms:g} ms exceeded "
+            f"{args.max_clock_uncertainty_ms:g} ms before workload launch"
+        )
+
+    run_id = secrets.token_hex(32)
+    planned_coordinator_ns = time.time_ns() + int(args.lead_time_ms * 1_000_000)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.clients) as executor:
+        run_futures = []
+        for client_index, (agent_url, profile) in enumerate(
+            zip(args.agent_url, clock_profiles)
+        ):
+            offset_ns = profile.get("clock_offset_agent_minus_coordinator_ns")
+            agent_hash = profile.get("agent_id_sha256")
+            if not isinstance(offset_ns, int) or isinstance(offset_ns, bool):
+                raise RuntimeError("remote agent returned invalid clock offset")
+            assert isinstance(agent_hash, str)
+            run_futures.append(
+                executor.submit(
+                    run_agent_benchmark,
+                    agent_url,
+                    api_key=api_key,
+                    expected_agent_id_sha256=agent_hash,
+                    run_id=run_id,
+                    client_index=client_index,
+                    client_count=args.clients,
+                    planned_start_agent_unix_ns=planned_coordinator_ns + offset_ns,
+                    benchmark_args=args.benchmark_args,
+                    timeout_seconds=args.timeout_seconds,
+                )
+            )
+        shards = [future.result() for future in run_futures]
+
+    for shard, profile in zip(shards, clock_profiles):
+        shard["_remote_agent"] = {
+            **profile,
+            "planned_start_coordinator_unix_ns": planned_coordinator_ns,
+        }
+    return build_remote_coordinated_summary(
+        shards,
+        max_start_skew_ms=args.max_start_skew_ms,
+        max_clock_uncertainty_ms=args.max_clock_uncertainty_ms,
+    )
+
+
+def main() -> None:
+    args = _parse_args()
+    output_dir = Path(args.output_dir)
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise SystemExit("coordinated output directory must be empty")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.agent_url:
+        summary = _run_remote_clients(args)
+    else:
+        summary = _run_local_clients(args, output_dir)
+
     json_path = output_dir / "coordinated_benchmark.json"
     prometheus_path = output_dir / "coordinated_benchmark.prom"
     json_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

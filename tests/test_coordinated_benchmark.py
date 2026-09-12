@@ -15,6 +15,7 @@ from benchmark import (
 )
 from coordinated_benchmark import (
     build_coordinated_summary,
+    build_remote_coordinated_summary,
     format_coordinated_prometheus,
     validate_benchmark_args,
 )
@@ -34,6 +35,7 @@ def shard(
     attempts: int = 4,
     run_hash: str = RUN_HASH,
     config_hash: str = CONFIG_HASH,
+    planned_start_ns: int = 900_000_000,
 ) -> dict[str, object]:
     logical_requests = successful + failed
     return {
@@ -68,12 +70,41 @@ def shard(
             "config_fingerprint_sha256": config_hash,
             "client_index": index,
             "client_count": 2,
-            "planned_start_unix_ns": 900_000_000,
+            "planned_start_unix_ns": planned_start_ns,
             "measured_start_unix_ns": started_ns,
             "measured_end_unix_ns": ended_ns,
             "clock": "host_wall_clock",
         },
     }
+
+
+def remote_shard(
+    index: int,
+    *,
+    normalized_start_ns: int,
+    normalized_end_ns: int,
+    offset_ns: int,
+    uncertainty_ns: int,
+    agent_hash: str,
+) -> dict[str, object]:
+    planned_coordinator_ns = 900_000_000
+    result = shard(
+        index,
+        started_ns=normalized_start_ns + offset_ns,
+        ended_ns=normalized_end_ns + offset_ns,
+        planned_start_ns=planned_coordinator_ns + offset_ns,
+    )
+    result["_remote_agent"] = {
+        "agent_id_sha256": agent_hash,
+        "agent_id_persisted": False,
+        "clock_offset_agent_minus_coordinator_ns": offset_ns,
+        "clock_network_delay_ns": uncertainty_ns * 2,
+        "clock_uncertainty_ns": uncertainty_ns,
+        "clock_sample_count": 5,
+        "clock_selection": "minimum_network_delay",
+        "planned_start_coordinator_unix_ns": planned_coordinator_ns,
+    }
+    return result
 
 
 class CoordinatedBenchmarkTest(unittest.TestCase):
@@ -197,6 +228,105 @@ class CoordinatedBenchmarkTest(unittest.TestCase):
             "did not overlap",
             " ".join(summary["coordination_gate"]["failure_reasons"]),
         )
+
+    def test_remote_aggregate_normalizes_clocks_and_uses_conservative_bounds(self) -> None:
+        summary = build_remote_coordinated_summary(
+            [
+                remote_shard(
+                    0,
+                    normalized_start_ns=1_000_000_000,
+                    normalized_end_ns=2_000_000_000,
+                    offset_ns=100_000_000,
+                    uncertainty_ns=1_000_000,
+                    agent_hash="d" * 64,
+                ),
+                remote_shard(
+                    1,
+                    normalized_start_ns=1_010_000_000,
+                    normalized_end_ns=2_010_000_000,
+                    offset_ns=-50_000_000,
+                    uncertainty_ns=2_000_000,
+                    agent_hash="e" * 64,
+                ),
+            ],
+            max_start_skew_ms=20,
+            max_clock_uncertainty_ms=5,
+        )
+
+        self.assertEqual(summary["scope"], "authenticated_remote_agents")
+        self.assertEqual(summary["schema_version"], 2)
+        self.assertEqual(
+            summary["window"]["clock"],
+            "coordinator_wall_clock_estimated_from_agent_samples",
+        )
+        self.assertEqual(summary["window"]["observed_start_skew_ms"], 10)
+        self.assertEqual(summary["window"]["start_skew_upper_bound_ms"], 14)
+        self.assertEqual(summary["window"]["observed_union_duration_seconds"], 1.01)
+        self.assertEqual(summary["window"]["union_duration_upper_bound_seconds"], 1.014)
+        self.assertEqual(summary["window"]["observed_overlap_duration_seconds"], 0.99)
+        self.assertEqual(summary["window"]["overlap_duration_lower_bound_seconds"], 0.986)
+        self.assertEqual(summary["clock_quality"]["max_uncertainty_ms"], 2)
+        self.assertTrue(summary["clock_quality"]["passed"])
+        self.assertTrue(summary["coordination_gate"]["passed"])
+        self.assertAlmostEqual(
+            summary["throughput"]["observed_normalized_rps"], 8 / 1.01, places=4
+        )
+        self.assertAlmostEqual(
+            summary["throughput"]["conservative_lower_bound_rps"],
+            8 / 1.014,
+            places=4,
+        )
+
+        serialized = json.dumps(summary)
+        self.assertNotIn('"_remote_agent":', serialized)
+        self.assertNotIn("agent.example", serialized)
+        self.assertFalse(summary["privacy"]["agent_urls_persisted"])
+        self.assertFalse(summary["privacy"]["authorization_persisted"])
+        self.assertFalse(summary["privacy"]["clock_challenges_persisted"])
+
+        prometheus = format_coordinated_prometheus(summary)
+        self.assertIn("triton_coordinated_clock_uncertainty_max_ms 2", prometheus)
+        self.assertIn("triton_coordinated_start_skew_upper_bound_ms 14", prometheus)
+        self.assertIn("triton_coordinated_throughput_lower_bound_rps", prometheus)
+        self.assertNotIn("d" * 64, prometheus)
+        self.assertNotIn("e" * 64, prometheus)
+
+    def test_remote_aggregate_fails_on_clock_quality_and_duplicate_agents(self) -> None:
+        first = remote_shard(
+            0,
+            normalized_start_ns=1_000_000_000,
+            normalized_end_ns=2_000_000_000,
+            offset_ns=100_000_000,
+            uncertainty_ns=6_000_000,
+            agent_hash="d" * 64,
+        )
+        second = remote_shard(
+            1,
+            normalized_start_ns=1_010_000_000,
+            normalized_end_ns=2_010_000_000,
+            offset_ns=-50_000_000,
+            uncertainty_ns=2_000_000,
+            agent_hash="e" * 64,
+        )
+        summary = build_remote_coordinated_summary(
+            [first, second],
+            max_start_skew_ms=20,
+            max_clock_uncertainty_ms=5,
+        )
+        self.assertFalse(summary["clock_quality"]["passed"])
+        self.assertFalse(summary["coordination_gate"]["passed"])
+        self.assertIn(
+            "clock uncertainty",
+            " ".join(summary["coordination_gate"]["failure_reasons"]),
+        )
+
+        second["_remote_agent"]["agent_id_sha256"] = "d" * 64
+        with self.assertRaisesRegex(ValueError, "unique agent identities"):
+            build_remote_coordinated_summary(
+                [first, second],
+                max_start_skew_ms=20,
+                max_clock_uncertainty_ms=10,
+            )
 
     def test_aggregate_rejects_incomplete_or_mismatched_shards(self) -> None:
         first = shard(0, started_ns=1_000_000_000, ended_ns=2_000_000_000)
