@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import math
@@ -29,6 +30,18 @@ MAX_REQUEST_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_BENCHMARK_ARGUMENT_BYTES = 32 * 1024
 MAX_REPLAY_IDENTITIES = 1024
+MAX_CACHED_RESULTS = 8
+MAX_CACHED_RESULT_BYTES = 64 * 1024 * 1024
+COORDINATED_ARTIFACT_FIELDS = (
+    "mode",
+    "num_requests",
+    "successful_requests",
+    "failed_requests",
+    "duration_seconds",
+    "retry",
+    "load_schedule",
+    "coordination",
+)
 
 
 class AgentProtocolError(ValueError):
@@ -37,6 +50,10 @@ class AgentProtocolError(ValueError):
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
         self.status = status
+
+
+class AgentTransportError(RuntimeError):
+    """An ambiguous transport failure for which execution may have completed."""
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -110,6 +127,18 @@ def build_child_environment(
             raise ValueError(f"allowed child environment variable {name} is not set")
         child_environment[name] = value
     return child_environment
+
+
+def build_coordinated_agent_artifact(
+    artifact: dict[str, object],
+) -> dict[str, object]:
+    """Project a child result to fields required by privacy-safe reconciliation."""
+    projected = {
+        key: artifact[key]
+        for key in COORDINATED_ARTIFACT_FIELDS
+        if key in artifact
+    }
+    return json.loads(json.dumps(projected, separators=(",", ":")))
 
 
 def _integer(mapping: dict[str, Any], key: str) -> int:
@@ -187,14 +216,19 @@ def _post_json(
         except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
             detail = "request rejected"
         raise RuntimeError(f"agent returned HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError("agent request failed") from exc
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        ConnectionError,
+        http.client.IncompleteRead,
+    ) as exc:
+        raise AgentTransportError("agent request failed") from exc
     if len(raw) > MAX_RESPONSE_BYTES:
         raise RuntimeError("agent response exceeded the size limit")
     try:
         decoded = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("agent response was not valid JSON") from exc
+        raise AgentTransportError("agent response was not valid JSON") from exc
     if not isinstance(decoded, dict):
         raise RuntimeError("agent response must be a JSON object")
     return decoded
@@ -272,23 +306,39 @@ def run_agent_benchmark(
     planned_start_agent_unix_ns: int,
     benchmark_args: list[str],
     timeout_seconds: float,
+    recovery_attempts: int = 0,
 ) -> dict[str, object]:
-    """Run one benchmark child through an authenticated agent."""
-    response = _post_json(
-        base_url,
-        "/v1/run",
-        {
-            "schema_version": 1,
-            "run_id": run_id,
-            "client_index": client_index,
-            "client_count": client_count,
-            "planned_start_unix_ns": planned_start_agent_unix_ns,
-            "benchmark_args": benchmark_args,
-            "timeout_seconds": timeout_seconds,
-        },
-        api_key=api_key,
-        timeout_seconds=timeout_seconds + 5,
-    )
+    """Run one child, retrying only ambiguous transport failures when configured."""
+    if (
+        not isinstance(recovery_attempts, int)
+        or isinstance(recovery_attempts, bool)
+        or not 0 <= recovery_attempts <= 3
+    ):
+        raise ValueError("agent result recovery attempts must be between 0 and 3")
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "client_index": client_index,
+        "client_count": client_count,
+        "planned_start_unix_ns": planned_start_agent_unix_ns,
+        "benchmark_args": benchmark_args,
+        "timeout_seconds": timeout_seconds,
+    }
+    transport_retries = 0
+    while True:
+        try:
+            response = _post_json(
+                base_url,
+                "/v1/run",
+                payload,
+                api_key=api_key,
+                timeout_seconds=timeout_seconds + 5,
+            )
+            break
+        except AgentTransportError:
+            if transport_retries >= recovery_attempts:
+                raise
+            transport_retries += 1
     if response.get("schema_version") != 1:
         raise RuntimeError("agent run response has an unsupported schema")
     response_agent_hash = response.get("agent_id_sha256")
@@ -299,7 +349,16 @@ def run_agent_benchmark(
     artifact = response.get("artifact")
     if not isinstance(artifact, dict):
         raise RuntimeError("agent run response did not contain an artifact object")
-    return dict(artifact)
+    result_source = response.get("result_source", "executed")
+    if result_source not in {"executed", "cached"}:
+        raise RuntimeError("agent run response has an invalid result source")
+    result = dict(artifact)
+    result["_remote_result_delivery"] = {
+        "result_source": result_source,
+        "transport_retries": transport_retries,
+        "max_transport_recovery_attempts": recovery_attempts,
+    }
+    return result
 
 
 def _require_int(
@@ -314,7 +373,7 @@ def _require_int(
 
 
 class BenchmarkAgentServer(HTTPServer):
-    """Single-job-at-a-time HTTP server with bounded replay memory."""
+    """Single-job-at-a-time HTTP server with bounded idempotency memory."""
 
     def __init__(
         self,
@@ -324,23 +383,103 @@ class BenchmarkAgentServer(HTTPServer):
         agent_id: str,
         child_timeout_seconds: float,
         child_environment: dict[str, str],
+        max_cached_results: int = MAX_CACHED_RESULTS,
+        max_cached_result_bytes: int = MAX_CACHED_RESULT_BYTES,
     ) -> None:
         super().__init__(server_address, BenchmarkAgentHandler)
         self.api_key = api_key
         self.agent_id_sha256 = hashlib.sha256(agent_id.encode("utf-8")).hexdigest()
         self.child_timeout_seconds = child_timeout_seconds
         self.child_environment = dict(child_environment)
-        self.replay_identities: set[str] = set()
+        if max_cached_results < 1 or max_cached_result_bytes < 1:
+            raise ValueError("completed-result cache limits must be positive")
+        self.max_cached_results = max_cached_results
+        self.max_cached_result_bytes = max_cached_result_bytes
+        self.run_records: dict[str, dict[str, Any]] = {}
         self.replay_order: deque[str] = deque()
+        self.completed_result_order: deque[str] = deque()
+        self.cached_result_count = 0
+        self.cached_result_bytes = 0
 
-    def remember_run(self, identity: str) -> None:
-        if identity in self.replay_identities:
-            raise AgentProtocolError("run/client identity was already accepted", status=409)
-        self.replay_identities.add(identity)
+    def begin_run(
+        self, identity: str, request_fingerprint: str
+    ) -> dict[str, object] | None:
+        """Accept a new identity or return its identical completed result."""
+        record = self.run_records.get(identity)
+        if record is not None:
+            if not hmac.compare_digest(
+                str(record["request_fingerprint"]), request_fingerprint
+            ):
+                raise AgentProtocolError(
+                    "run/client identity was reused for a different request", status=409
+                )
+            artifact = record.get("artifact")
+            if isinstance(artifact, dict):
+                return dict(artifact)
+            if record.get("state") == "completed_result_expired":
+                raise AgentProtocolError(
+                    "completed run result expired from the bounded cache", status=410
+                )
+            raise AgentProtocolError(
+                "run/client identity was accepted but did not complete", status=409
+            )
+
+        self.run_records[identity] = {
+            "request_fingerprint": request_fingerprint,
+            "state": "accepted",
+            "artifact": None,
+            "artifact_bytes": 0,
+        }
         self.replay_order.append(identity)
         if len(self.replay_order) > MAX_REPLAY_IDENTITIES:
             expired = self.replay_order.popleft()
-            self.replay_identities.discard(expired)
+            expired_record = self.run_records.pop(expired, None)
+            if expired_record is not None and isinstance(
+                expired_record.get("artifact"), dict
+            ):
+                self.cached_result_count -= 1
+                self.cached_result_bytes -= int(expired_record["artifact_bytes"])
+        return None
+
+    def complete_run(self, identity: str, artifact: dict[str, object]) -> None:
+        """Attach a completed artifact, evicting older result bodies fail-closed."""
+        record = self.run_records.get(identity)
+        if record is None or record.get("state") != "accepted":
+            raise RuntimeError("run identity was not in the accepted state")
+        artifact_copy = dict(artifact)
+        artifact_bytes = len(
+            json.dumps(artifact_copy, separators=(",", ":")).encode("utf-8")
+        )
+        record.update(
+            {
+                "state": "completed",
+                "artifact": artifact_copy,
+                "artifact_bytes": artifact_bytes,
+            }
+        )
+        self.completed_result_order.append(identity)
+        self.cached_result_count += 1
+        self.cached_result_bytes += artifact_bytes
+
+        while (
+            self.cached_result_count > self.max_cached_results
+            or self.cached_result_bytes > self.max_cached_result_bytes
+        ):
+            expired = self.completed_result_order.popleft()
+            expired_record = self.run_records.get(expired)
+            if expired_record is None or not isinstance(
+                expired_record.get("artifact"), dict
+            ):
+                continue
+            self.cached_result_count -= 1
+            self.cached_result_bytes -= int(expired_record["artifact_bytes"])
+            expired_record.update(
+                {
+                    "state": "completed_result_expired",
+                    "artifact": None,
+                    "artifact_bytes": 0,
+                }
+            )
 
 
 class BenchmarkAgentHandler(BaseHTTPRequestHandler):
@@ -466,7 +605,25 @@ class BenchmarkAgentHandler(BaseHTTPRequestHandler):
         replay_identity = hashlib.sha256(
             f"{run_id}\0{client_index}".encode("utf-8")
         ).hexdigest()
-        self.server.remember_run(replay_identity)
+        request_fingerprint = hashlib.sha256(
+            json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        ).hexdigest()
+        cached_artifact = self.server.begin_run(
+            replay_identity, request_fingerprint
+        )
+        if cached_artifact is not None:
+            self._send_json(
+                200,
+                {
+                    "schema_version": 1,
+                    "agent_id_sha256": self.server.agent_id_sha256,
+                    "result_source": "cached",
+                    "artifact": cached_artifact,
+                },
+            )
+            return
 
         with tempfile.TemporaryDirectory(prefix="benchmark-agent-") as temp_dir:
             command = [
@@ -512,12 +669,15 @@ class BenchmarkAgentHandler(BaseHTTPRequestHandler):
             if not isinstance(artifact, dict):
                 raise AgentProtocolError("benchmark child artifact is invalid", status=500)
 
+        coordinated_artifact = build_coordinated_agent_artifact(artifact)
+        self.server.complete_run(replay_identity, coordinated_artifact)
         self._send_json(
             200,
             {
                 "schema_version": 1,
                 "agent_id_sha256": self.server.agent_id_sha256,
-                "artifact": artifact,
+                "result_source": "executed",
+                "artifact": coordinated_artifact,
             },
         )
 

@@ -8,9 +8,11 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +28,54 @@ SERIALIZED_TRACEPARENT_PATTERN = re.compile(
 )
 API_KEY_ENV = "BENCHMARK_AGENT_FIXTURE_KEY"
 API_KEY = "fixture-agent-key-32-characters-long"
+
+
+class OneShotRunResponseDropProxy(ThreadingHTTPServer):
+    """Forward agent calls but discard the first complete run response."""
+
+    def __init__(self, target_url: str) -> None:
+        super().__init__(("127.0.0.1", 0), OneShotRunResponseDropHandler)
+        self.target_url = target_url
+        self.dropped_run_responses = 0
+
+
+class OneShotRunResponseDropHandler(BaseHTTPRequestHandler):
+    server: OneShotRunResponseDropProxy
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        request = urllib.request.Request(
+            self.server.target_url + self.path,
+            data=body,
+            headers={
+                "Authorization": self.headers.get("Authorization", ""),
+                "Content-Type": self.headers.get("Content-Type", "application/json"),
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=35) as response:
+                status = response.status
+                response_body = response.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+
+        if self.path == "/v1/run" and self.server.dropped_run_responses == 0:
+            self.server.dropped_run_responses += 1
+            self.close_connection = True
+            return
+
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response_body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(response_body)
 
 
 def wait_for_port_file(path: Path, process: subprocess.Popen[str]) -> int:
@@ -73,7 +123,7 @@ def assert_wrong_key_is_rejected(agent_url: str) -> None:
         raise AssertionError("agent accepted an invalid bearer key")
 
 
-def assert_replay_is_rejected(agent_url: str) -> None:
+def assert_idempotent_repeat_and_conflict(agent_url: str) -> None:
     profile = probe_agent_clock(
         agent_url,
         api_key=API_KEY,
@@ -98,6 +148,20 @@ def assert_replay_is_rejected(agent_url: str) -> None:
         timeout_seconds=10,
     )
     assert first["successful_requests"] == 2
+    repeated = run_agent_benchmark(
+        agent_url,
+        api_key=API_KEY,
+        expected_agent_id_sha256=agent_hash,
+        run_id="fixture-replay-identity",
+        client_index=0,
+        client_count=2,
+        planned_start_agent_unix_ns=planned_agent_ns,
+        benchmark_args=arguments,
+        timeout_seconds=10,
+    )
+    assert repeated["successful_requests"] == 2
+    assert repeated["_remote_result_delivery"]["result_source"] == "cached"
+
     try:
         run_agent_benchmark(
             agent_url,
@@ -107,18 +171,20 @@ def assert_replay_is_rejected(agent_url: str) -> None:
             client_index=0,
             client_count=2,
             planned_start_agent_unix_ns=planned_agent_ns,
-            benchmark_args=arguments,
+            benchmark_args=[*arguments, "--seed", "99"],
             timeout_seconds=10,
         )
     except RuntimeError as exc:
         assert "HTTP 409" in str(exc), str(exc)
     else:
-        raise AssertionError("agent accepted a replayed run/client identity")
+        raise AssertionError("agent accepted one identity for a different request")
 
 
 def main() -> None:
     fixture_process: subprocess.Popen[str] | None = None
     agent_processes: list[subprocess.Popen[str]] = []
+    drop_proxy: OneShotRunResponseDropProxy | None = None
+    drop_proxy_thread: threading.Thread | None = None
     with tempfile.TemporaryDirectory(prefix="remote-agent-fixture-") as temp_dir:
         temp_path = Path(temp_dir)
         fixture_port_path = temp_path / "fixture.port"
@@ -172,7 +238,17 @@ def main() -> None:
                 agent_urls.append(f"http://127.0.0.1:{port}")
 
             assert_wrong_key_is_rejected(agent_urls[0])
-            assert_replay_is_rejected(agent_urls[0])
+            assert_idempotent_repeat_and_conflict(agent_urls[0])
+
+            drop_proxy = OneShotRunResponseDropProxy(agent_urls[0])
+            drop_proxy_thread = threading.Thread(
+                target=drop_proxy.serve_forever, daemon=True
+            )
+            drop_proxy_thread.start()
+            coordinator_agent_urls = [
+                f"http://127.0.0.1:{drop_proxy.server_port}",
+                agent_urls[1],
+            ]
 
             command = [
                 sys.executable,
@@ -193,10 +269,12 @@ def main() -> None:
                 "5",
                 "--timeout-seconds",
                 "30",
+                "--agent-run-recovery-attempts",
+                "1",
                 "--agent-url",
-                agent_urls[0],
+                coordinator_agent_urls[0],
                 "--agent-url",
-                agent_urls[1],
+                coordinator_agent_urls[1],
                 "--agent-api-key-env",
                 API_KEY_ENV,
                 "--",
@@ -252,6 +330,13 @@ def main() -> None:
             assert aggregate["failed_requests"] == 0
             assert aggregate["client_attempts"] == 8
             assert aggregate["configured_aggregate_request_rate_rps"] == 20
+            assert aggregate["result_delivery"] == {
+                "max_transport_recovery_attempts_per_agent": 1,
+                "transport_retries": 1,
+                "executed_results": 1,
+                "cached_results": 1,
+                "recovered_after_transport_failure": 1,
+            }
             assert aggregate["clock_quality"]["passed"] is True
             assert aggregate["clock_quality"]["max_uncertainty_ms"] <= 100
             assert all(
@@ -275,6 +360,7 @@ def main() -> None:
                 API_KEY,
                 API_KEY_ENV,
                 *agent_urls,
+                *coordinator_agent_urls,
                 "loopback-agent-0",
                 "loopback-agent-1",
                 str(result_dir),
@@ -284,6 +370,9 @@ def main() -> None:
             assert "triton_coordinated_clock_uncertainty_max_ms" in prometheus
             assert "triton_coordinated_start_skew_upper_bound_ms" in prometheus
             assert "triton_coordinated_throughput_lower_bound_rps" in prometheus
+            assert "triton_coordinated_agent_transport_retries_total 1" in prometheus
+            assert "triton_coordinated_agent_cached_results_total 1" in prometheus
+            assert "triton_coordinated_agent_recovered_results_total 1" in prometheus
             assert "triton_coordinated_gate_passed 1" in prometheus
             assert sorted(path.name for path in result_dir.iterdir()) == [
                 "coordinated_benchmark.json",
@@ -295,6 +384,7 @@ def main() -> None:
             assert len(set(traceparents)) == 8, traceparents
             assert all(TRACEPARENT_PATTERN.fullmatch(value) for value in traceparents)
             assert all(value not in serialized for value in traceparents)
+            assert drop_proxy.dropped_run_responses == 1
 
             print(
                 json.dumps(
@@ -317,12 +407,24 @@ def main() -> None:
                         ],
                         "coordination_gate": aggregate["coordination_gate"]["passed"],
                         "wrong_key_rejected": True,
-                        "replay_rejected": True,
+                        "conflicting_replay_rejected": True,
+                        "ambiguous_response_dropped": True,
+                        "transport_retries": aggregate["result_delivery"][
+                            "transport_retries"
+                        ],
+                        "cached_results": aggregate["result_delivery"][
+                            "cached_results"
+                        ],
                     },
                     indent=2,
                 )
             )
         finally:
+            if drop_proxy is not None:
+                drop_proxy.shutdown()
+                drop_proxy.server_close()
+            if drop_proxy_thread is not None:
+                drop_proxy_thread.join(timeout=2)
             for process in agent_processes:
                 stop_process(process)
             stop_process(fixture_process)

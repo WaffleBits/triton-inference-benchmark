@@ -86,6 +86,9 @@ def remote_shard(
     offset_ns: int,
     uncertainty_ns: int,
     agent_hash: str,
+    result_source: str = "executed",
+    transport_retries: int = 0,
+    max_transport_recovery_attempts: int = 1,
 ) -> dict[str, object]:
     planned_coordinator_ns = 900_000_000
     result = shard(
@@ -103,6 +106,11 @@ def remote_shard(
         "clock_sample_count": 5,
         "clock_selection": "minimum_network_delay",
         "planned_start_coordinator_unix_ns": planned_coordinator_ns,
+    }
+    result["_remote_result_delivery"] = {
+        "result_source": result_source,
+        "transport_retries": transport_retries,
+        "max_transport_recovery_attempts": max_transport_recovery_attempts,
     }
     return result
 
@@ -239,6 +247,8 @@ class CoordinatedBenchmarkTest(unittest.TestCase):
                     offset_ns=100_000_000,
                     uncertainty_ns=1_000_000,
                     agent_hash="d" * 64,
+                    result_source="cached",
+                    transport_retries=1,
                 ),
                 remote_shard(
                     1,
@@ -266,6 +276,16 @@ class CoordinatedBenchmarkTest(unittest.TestCase):
         self.assertEqual(summary["window"]["observed_overlap_duration_seconds"], 0.99)
         self.assertEqual(summary["window"]["overlap_duration_lower_bound_seconds"], 0.986)
         self.assertEqual(summary["clock_quality"]["max_uncertainty_ms"], 2)
+        self.assertEqual(
+            summary["result_delivery"],
+            {
+                "max_transport_recovery_attempts_per_agent": 1,
+                "transport_retries": 1,
+                "executed_results": 1,
+                "cached_results": 1,
+                "recovered_after_transport_failure": 1,
+            },
+        )
         self.assertTrue(summary["clock_quality"]["passed"])
         self.assertTrue(summary["coordination_gate"]["passed"])
         self.assertAlmostEqual(
@@ -279,6 +299,7 @@ class CoordinatedBenchmarkTest(unittest.TestCase):
 
         serialized = json.dumps(summary)
         self.assertNotIn('"_remote_agent":', serialized)
+        self.assertNotIn('"_remote_result_delivery":', serialized)
         self.assertNotIn("agent.example", serialized)
         self.assertFalse(summary["privacy"]["agent_urls_persisted"])
         self.assertFalse(summary["privacy"]["authorization_persisted"])
@@ -288,6 +309,9 @@ class CoordinatedBenchmarkTest(unittest.TestCase):
         self.assertIn("triton_coordinated_clock_uncertainty_max_ms 2", prometheus)
         self.assertIn("triton_coordinated_start_skew_upper_bound_ms 14", prometheus)
         self.assertIn("triton_coordinated_throughput_lower_bound_rps", prometheus)
+        self.assertIn("triton_coordinated_agent_transport_retries_total 1", prometheus)
+        self.assertIn("triton_coordinated_agent_cached_results_total 1", prometheus)
+        self.assertIn("triton_coordinated_agent_recovered_results_total 1", prometheus)
         self.assertNotIn("d" * 64, prometheus)
         self.assertNotIn("e" * 64, prometheus)
 

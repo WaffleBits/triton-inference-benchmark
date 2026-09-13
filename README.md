@@ -19,7 +19,8 @@ drives a real inference endpoint.
   gates, and privacy-safe aggregate request/retry/window artifacts.
 - Authenticated remote-agent coordination with explicit opt-in credentials,
   NTP-style clock sampling, conservative skew/overlap/throughput bounds, replay
-  rejection, and no agent URLs or authorization data in aggregate artifacts.
+  conflict rejection, idempotent completed-result recovery after ambiguous
+  response loss, and no agent URLs or authorization data in aggregate artifacts.
 - Optional phase-separated warmup requests with their own outcomes, latency,
   throughput, JSON, and Prometheus records; headline and cost metrics remain
   scoped to the measured phase.
@@ -207,24 +208,42 @@ a conservative lower bound based on the union-duration upper bound.
 
 The agent accepts a bounded JSON protocol, invokes only this repository's
 `benchmark.py`, rejects coordinator-owned/shared-counter options, and remembers
-a bounded set of hashed run/client identities to reject replays. One explicitly
-selected bearer key is sent to every configured agent, so combine only agents
-authorized to receive that credential. Authenticated requests do not follow
-redirects, keeping the bearer key pinned to the selected agent origin. Benchmark
-children receive only `PATH`, `PYTHONIOENCODING`, and values named by an
-agent-side `--allow-child-env`; the agent's own API-key variable cannot be
+a bounded set of hashed run/client identities. For each accepted job it retains
+only a canonical request fingerprint and, after completion, a coordinator-only
+projection containing only fields required for shard reconciliation. The
+projection excludes child configuration, target/model data, latency details,
+prompt hashes, output data, and filesystem paths before it is returned or placed
+in the bounded in-memory cache. An identical completed request returns the cached
+result without launching another child. The same identity with different
+arguments, an unfinished prior execution, or an expired result is rejected. The
+coordinator retries only ambiguous transport/response failures, up to
+`--agent-run-recovery-attempts` (default 1, maximum 3); explicit HTTP rejections
+are not retried. Aggregate JSON and Prometheus output separate transport retries,
+fresh executions, cached responses, and completed results recovered after a
+transport failure.
+
+One explicitly selected bearer key is sent to every configured agent, so combine
+only agents authorized to receive that credential. Authenticated requests do not
+follow redirects, keeping the bearer key pinned to the selected agent origin.
+Benchmark children receive only `PATH`, `PYTHONIOENCODING`, and values named by
+an agent-side `--allow-child-env`; the agent's own API-key variable cannot be
 allowed. A live target credential therefore requires opt-in by both the agent
 operator and the benchmark CLI.
 Raw keys, challenges, agent IDs, URLs, child paths, endpoints, prompts, outputs,
 and trace IDs are absent from the aggregate. Hashed agent identities establish
 protocol-level distinctness, not proof of separate physical machines.
 
-CI exercises two agent services, two real benchmark child processes, and one
-synthetic SSE target on a single host. That fixture proves authentication,
-replay rejection, CLI wiring, clock accounting, trace uniqueness, and artifact
-redaction over loopback. It does not prove multi-host or production-network
-behavior, hardware clock synchronization, a model/GPU, traffic isolation, or
-fleet scale.
+CI exercises two agent services, two real benchmark child processes, one
+synthetic SSE target, and a proxy that discards one completed run response on a
+single host. The coordinator retrieves that result from agent memory; the target
+still receives exactly eight requests, not twelve. The fixture proves
+authentication, conflicting-replay rejection, bounded completed-result recovery,
+CLI wiring, clock accounting, trace uniqueness, and artifact redaction over
+loopback. The cache is process-local and bounded to eight completed results and
+64 MiB while identity records are retained for 1,024 accepted jobs. This does not
+prove recovery after agent/coordinator process loss, persistent deduplication,
+arbitrary network faults, multi-host behavior, hardware clock synchronization, a
+model/GPU, traffic isolation, or fleet scale.
 
 Gate the extra client work used to recover failed logical requests:
 
@@ -564,7 +583,7 @@ python tests/run_remote_agent_fixture.py
 
 - Server-lifecycle hooks for controlled cold-start measurements.
 - Exercise authenticated agents on separate authorized hosts behind TLS, then
-  qualify clock drift and controlled network faults without weakening the
-  conservative time bounds.
+  qualify clock drift, persistent job state, and broader controlled network
+  faults without weakening the conservative time bounds.
 - Exercise the multi-source path gate in a real orchestrated router/model-server
   deployment; the committed qualification remains a synthetic single-host fixture.
