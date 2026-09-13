@@ -380,11 +380,20 @@ def build_remote_coordinated_summary(
     agent_hashes: set[str] = set()
     planned_starts: set[int] = set()
     uncertainties_ns: list[int] = []
+    total_transport_retries = 0
+    executed_results = 0
+    cached_results = 0
+    recovered_results = 0
+    configured_recovery_attempts: set[int] = set()
 
     for position, raw_shard in enumerate(shards):
         shard_data = dict(raw_shard)
         remote = _mapping(
             shard_data.pop("_remote_agent", None), f"shard[{position}]._remote_agent"
+        )
+        delivery = _mapping(
+            shard_data.pop("_remote_result_delivery", None),
+            f"shard[{position}]._remote_result_delivery",
         )
         coordination = _mapping(
             shard_data.get("coordination"), f"shard[{position}].coordination"
@@ -399,6 +408,33 @@ def build_remote_coordinated_summary(
             raise ValueError("remote agent did not confirm raw identity redaction")
         if remote.get("clock_selection") != "minimum_network_delay":
             raise ValueError("remote clock selection method is unsupported")
+        result_source = delivery.get("result_source")
+        if result_source not in {"executed", "cached"}:
+            raise ValueError("remote result source is invalid")
+        transport_retries = _integer_value(
+            delivery,
+            "transport_retries",
+            f"shard[{position}]._remote_result_delivery",
+            nonnegative=True,
+        )
+        if transport_retries > 3:
+            raise ValueError("remote transport retry count exceeded the protocol limit")
+        max_recovery_attempts = _integer_value(
+            delivery,
+            "max_transport_recovery_attempts",
+            f"shard[{position}]._remote_result_delivery",
+            nonnegative=True,
+        )
+        if max_recovery_attempts > 3 or transport_retries > max_recovery_attempts:
+            raise ValueError("remote transport retries exceeded the configured limit")
+        configured_recovery_attempts.add(max_recovery_attempts)
+        total_transport_retries += transport_retries
+        if result_source == "executed":
+            executed_results += 1
+        else:
+            cached_results += 1
+            if transport_retries > 0:
+                recovered_results += 1
         offset_ns = _integer_value(
             remote,
             "clock_offset_agent_minus_coordinator_ns",
@@ -478,6 +514,8 @@ def build_remote_coordinated_summary(
                 "clock_network_delay_ms": round(network_delay_ns / 1_000_000, 6),
                 "clock_uncertainty_ms": round(uncertainty_ns / 1_000_000, 6),
                 "clock_sample_count": sample_count,
+                "result_source": result_source,
+                "transport_retries": transport_retries,
             }
         )
 
@@ -485,6 +523,8 @@ def build_remote_coordinated_summary(
         raise ValueError("remote coordination requires unique agent identities")
     if len(planned_starts) != 1:
         raise ValueError("remote coordinator planned-start mismatch")
+    if len(configured_recovery_attempts) != 1:
+        raise ValueError("remote result recovery configuration was inconsistent")
 
     summary = build_coordinated_summary(normalized_shards, max_start_skew_ms)
     window = _mapping(summary.get("window"), "window")
@@ -539,8 +579,18 @@ def build_remote_coordinated_summary(
                 "authentication": "explicit_bearer_key_environment_variable",
                 "transport_policy": "https_or_loopback_http",
                 "replay_identity": "sha256_run_id_and_client_index",
+                "result_recovery": "bounded_in_memory_identical_request_cache",
             },
             "agent_identity_fingerprints_sha256": sorted(agent_hashes),
+            "result_delivery": {
+                "max_transport_recovery_attempts_per_agent": next(
+                    iter(configured_recovery_attempts)
+                ),
+                "transport_retries": total_transport_retries,
+                "executed_results": executed_results,
+                "cached_results": cached_results,
+                "recovered_after_transport_failure": recovered_results,
+            },
             "clock_quality": {
                 "method": "ntp_style_minimum_network_delay_sample",
                 "max_uncertainty_ms": round(max_uncertainty_ms, 6),
@@ -620,6 +670,7 @@ def _format_remote_prometheus(summary: dict[str, object]) -> str:
     throughput = _mapping(summary.get("throughput"), "throughput")
     clock = _mapping(summary.get("clock_quality"), "clock_quality")
     gate = _mapping(summary.get("coordination_gate"), "coordination_gate")
+    delivery = _mapping(summary.get("result_delivery"), "result_delivery")
     lines = [
         "# HELP triton_coordinated_clients Authenticated benchmark agent clients.",
         "# TYPE triton_coordinated_clients gauge",
@@ -664,6 +715,18 @@ def _format_remote_prometheus(summary: dict[str, object]) -> str:
         "# HELP triton_coordinated_gate_passed Whether authentication, clock, overlap, and start-skew checks passed.",
         "# TYPE triton_coordinated_gate_passed gauge",
         f"triton_coordinated_gate_passed {1 if gate.get('passed') is True else 0}",
+        "# HELP triton_coordinated_agent_transport_retries_total Ambiguous agent response failures retried by the coordinator.",
+        "# TYPE triton_coordinated_agent_transport_retries_total counter",
+        "triton_coordinated_agent_transport_retries_total "
+        f"{_nonnegative_int(delivery, 'transport_retries', 'result_delivery')}",
+        "# HELP triton_coordinated_agent_cached_results_total Completed results served from bounded agent memory.",
+        "# TYPE triton_coordinated_agent_cached_results_total counter",
+        "triton_coordinated_agent_cached_results_total "
+        f"{_nonnegative_int(delivery, 'cached_results', 'result_delivery')}",
+        "# HELP triton_coordinated_agent_recovered_results_total Cached results recovered after an ambiguous transport failure.",
+        "# TYPE triton_coordinated_agent_recovered_results_total counter",
+        "triton_coordinated_agent_recovered_results_total "
+        f"{_nonnegative_int(delivery, 'recovered_after_transport_failure', 'result_delivery')}",
     ]
     configured_rate = summary.get("configured_aggregate_request_rate_rps")
     if isinstance(configured_rate, (int, float)) and not isinstance(
@@ -755,6 +818,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--clock-samples", type=int, default=5)
     parser.add_argument("--max-clock-uncertainty-ms", type=float, default=25.0)
+    parser.add_argument(
+        "--agent-run-recovery-attempts",
+        type=int,
+        default=1,
+        help="Retries for ambiguous agent run-response failures (0 to 3).",
+    )
     parser.add_argument("benchmark_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if not 2 <= args.clients <= MAX_CLIENTS:
@@ -767,6 +836,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--timeout-seconds must be finite and greater than zero")
     if not 1 <= args.clock_samples <= 20:
         parser.error("--clock-samples must be between 1 and 20")
+    if not 0 <= args.agent_run_recovery_attempts <= 3:
+        parser.error("--agent-run-recovery-attempts must be between 0 and 3")
     if (
         not math.isfinite(args.max_clock_uncertainty_ms)
         or args.max_clock_uncertainty_ms < 0
@@ -958,6 +1029,7 @@ def _run_remote_clients(args: argparse.Namespace) -> dict[str, object]:
                     planned_start_agent_unix_ns=planned_coordinator_ns + offset_ns,
                     benchmark_args=args.benchmark_args,
                     timeout_seconds=args.timeout_seconds,
+                    recovery_attempts=args.agent_run_recovery_attempts,
                 )
             )
         shards = [future.result() for future in run_futures]

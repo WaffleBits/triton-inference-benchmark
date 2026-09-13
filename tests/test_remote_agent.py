@@ -3,10 +3,16 @@ from __future__ import annotations
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 from remote_agent import (
+    AgentProtocolError,
+    AgentTransportError,
+    BenchmarkAgentServer,
     _post_json,
     build_child_environment,
+    build_coordinated_agent_artifact,
+    run_agent_benchmark,
     select_clock_observation,
     validate_agent_base_url,
 )
@@ -154,6 +160,129 @@ class RemoteAgentProtocolTest(unittest.TestCase):
             build_child_environment("AGENT_KEY", ["AGENT_KEY"], source=source)
         with self.assertRaisesRegex(ValueError, "is not set"):
             build_child_environment("AGENT_KEY", ["MISSING_KEY"], source=source)
+
+    def test_agent_artifact_projection_omits_endpoint_prompt_and_output_data(self) -> None:
+        projected = build_coordinated_agent_artifact(
+            {
+                "mode": "openai",
+                "num_requests": 4,
+                "successful_requests": 4,
+                "failed_requests": 0,
+                "duration_seconds": 1.0,
+                "retry": {"logical_requests": 4},
+                "load_schedule": None,
+                "coordination": {"client_index": 0},
+                "server_url": "https://private.example.test/v1",
+                "config": {
+                    "server_url": "https://private.example.test/v1",
+                    "openai_prompt_sha256": "a" * 64,
+                },
+                "private_output": "sensitive response",
+            }
+        )
+
+        serialized = str(projected)
+        self.assertEqual(
+            set(projected),
+            {
+                "mode",
+                "num_requests",
+                "successful_requests",
+                "failed_requests",
+                "duration_seconds",
+                "retry",
+                "load_schedule",
+                "coordination",
+            },
+        )
+        self.assertNotIn("private.example.test", serialized)
+        self.assertNotIn("sensitive response", serialized)
+
+    def test_completed_run_is_cached_but_conflicts_and_expired_results_fail_closed(self) -> None:
+        server = BenchmarkAgentServer(
+            ("127.0.0.1", 0),
+            api_key="unit-test-agent-key",
+            agent_id="unit-test-agent",
+            child_timeout_seconds=5,
+            child_environment={"PATH": "", "PYTHONIOENCODING": "utf-8"},
+            max_cached_results=1,
+        )
+        try:
+            first_artifact = {"successful_requests": 4}
+            self.assertIsNone(server.begin_run("run-a", "a" * 64))
+            server.complete_run("run-a", first_artifact)
+            self.assertEqual(
+                server.begin_run("run-a", "a" * 64), first_artifact
+            )
+
+            with self.assertRaisesRegex(AgentProtocolError, "different request"):
+                server.begin_run("run-a", "b" * 64)
+
+            self.assertIsNone(server.begin_run("unfinished", "d" * 64))
+            with self.assertRaisesRegex(AgentProtocolError, "did not complete"):
+                server.begin_run("unfinished", "d" * 64)
+
+            self.assertIsNone(server.begin_run("run-b", "c" * 64))
+            server.complete_run("run-b", {"successful_requests": 2})
+            with self.assertRaisesRegex(AgentProtocolError, "expired"):
+                server.begin_run("run-a", "a" * 64)
+        finally:
+            server.server_close()
+
+    def test_transport_failure_retries_same_run_and_records_cached_recovery(self) -> None:
+        response = {
+            "schema_version": 1,
+            "agent_id_sha256": "d" * 64,
+            "result_source": "cached",
+            "artifact": {"successful_requests": 4},
+        }
+        with patch(
+            "remote_agent._post_json",
+            side_effect=[AgentTransportError("response lost"), response],
+        ) as post:
+            artifact = run_agent_benchmark(
+                "https://agent.example.test",
+                api_key="unit-test-agent-key",
+                expected_agent_id_sha256="d" * 64,
+                run_id="private-run-id",
+                client_index=0,
+                client_count=2,
+                planned_start_agent_unix_ns=1_000_000_000,
+                benchmark_args=["--mode", "mock", "--num-requests", "4"],
+                timeout_seconds=5,
+                recovery_attempts=1,
+            )
+
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(artifact["successful_requests"], 4)
+        self.assertEqual(
+            artifact["_remote_result_delivery"],
+            {
+                "result_source": "cached",
+                "transport_retries": 1,
+                "max_transport_recovery_attempts": 1,
+            },
+        )
+
+    def test_explicit_http_rejection_is_not_retried(self) -> None:
+        with patch(
+            "remote_agent._post_json",
+            side_effect=RuntimeError("agent returned HTTP 409: conflict"),
+        ) as post:
+            with self.assertRaisesRegex(RuntimeError, "HTTP 409"):
+                run_agent_benchmark(
+                    "https://agent.example.test",
+                    api_key="unit-test-agent-key",
+                    expected_agent_id_sha256="d" * 64,
+                    run_id="private-run-id",
+                    client_index=0,
+                    client_count=2,
+                    planned_start_agent_unix_ns=1_000_000_000,
+                    benchmark_args=["--mode", "mock", "--num-requests", "4"],
+                    timeout_seconds=5,
+                    recovery_attempts=3,
+                )
+        self.assertEqual(post.call_count, 1)
 
 
 if __name__ == "__main__":
