@@ -247,7 +247,7 @@ class CoordinatedBenchmarkTest(unittest.TestCase):
                     offset_ns=100_000_000,
                     uncertainty_ns=1_000_000,
                     agent_hash="d" * 64,
-                    result_source="cached",
+                    result_source="durable",
                     transport_retries=1,
                 ),
                 remote_shard(
@@ -282,7 +282,8 @@ class CoordinatedBenchmarkTest(unittest.TestCase):
                 "max_transport_recovery_attempts_per_agent": 1,
                 "transport_retries": 1,
                 "executed_results": 1,
-                "cached_results": 1,
+                "cached_results": 0,
+                "durable_results": 1,
                 "recovered_after_transport_failure": 1,
             },
         )
@@ -310,7 +311,8 @@ class CoordinatedBenchmarkTest(unittest.TestCase):
         self.assertIn("triton_coordinated_start_skew_upper_bound_ms 14", prometheus)
         self.assertIn("triton_coordinated_throughput_lower_bound_rps", prometheus)
         self.assertIn("triton_coordinated_agent_transport_retries_total 1", prometheus)
-        self.assertIn("triton_coordinated_agent_cached_results_total 1", prometheus)
+        self.assertIn("triton_coordinated_agent_cached_results_total 0", prometheus)
+        self.assertIn("triton_coordinated_agent_durable_results_total 1", prometheus)
         self.assertIn("triton_coordinated_agent_recovered_results_total 1", prometheus)
         self.assertNotIn("d" * 64, prometheus)
         self.assertNotIn("e" * 64, prometheus)

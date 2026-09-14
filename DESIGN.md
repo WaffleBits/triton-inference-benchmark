@@ -98,13 +98,19 @@ argument sizes, gives children a minimal environment plus explicitly allowed
 variables, and serializes one job at a time. A hashed run/client identity is an
 idempotency key. The agent retains a canonical request fingerprint and a
 coordinator-only projection of each completed artifact, bounded to eight results /
-64 MiB in memory while retaining 1,024 accepted identities. The projection omits
-child configuration, target/model data, prompts, outputs and paths. An exact
-completed retry receives the cached projection without child re-execution.
-Payload conflicts, unfinished runs, and completed results whose body was evicted
-fail closed. The coordinator retries only ambiguous response failures and records
-whether each shard was freshly executed or recovered from the cache. Explicit
-HTTP errors are never retried.
+64 MiB while retaining 1,024 accepted identities. The projection omits child
+configuration, target/model data, prompts, outputs and paths. In-memory storage is
+the default. The explicit `--state-db` mode stores only the hashed identity,
+request fingerprint, run state, bounded ordering metadata and projected artifact
+in SQLite. The database is bound to a hash of the configured agent identity. Full
+synchronous transactions commit acceptance before child launch and completion
+before HTTP success; the file is restricted to its owner. An exact completed
+retry receives the stored projection without child re-execution,
+including after a process restart in SQLite mode. Payload conflicts,
+accepted-but-incomplete runs, and completed results whose body was evicted fail
+closed. The coordinator retries only ambiguous response failures and records
+whether each shard was freshly executed, memory-cached or durable. Explicit HTTP
+errors are never retried.
 
 The agent authentication variable is never eligible for child inheritance. A
 hashed agent ID must be stable across clock probes and execution, and every shard
@@ -113,9 +119,13 @@ hosts, trustworthy time hardware, or production network isolation. The
 deterministic fixture runs two agents and two child processes over loopback and
 discards one successful response between an agent and the coordinator. Exactly
 eight target requests and one cached shard prove recovery for that response-loss
-case without a duplicate child execution. The memory is not persistent and the
-fixture does not establish process-loss recovery, general network-fault handling,
-or actual multi-host behavior.
+case without a duplicate child execution. A second fixture discards a completed
+two-request result, stops the agent, starts a new process on the same SQLite file,
+and retrieves the durable projection while the target count remains two. It also
+checks database integrity, file mode and persisted-field privacy. These local
+fixtures do not establish coordinator recovery, safe continuation of an
+interrupted child, general network-fault handling, shared-store coordination or
+actual multi-host behavior.
 
 ## Metrics
 

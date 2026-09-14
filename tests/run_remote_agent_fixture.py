@@ -335,6 +335,7 @@ def main() -> None:
                 "transport_retries": 1,
                 "executed_results": 1,
                 "cached_results": 1,
+                "durable_results": 0,
                 "recovered_after_transport_failure": 1,
             }
             assert aggregate["clock_quality"]["passed"] is True
@@ -372,6 +373,7 @@ def main() -> None:
             assert "triton_coordinated_throughput_lower_bound_rps" in prometheus
             assert "triton_coordinated_agent_transport_retries_total 1" in prometheus
             assert "triton_coordinated_agent_cached_results_total 1" in prometheus
+            assert "triton_coordinated_agent_durable_results_total 0" in prometheus
             assert "triton_coordinated_agent_recovered_results_total 1" in prometheus
             assert "triton_coordinated_gate_passed 1" in prometheus
             assert sorted(path.name for path in result_dir.iterdir()) == [

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+import stat
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import patch
 
 from remote_agent import (
@@ -228,6 +233,107 @@ class RemoteAgentProtocolTest(unittest.TestCase):
                 server.begin_run("run-a", "a" * 64)
         finally:
             server.server_close()
+
+    def test_durable_state_recovers_completed_result_after_server_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "agent-state.sqlite3"
+            identity_a = "a" * 64
+            identity_b = "b" * 64
+            fingerprint_a = "c" * 64
+            fingerprint_b = "d" * 64
+            artifact_a = {"successful_requests": 4}
+            artifact_b = {"successful_requests": 2}
+
+            first = BenchmarkAgentServer(
+                ("127.0.0.1", 0),
+                api_key="unit-test-agent-key",
+                agent_id="unit-test-agent",
+                child_timeout_seconds=5,
+                child_environment={"PATH": "", "PYTHONIOENCODING": "utf-8"},
+                max_cached_results=1,
+                state_db=state_path,
+            )
+            try:
+                self.assertIsNone(first.begin_run(identity_a, fingerprint_a))
+                first.complete_run(identity_a, artifact_a)
+                self.assertIsNone(first.begin_run(identity_b, fingerprint_b))
+                first.complete_run(identity_b, artifact_b)
+            finally:
+                first.server_close()
+
+            self.assertEqual(stat.S_IMODE(state_path.stat().st_mode), 0o600)
+            with sqlite3.connect(state_path) as connection:
+                rows = connection.execute(
+                    "SELECT identity, request_fingerprint, state, artifact_json "
+                    "FROM agent_run_records ORDER BY accepted_order"
+                ).fetchall()
+                metadata = connection.execute(
+                    "SELECT key, value FROM agent_state_metadata ORDER BY key"
+                ).fetchall()
+            serialized_rows = json.dumps([rows, metadata])
+            self.assertNotIn("unit-test-agent-key", serialized_rows)
+            self.assertNotIn("unit-test-agent", serialized_rows)
+            self.assertEqual(rows[0][0], identity_a)
+            self.assertEqual(rows[0][2], "completed_result_expired")
+            self.assertIsNone(rows[0][3])
+            self.assertEqual(json.loads(rows[1][3]), artifact_b)
+
+            second = BenchmarkAgentServer(
+                ("127.0.0.1", 0),
+                api_key="unit-test-agent-key",
+                agent_id="unit-test-agent",
+                child_timeout_seconds=5,
+                child_environment={"PATH": "", "PYTHONIOENCODING": "utf-8"},
+                max_cached_results=1,
+                state_db=state_path,
+            )
+            try:
+                self.assertEqual(
+                    second.begin_run(identity_b, fingerprint_b), artifact_b
+                )
+                with self.assertRaisesRegex(AgentProtocolError, "different request"):
+                    second.begin_run(identity_b, "e" * 64)
+                with self.assertRaisesRegex(AgentProtocolError, "expired"):
+                    second.begin_run(identity_a, fingerprint_a)
+
+                unfinished_identity = "f" * 64
+                unfinished_fingerprint = "1" * 64
+                self.assertIsNone(
+                    second.begin_run(unfinished_identity, unfinished_fingerprint)
+                )
+                with self.assertRaisesRegex(ValueError, "unsupported field"):
+                    second.complete_run(
+                        unfinished_identity,
+                        {"private_output": "must never be stored"},
+                    )
+            finally:
+                second.server_close()
+
+            third = BenchmarkAgentServer(
+                ("127.0.0.1", 0),
+                api_key="unit-test-agent-key",
+                agent_id="unit-test-agent",
+                child_timeout_seconds=5,
+                child_environment={"PATH": "", "PYTHONIOENCODING": "utf-8"},
+                max_cached_results=1,
+                state_db=state_path,
+            )
+            try:
+                with self.assertRaisesRegex(AgentProtocolError, "did not complete"):
+                    third.begin_run(unfinished_identity, unfinished_fingerprint)
+            finally:
+                third.server_close()
+
+            with self.assertRaisesRegex(ValueError, "different agent identity"):
+                BenchmarkAgentServer(
+                    ("127.0.0.1", 0),
+                    api_key="unit-test-agent-key",
+                    agent_id="different-unit-test-agent",
+                    child_timeout_seconds=5,
+                    child_environment={"PATH": "", "PYTHONIOENCODING": "utf-8"},
+                    max_cached_results=1,
+                    state_db=state_path,
+                )
 
     def test_transport_failure_retries_same_run_and_records_cached_recovery(self) -> None:
         response = {

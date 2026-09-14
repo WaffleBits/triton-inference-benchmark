@@ -239,6 +239,9 @@ jobs:
       - name: Run authenticated remote-agent qualification
         run: python tests/run_remote_agent_fixture.py
 
+      - name: Run durable agent-restart qualification
+        run: python tests/run_agent_restart_fixture.py
+
       - name: Run bracketed-telemetry mock benchmark
         shell: bash
         run: |
