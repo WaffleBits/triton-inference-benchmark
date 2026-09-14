@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -350,7 +351,7 @@ def run_agent_benchmark(
     if not isinstance(artifact, dict):
         raise RuntimeError("agent run response did not contain an artifact object")
     result_source = response.get("result_source", "executed")
-    if result_source not in {"executed", "cached"}:
+    if result_source not in {"executed", "cached", "durable"}:
         raise RuntimeError("agent run response has an invalid result source")
     result = dict(artifact)
     result["_remote_result_delivery"] = {
@@ -372,8 +373,240 @@ def _require_int(
     return value
 
 
+class DurableRunRecordStore:
+    """Transactional bounded state containing hashes and projected results only."""
+
+    SCHEMA_VERSION = "1"
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        agent_id_sha256: str,
+        max_cached_results: int,
+        max_cached_result_bytes: int,
+    ) -> None:
+        self.path = path
+        self.max_cached_results = max_cached_results
+        self.max_cached_result_bytes = max_cached_result_bytes
+        if path.exists() and path.is_symlink():
+            raise ValueError("agent state database must not be a symbolic link")
+        if not path.parent.is_dir():
+            raise ValueError("agent state database parent directory does not exist")
+        if path.exists() and not path.is_file():
+            raise ValueError("agent state database must be a regular file")
+
+        self.connection = sqlite3.connect(str(path), check_same_thread=False)
+        try:
+            self.connection.execute("PRAGMA journal_mode=DELETE")
+            self.connection.execute("PRAGMA synchronous=FULL")
+            self.connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS agent_state_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS agent_run_records (
+                    accepted_order INTEGER PRIMARY KEY AUTOINCREMENT,
+                    identity TEXT NOT NULL UNIQUE,
+                    request_fingerprint TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (
+                        state IN ('accepted', 'completed', 'completed_result_expired')
+                    ),
+                    artifact_json TEXT,
+                    artifact_bytes INTEGER NOT NULL CHECK (artifact_bytes >= 0),
+                    completed_order INTEGER UNIQUE,
+                    CHECK (
+                        (state = 'completed' AND artifact_json IS NOT NULL
+                            AND artifact_bytes > 0 AND completed_order IS NOT NULL)
+                        OR
+                        (state != 'completed' AND artifact_json IS NULL
+                            AND artifact_bytes = 0)
+                    )
+                );
+                """
+            )
+            with self.connection:
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO agent_state_metadata(key, value) "
+                    "VALUES ('schema_version', ?)",
+                    (self.SCHEMA_VERSION,),
+                )
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO agent_state_metadata(key, value) "
+                    "VALUES ('agent_id_sha256', ?)",
+                    (agent_id_sha256,),
+                )
+            schema_row = self.connection.execute(
+                "SELECT value FROM agent_state_metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            if schema_row != (self.SCHEMA_VERSION,):
+                raise ValueError("agent state database schema version is unsupported")
+            identity_row = self.connection.execute(
+                "SELECT value FROM agent_state_metadata WHERE key = 'agent_id_sha256'"
+            ).fetchone()
+            if identity_row != (agent_id_sha256,):
+                raise ValueError(
+                    "agent state database is bound to a different agent identity"
+                )
+            integrity = self.connection.execute("PRAGMA integrity_check").fetchone()
+            if integrity != ("ok",):
+                raise ValueError("agent state database failed its integrity check")
+            os.chmod(path, 0o600)
+            with self.connection:
+                self._enforce_identity_limit_locked()
+                self._enforce_result_limits_locked()
+            self.load_records()
+        except Exception:
+            self.connection.close()
+            raise
+
+    @staticmethod
+    def _decode_artifact(raw: str, expected_bytes: int) -> dict[str, object]:
+        if len(raw.encode("utf-8")) != expected_bytes:
+            raise ValueError("durable agent result size metadata is invalid")
+        try:
+            artifact = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("durable agent result is not valid JSON") from exc
+        if not isinstance(artifact, dict):
+            raise ValueError("durable agent result must be a JSON object")
+        if any(key not in COORDINATED_ARTIFACT_FIELDS for key in artifact):
+            raise ValueError("durable agent result contains an unsupported field")
+        return artifact
+
+    def _enforce_identity_limit_locked(self) -> list[str]:
+        expired: list[str] = []
+        count_row = self.connection.execute(
+            "SELECT COUNT(*) FROM agent_run_records"
+        ).fetchone()
+        count = int(count_row[0]) if count_row is not None else 0
+        while count > MAX_REPLAY_IDENTITIES:
+            row = self.connection.execute(
+                "SELECT identity FROM agent_run_records ORDER BY accepted_order LIMIT 1"
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("durable agent identity accounting is inconsistent")
+            identity = str(row[0])
+            self.connection.execute(
+                "DELETE FROM agent_run_records WHERE identity = ?", (identity,)
+            )
+            expired.append(identity)
+            count -= 1
+        return expired
+
+    def _enforce_result_limits_locked(self) -> list[str]:
+        expired: list[str] = []
+        totals = self.connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(artifact_bytes), 0) "
+            "FROM agent_run_records WHERE state = 'completed'"
+        ).fetchone()
+        count = int(totals[0]) if totals is not None else 0
+        size = int(totals[1]) if totals is not None else 0
+        while count > self.max_cached_results or size > self.max_cached_result_bytes:
+            row = self.connection.execute(
+                "SELECT identity, artifact_bytes FROM agent_run_records "
+                "WHERE state = 'completed' ORDER BY completed_order LIMIT 1"
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("durable agent result accounting is inconsistent")
+            identity = str(row[0])
+            artifact_bytes = int(row[1])
+            self.connection.execute(
+                "UPDATE agent_run_records SET state = 'completed_result_expired', "
+                "artifact_json = NULL, artifact_bytes = 0, completed_order = NULL "
+                "WHERE identity = ?",
+                (identity,),
+            )
+            expired.append(identity)
+            count -= 1
+            size -= artifact_bytes
+        return expired
+
+    def load_records(self) -> list[tuple[str, dict[str, Any]]]:
+        """Read and validate all bounded records in acceptance order."""
+        records: list[tuple[str, dict[str, Any]]] = []
+        rows = self.connection.execute(
+            "SELECT identity, request_fingerprint, state, artifact_json, "
+            "artifact_bytes, completed_order FROM agent_run_records "
+            "ORDER BY accepted_order"
+        ).fetchall()
+        for identity, fingerprint, state, artifact_json, artifact_bytes, completed_order in rows:
+            if not isinstance(identity, str) or HASH_PATTERN.fullmatch(identity) is None:
+                raise ValueError("durable agent identity is not lowercase SHA-256")
+            if not isinstance(fingerprint, str) or HASH_PATTERN.fullmatch(fingerprint) is None:
+                raise ValueError("durable request fingerprint is not lowercase SHA-256")
+            artifact: dict[str, object] | None = None
+            if state == "completed":
+                if not isinstance(artifact_json, str) or not isinstance(artifact_bytes, int):
+                    raise ValueError("durable completed agent result is invalid")
+                artifact = self._decode_artifact(artifact_json, artifact_bytes)
+                if not isinstance(completed_order, int):
+                    raise ValueError("durable completed-result order is invalid")
+            elif state not in {"accepted", "completed_result_expired"}:
+                raise ValueError("durable agent run state is invalid")
+            records.append(
+                (
+                    identity,
+                    {
+                        "request_fingerprint": fingerprint,
+                        "state": state,
+                        "artifact": artifact,
+                        "artifact_bytes": int(artifact_bytes),
+                        "completed_order": completed_order,
+                    },
+                )
+            )
+        return records
+
+    def accept_run(self, identity: str, request_fingerprint: str) -> list[str]:
+        """Durably accept one identity before its child can be launched."""
+        if HASH_PATTERN.fullmatch(identity) is None:
+            raise ValueError("agent run identity is not lowercase SHA-256")
+        if HASH_PATTERN.fullmatch(request_fingerprint) is None:
+            raise ValueError("agent request fingerprint is not lowercase SHA-256")
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO agent_run_records("
+                "identity, request_fingerprint, state, artifact_json, artifact_bytes"
+                ") VALUES (?, ?, 'accepted', NULL, 0)",
+                (identity, request_fingerprint),
+            )
+            return self._enforce_identity_limit_locked()
+
+    def complete_run(
+        self, identity: str, artifact: dict[str, object]
+    ) -> list[str]:
+        """Commit one projected result and bounded evictions before HTTP success."""
+        artifact_json = json.dumps(
+            artifact, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        artifact_bytes = len(artifact_json.encode("utf-8"))
+        self._decode_artifact(artifact_json, artifact_bytes)
+        with self.connection:
+            state_row = self.connection.execute(
+                "SELECT state FROM agent_run_records WHERE identity = ?", (identity,)
+            ).fetchone()
+            if state_row != ("accepted",):
+                raise RuntimeError("durable run identity was not in the accepted state")
+            order_row = self.connection.execute(
+                "SELECT COALESCE(MAX(completed_order), 0) + 1 "
+                "FROM agent_run_records"
+            ).fetchone()
+            completed_order = int(order_row[0])
+            self.connection.execute(
+                "UPDATE agent_run_records SET state = 'completed', artifact_json = ?, "
+                "artifact_bytes = ?, completed_order = ? WHERE identity = ?",
+                (artifact_json, artifact_bytes, completed_order, identity),
+            )
+            return self._enforce_result_limits_locked()
+
+    def close(self) -> None:
+        self.connection.close()
+
+
 class BenchmarkAgentServer(HTTPServer):
-    """Single-job-at-a-time HTTP server with bounded idempotency memory."""
+    """Single-job-at-a-time server with bounded memory or opt-in durable state."""
 
     def __init__(
         self,
@@ -385,6 +618,7 @@ class BenchmarkAgentServer(HTTPServer):
         child_environment: dict[str, str],
         max_cached_results: int = MAX_CACHED_RESULTS,
         max_cached_result_bytes: int = MAX_CACHED_RESULT_BYTES,
+        state_db: Path | None = None,
     ) -> None:
         super().__init__(server_address, BenchmarkAgentHandler)
         self.api_key = api_key
@@ -400,6 +634,38 @@ class BenchmarkAgentServer(HTTPServer):
         self.completed_result_order: deque[str] = deque()
         self.cached_result_count = 0
         self.cached_result_bytes = 0
+        self.durable_store: DurableRunRecordStore | None = None
+        if state_db is not None:
+            try:
+                self.durable_store = DurableRunRecordStore(
+                    state_db,
+                    agent_id_sha256=self.agent_id_sha256,
+                    max_cached_results=max_cached_results,
+                    max_cached_result_bytes=max_cached_result_bytes,
+                )
+                loaded = self.durable_store.load_records()
+            except Exception:
+                super().server_close()
+                raise
+            for identity, record in loaded:
+                self.run_records[identity] = record
+                self.replay_order.append(identity)
+                if isinstance(record.get("artifact"), dict):
+                    self.completed_result_order.append(identity)
+                    self.cached_result_count += 1
+                    self.cached_result_bytes += int(record["artifact_bytes"])
+
+    @property
+    def cached_result_source(self) -> str:
+        return "durable" if self.durable_store is not None else "cached"
+
+    def server_close(self) -> None:
+        try:
+            super().server_close()
+        finally:
+            if self.durable_store is not None:
+                self.durable_store.close()
+                self.durable_store = None
 
     def begin_run(
         self, identity: str, request_fingerprint: str
@@ -424,15 +690,23 @@ class BenchmarkAgentServer(HTTPServer):
                 "run/client identity was accepted but did not complete", status=409
             )
 
-        self.run_records[identity] = {
+        new_record = {
             "request_fingerprint": request_fingerprint,
             "state": "accepted",
             "artifact": None,
             "artifact_bytes": 0,
         }
+        durable_expired: list[str] = []
+        if self.durable_store is not None:
+            durable_expired = self.durable_store.accept_run(
+                identity, request_fingerprint
+            )
+        self.run_records[identity] = new_record
         self.replay_order.append(identity)
         if len(self.replay_order) > MAX_REPLAY_IDENTITIES:
             expired = self.replay_order.popleft()
+            if durable_expired and durable_expired != [expired]:
+                raise RuntimeError("durable agent identity eviction order diverged")
             expired_record = self.run_records.pop(expired, None)
             if expired_record is not None and isinstance(
                 expired_record.get("artifact"), dict
@@ -450,6 +724,9 @@ class BenchmarkAgentServer(HTTPServer):
         artifact_bytes = len(
             json.dumps(artifact_copy, separators=(",", ":")).encode("utf-8")
         )
+        durable_expired: list[str] | None = None
+        if self.durable_store is not None:
+            durable_expired = self.durable_store.complete_run(identity, artifact_copy)
         record.update(
             {
                 "state": "completed",
@@ -461,11 +738,22 @@ class BenchmarkAgentServer(HTTPServer):
         self.cached_result_count += 1
         self.cached_result_bytes += artifact_bytes
 
-        while (
-            self.cached_result_count > self.max_cached_results
-            or self.cached_result_bytes > self.max_cached_result_bytes
+        while durable_expired or (
+            durable_expired is None
+            and (
+                self.cached_result_count > self.max_cached_results
+                or self.cached_result_bytes > self.max_cached_result_bytes
+            )
         ):
-            expired = self.completed_result_order.popleft()
+            expired = (
+                durable_expired.pop(0)
+                if durable_expired is not None
+                else self.completed_result_order.popleft()
+            )
+            if self.completed_result_order and self.completed_result_order[0] == expired:
+                self.completed_result_order.popleft()
+            elif durable_expired is not None:
+                raise RuntimeError("durable agent result eviction order diverged")
             expired_record = self.run_records.get(expired)
             if expired_record is None or not isinstance(
                 expired_record.get("artifact"), dict
@@ -619,7 +907,7 @@ class BenchmarkAgentHandler(BaseHTTPRequestHandler):
                 {
                     "schema_version": 1,
                     "agent_id_sha256": self.server.agent_id_sha256,
-                    "result_source": "cached",
+                    "result_source": self.server.cached_result_source,
                     "artifact": cached_artifact,
                 },
             )
@@ -696,6 +984,14 @@ def _parse_args() -> argparse.Namespace:
         help="Environment variable explicitly allowed into benchmark children.",
     )
     parser.add_argument("--child-timeout-seconds", type=float, default=180.0)
+    parser.add_argument(
+        "--state-db",
+        type=Path,
+        help=(
+            "Optional SQLite path for bounded restart-safe run/result state; "
+            "the file contains hashes and coordinator-only result projections."
+        ),
+    )
     args = parser.parse_args()
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
@@ -725,6 +1021,7 @@ def main() -> None:
         agent_id=args.agent_id,
         child_timeout_seconds=args.child_timeout_seconds,
         child_environment=args.child_environment,
+        state_db=args.state_db,
     )
     if args.port_file:
         Path(args.port_file).write_text(str(server.server_address[1]), encoding="utf-8")

@@ -19,8 +19,9 @@ drives a real inference endpoint.
   gates, and privacy-safe aggregate request/retry/window artifacts.
 - Authenticated remote-agent coordination with explicit opt-in credentials,
   NTP-style clock sampling, conservative skew/overlap/throughput bounds, replay
-  conflict rejection, idempotent completed-result recovery after ambiguous
-  response loss, and no agent URLs or authorization data in aggregate artifacts.
+  conflict rejection, in-memory recovery after ambiguous response loss, optional
+  SQLite-backed recovery across agent restart, and no agent URLs or authorization
+  data in aggregate artifacts.
 - Optional phase-separated warmup requests with their own outcomes, latency,
   throughput, JSON, and Prometheus records; headline and cost metrics remain
   scoped to the measured phase.
@@ -170,8 +171,15 @@ python remote_agent.py \
   --listen-host 127.0.0.1 \
   --port 8081 \
   --agent-id loadgen-a \
-  --api-key-env BENCHMARK_AGENT_KEY
+  --api-key-env BENCHMARK_AGENT_KEY \
+  --state-db /var/lib/triton-benchmark-agent/run-state.sqlite3
 ```
+
+`--state-db` is optional. Without it, completed-result recovery remains bounded
+and process-local. With it, the agent creates or opens an owner-only SQLite
+file and commits each accepted identity before child launch. Keep the file on
+operator-managed local storage and reuse both the file and `--agent-id` when the
+service restarts.
 
 Repeat `--agent-url` once per client when launching the coordinator:
 
@@ -212,15 +220,20 @@ a bounded set of hashed run/client identities. For each accepted job it retains
 only a canonical request fingerprint and, after completion, a coordinator-only
 projection containing only fields required for shard reconciliation. The
 projection excludes child configuration, target/model data, latency details,
-prompt hashes, output data, and filesystem paths before it is returned or placed
-in the bounded in-memory cache. An identical completed request returns the cached
-result without launching another child. The same identity with different
-arguments, an unfinished prior execution, or an expired result is rejected. The
-coordinator retries only ambiguous transport/response failures, up to
+prompt hashes, output data, and filesystem paths. The default cache is in memory.
+When `--state-db` is selected, SQLite stores only the hashed identity, canonical
+request fingerprint, state, ordering metadata, and that same projection. It uses
+full synchronous transactions, an owner-only file mode, and a hashed binding to
+the configured agent identity. A completed result is committed before HTTP
+success is written, so an identical request can retrieve it without another child
+after an agent restart. An identity accepted before an
+interrupted child remains fail-closed; it is not automatically re-executed. The
+same identity with different arguments or an expired result is also rejected.
+The coordinator retries only ambiguous transport/response failures, up to
 `--agent-run-recovery-attempts` (default 1, maximum 3); explicit HTTP rejections
 are not retried. Aggregate JSON and Prometheus output separate transport retries,
-fresh executions, cached responses, and completed results recovered after a
-transport failure.
+fresh executions, memory-cached responses, durable responses, and completed
+results recovered after a transport failure.
 
 One explicitly selected bearer key is sent to every configured agent, so combine
 only agents authorized to receive that credential. Authenticated requests do not
@@ -239,11 +252,16 @@ single host. The coordinator retrieves that result from agent memory; the target
 still receives exactly eight requests, not twelve. The fixture proves
 authentication, conflicting-replay rejection, bounded completed-result recovery,
 CLI wiring, clock accounting, trace uniqueness, and artifact redaction over
-loopback. The cache is process-local and bounded to eight completed results and
-64 MiB while identity records are retained for 1,024 accepted jobs. This does not
-prove recovery after agent/coordinator process loss, persistent deduplication,
-arbitrary network faults, multi-host behavior, hardware clock synchronization, a
-model/GPU, traffic isolation, or fleet scale.
+loopback. A separate restart fixture sends two traced requests, discards the
+completed response, stops the agent, starts a second process on the same SQLite
+file, and retrieves the durable result without a third target request. It checks
+database integrity, owner-only permissions, conflict rejection, and exclusion of
+the key, raw agent/run IDs, target URL, prompt, state path, and trace IDs from the
+stored rows. Both stores retain at most eight completed results / 64 MiB and 1,024
+accepted identities. These fixtures do not prove coordinator restart recovery,
+recovery of an interrupted child, arbitrary network faults, multi-host storage or
+behavior, hardware clock synchronization, a model/GPU, traffic isolation, or
+fleet scale.
 
 Gate the extra client work used to recover failed logical requests:
 
@@ -571,6 +589,7 @@ server under test rather than the mock generator.
 python -m unittest discover -s tests
 python tests/run_coordinated_client_fixture.py
 python tests/run_remote_agent_fixture.py
+python tests/run_agent_restart_fixture.py
 ```
 
 ## More
@@ -583,7 +602,7 @@ python tests/run_remote_agent_fixture.py
 
 - Server-lifecycle hooks for controlled cold-start measurements.
 - Exercise authenticated agents on separate authorized hosts behind TLS, then
-  qualify clock drift, persistent job state, and broader controlled network
-  faults without weakening the conservative time bounds.
+  qualify clock drift, coordinator recovery, shared-store ownership, and broader
+  controlled network faults without weakening the conservative time bounds.
 - Exercise the multi-source path gate in a real orchestrated router/model-server
   deployment; the committed qualification remains a synthetic single-host fixture.

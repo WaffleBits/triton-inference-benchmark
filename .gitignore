@@ -24,6 +24,8 @@ wheels/
 
 # Benchmark results
 benchmark_results/
+*.sqlite
+*.sqlite3
 
 # Virtual Environment
 venv/

@@ -383,6 +383,7 @@ def build_remote_coordinated_summary(
     total_transport_retries = 0
     executed_results = 0
     cached_results = 0
+    durable_results = 0
     recovered_results = 0
     configured_recovery_attempts: set[int] = set()
 
@@ -409,7 +410,7 @@ def build_remote_coordinated_summary(
         if remote.get("clock_selection") != "minimum_network_delay":
             raise ValueError("remote clock selection method is unsupported")
         result_source = delivery.get("result_source")
-        if result_source not in {"executed", "cached"}:
+        if result_source not in {"executed", "cached", "durable"}:
             raise ValueError("remote result source is invalid")
         transport_retries = _integer_value(
             delivery,
@@ -431,8 +432,12 @@ def build_remote_coordinated_summary(
         total_transport_retries += transport_retries
         if result_source == "executed":
             executed_results += 1
-        else:
+        elif result_source == "cached":
             cached_results += 1
+            if transport_retries > 0:
+                recovered_results += 1
+        else:
+            durable_results += 1
             if transport_retries > 0:
                 recovered_results += 1
         offset_ns = _integer_value(
@@ -579,7 +584,7 @@ def build_remote_coordinated_summary(
                 "authentication": "explicit_bearer_key_environment_variable",
                 "transport_policy": "https_or_loopback_http",
                 "replay_identity": "sha256_run_id_and_client_index",
-                "result_recovery": "bounded_in_memory_identical_request_cache",
+                "result_recovery": "bounded_agent_selected_identical_request_store",
             },
             "agent_identity_fingerprints_sha256": sorted(agent_hashes),
             "result_delivery": {
@@ -589,6 +594,7 @@ def build_remote_coordinated_summary(
                 "transport_retries": total_transport_retries,
                 "executed_results": executed_results,
                 "cached_results": cached_results,
+                "durable_results": durable_results,
                 "recovered_after_transport_failure": recovered_results,
             },
             "clock_quality": {
@@ -723,7 +729,11 @@ def _format_remote_prometheus(summary: dict[str, object]) -> str:
         "# TYPE triton_coordinated_agent_cached_results_total counter",
         "triton_coordinated_agent_cached_results_total "
         f"{_nonnegative_int(delivery, 'cached_results', 'result_delivery')}",
-        "# HELP triton_coordinated_agent_recovered_results_total Cached results recovered after an ambiguous transport failure.",
+        "# HELP triton_coordinated_agent_durable_results_total Completed results served from opt-in durable agent state.",
+        "# TYPE triton_coordinated_agent_durable_results_total counter",
+        "triton_coordinated_agent_durable_results_total "
+        f"{_nonnegative_int(delivery, 'durable_results', 'result_delivery')}",
+        "# HELP triton_coordinated_agent_recovered_results_total Stored results recovered after an ambiguous transport failure.",
         "# TYPE triton_coordinated_agent_recovered_results_total counter",
         "triton_coordinated_agent_recovered_results_total "
         f"{_nonnegative_int(delivery, 'recovered_after_transport_failure', 'result_delivery')}",
