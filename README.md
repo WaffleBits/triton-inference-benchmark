@@ -166,6 +166,7 @@ variable explicitly named on both sides.
 
 ```bash
 export BENCHMARK_AGENT_KEY="replace-with-an-operator-managed-secret"
+export BENCHMARK_COORDINATOR_RESUME_TOKEN="use-a-separate-operator-managed-secret"
 
 python remote_agent.py \
   --listen-host 127.0.0.1 \
@@ -189,6 +190,8 @@ python coordinated_benchmark.py \
   --agent-url https://loadgen-a.example.internal \
   --agent-url https://loadgen-b.example.internal \
   --agent-api-key-env BENCHMARK_AGENT_KEY \
+  --coordinator-state-file /var/lib/triton-benchmark-coordinator/run-state.json \
+  --coordinator-resume-token-env BENCHMARK_COORDINATOR_RESUME_TOKEN \
   --clock-samples 5 \
   --max-clock-uncertainty-ms 25 \
   --max-start-skew-ms 100 \
@@ -246,20 +249,42 @@ Raw keys, challenges, agent IDs, URLs, child paths, endpoints, prompts, outputs,
 and trace IDs are absent from the aggregate. Hashed agent identities establish
 protocol-level distinctness, not proof of separate physical machines.
 
+Coordinator restart recovery is opt-in and completed-work-only. Before first
+dispatch, `--coordinator-state-file` publishes a bounded owner-only manifest
+authenticated by the separate environment-selected resume token. It records the
+original clock plan, agent identity hashes, a random workflow nonce, and a
+configuration fingerprint, but not the token, derived run ID, benchmark
+arguments, agent/target URLs, prompts, result bodies, paths, or trace IDs. On a
+later invocation with the same state file, agent order, and arguments, the
+coordinator re-derives the exact run ID, probes current agent identities, and
+uses authenticated `/v1/run-status` requests. It retrieves results only after
+every exact shard is still completed and available. A missing, accepted,
+expired, conflicting, or reconfigured shard fails closed before any `/v1/run`
+request, so stale planned starts cannot launch partial replacement work. Keep
+the manifest outside the output directory, preserve its `0600` permissions, and
+reuse neither the agent bearer key nor its environment variable as the resume
+token. Delete or archive the manifest under operator policy after the result no
+longer needs restart retrieval.
+
 CI exercises two agent services, two real benchmark child processes, one
 synthetic SSE target, and a proxy that discards one completed run response on a
 single host. The coordinator retrieves that result from agent memory; the target
 still receives exactly eight requests, not twelve. The fixture proves
 authentication, conflicting-replay rejection, bounded completed-result recovery,
 CLI wiring, clock accounting, trace uniqueness, and artifact redaction over
-loopback. A separate restart fixture sends two traced requests, discards the
+loopback. A separate agent-restart fixture sends two traced requests, discards the
 completed response, stops the agent, starts a second process on the same SQLite
 file, and retrieves the durable result without a third target request. It checks
 database integrity, owner-only permissions, conflict rejection, and exclusion of
 the key, raw agent/run IDs, target URL, prompt, state path, and trace IDs from the
-stored rows. Both stores retain at most eight completed results / 64 MiB and 1,024
-accepted identities. These fixtures do not prove coordinator restart recovery,
-recovery of an interrupted child, arbitrary network faults, multi-host storage or
+stored rows. The coordinator-restart fixture withholds both completed responses,
+terminates the first coordinator, starts a second process, verifies both exact
+completed statuses, and retrieves the two cached shard projections while the
+synthetic target count remains eight. It also checks manifest authentication,
+owner-only permissions, CLI wiring, and serialized privacy boundaries. Agent
+stores retain at most eight completed results / 64 MiB and 1,024 accepted
+identities. These fixtures do not prove partial-workflow continuation, recovery
+of an interrupted child, arbitrary network faults, multi-host storage or
 behavior, hardware clock synchronization, a model/GPU, traffic isolation, or
 fleet scale.
 
@@ -590,6 +615,7 @@ python -m unittest discover -s tests
 python tests/run_coordinated_client_fixture.py
 python tests/run_remote_agent_fixture.py
 python tests/run_agent_restart_fixture.py
+python tests/run_coordinator_restart_fixture.py
 ```
 
 ## More
@@ -602,7 +628,9 @@ python tests/run_agent_restart_fixture.py
 
 - Server-lifecycle hooks for controlled cold-start measurements.
 - Exercise authenticated agents on separate authorized hosts behind TLS, then
-  qualify clock drift, coordinator recovery, shared-store ownership, and broader
-  controlled network faults without weakening the conservative time bounds.
+  qualify bounded clock drift, shared-store ownership, and broader controlled
+  network faults without weakening the conservative time bounds.
+- Extend restart handling beyond completed-shard reconciliation only after an
+  explicit lease/cancellation design can prevent duplicate in-flight work.
 - Exercise the multi-source path gate in a real orchestrated router/model-server
   deployment; the committed qualification remains a synthetic single-host fixture.

@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
+import tempfile
 import time
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from benchmark import (
@@ -14,10 +19,16 @@ from benchmark import (
     run_benchmark,
 )
 from coordinated_benchmark import (
+    build_coordinator_configuration_fingerprint,
     build_coordinated_summary,
     build_remote_coordinated_summary,
+    create_coordinator_resume_manifest,
+    derive_coordinator_run_id,
     format_coordinated_prometheus,
+    load_coordinator_resume_manifest,
+    _run_remote_clients,
     validate_benchmark_args,
+    write_coordinator_resume_manifest,
 )
 
 
@@ -116,6 +127,186 @@ def remote_shard(
 
 
 class CoordinatedBenchmarkTest(unittest.TestCase):
+    def test_resume_refuses_missing_shard_without_launching_work(self) -> None:
+        resume_token = "private-coordinator-resume-token-32-characters"
+        agent_key = "separate-agent-api-key-material"
+        profiles = [
+            {
+                "agent_id_sha256": "d" * 64,
+                "agent_id_persisted": False,
+                "clock_offset_agent_minus_coordinator_ns": 10,
+                "clock_network_delay_ns": 20,
+                "clock_uncertainty_ns": 10,
+                "clock_sample_count": 3,
+                "clock_selection": "minimum_network_delay",
+            },
+            {
+                "agent_id_sha256": "e" * 64,
+                "agent_id_persisted": False,
+                "clock_offset_agent_minus_coordinator_ns": -10,
+                "clock_network_delay_ns": 20,
+                "clock_uncertainty_ns": 10,
+                "clock_sample_count": 3,
+                "clock_selection": "minimum_network_delay",
+            },
+        ]
+        benchmark_args = ["--mode", "mock", "--num-requests", "2"]
+        configuration_hash = build_coordinator_configuration_fingerprint(
+            client_count=2,
+            benchmark_args=benchmark_args,
+            timeout_seconds=30,
+            max_start_skew_ms=100,
+            max_clock_uncertainty_ms=25,
+            agent_run_recovery_attempts=1,
+            agent_hashes=["d" * 64, "e" * 64],
+        )
+        manifest = create_coordinator_resume_manifest(
+            resume_token=resume_token,
+            configuration_sha256=configuration_hash,
+            planned_start_coordinator_unix_ns=1_000_000_000,
+            clock_profiles=profiles,
+            workflow_nonce="a" * 64,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "coordinator-state.json"
+            write_coordinator_resume_manifest(state_path, manifest)
+            args = SimpleNamespace(
+                agent_api_key=agent_key,
+                coordinator_state_file=state_path,
+                coordinator_resume_token=resume_token,
+                clients=2,
+                clock_samples=3,
+                timeout_seconds=30.0,
+                agent_url=["http://127.0.0.1:8001", "http://127.0.0.1:8002"],
+                benchmark_args=benchmark_args,
+                max_start_skew_ms=100.0,
+                max_clock_uncertainty_ms=25.0,
+                agent_run_recovery_attempts=1,
+                lead_time_ms=500.0,
+            )
+
+            def probe(url: str, **_: object) -> dict[str, object]:
+                return profiles[0] if url.endswith("8001") else profiles[1]
+
+            def status(url: str, **_: object) -> dict[str, object]:
+                if url.endswith("8001"):
+                    return {
+                        "state": "completed",
+                        "result_available": True,
+                        "result_source": "cached",
+                    }
+                return {"state": "missing", "result_available": False}
+
+            with (
+                patch("coordinated_benchmark.probe_agent_clock", side_effect=probe),
+                patch("coordinated_benchmark.query_agent_run_status", side_effect=status),
+                patch("coordinated_benchmark.run_agent_benchmark") as run,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "no workload was launched"):
+                    _run_remote_clients(args)
+                run.assert_not_called()
+
+    def test_resume_manifest_is_owner_only_authenticated_and_private(self) -> None:
+        resume_token = "private-coordinator-resume-token-32-characters"
+        private_prompt = "private coordinator restart prompt"
+        private_url = "https://private-agent.example.test"
+        private_env = "PRIVATE_COORDINATOR_RESUME_TOKEN"
+        agent_hashes = ["d" * 64, "e" * 64]
+        configuration_hash = build_coordinator_configuration_fingerprint(
+            client_count=2,
+            benchmark_args=[
+                "--mode",
+                "openai",
+                "--server-url",
+                private_url,
+                "--openai-prompt",
+                private_prompt,
+            ],
+            timeout_seconds=30,
+            max_start_skew_ms=100,
+            max_clock_uncertainty_ms=25,
+            agent_run_recovery_attempts=1,
+            agent_hashes=agent_hashes,
+        )
+        clock_profiles = [
+            {
+                "agent_id_sha256": agent_hashes[0],
+                "agent_id_persisted": False,
+                "clock_offset_agent_minus_coordinator_ns": 100,
+                "clock_network_delay_ns": 20,
+                "clock_uncertainty_ns": 10,
+                "clock_sample_count": 5,
+                "clock_selection": "minimum_network_delay",
+            },
+            {
+                "agent_id_sha256": agent_hashes[1],
+                "agent_id_persisted": False,
+                "clock_offset_agent_minus_coordinator_ns": -50,
+                "clock_network_delay_ns": 40,
+                "clock_uncertainty_ns": 20,
+                "clock_sample_count": 5,
+                "clock_selection": "minimum_network_delay",
+            },
+        ]
+        manifest = create_coordinator_resume_manifest(
+            resume_token=resume_token,
+            configuration_sha256=configuration_hash,
+            planned_start_coordinator_unix_ns=1_000_000_000,
+            clock_profiles=clock_profiles,
+            workflow_nonce="a" * 64,
+        )
+
+        run_id = derive_coordinator_run_id(resume_token, manifest["workflow_nonce"])
+        self.assertEqual(len(run_id), 64)
+        self.assertEqual(
+            run_id,
+            derive_coordinator_run_id(resume_token, manifest["workflow_nonce"]),
+        )
+        self.assertNotIn(resume_token, run_id)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "coordinator-state.json"
+            write_coordinator_resume_manifest(state_path, manifest)
+            self.assertEqual(stat.S_IMODE(state_path.stat().st_mode), 0o600)
+            loaded = load_coordinator_resume_manifest(state_path, resume_token)
+            self.assertEqual(loaded, manifest)
+            original_bytes = state_path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                write_coordinator_resume_manifest(state_path, manifest)
+            self.assertEqual(state_path.read_bytes(), original_bytes)
+
+            serialized = state_path.read_text(encoding="utf-8")
+            for private_value in (
+                resume_token,
+                private_prompt,
+                private_url,
+                private_env,
+                run_id,
+                str(state_path),
+                "raw-agent-a",
+                "raw-agent-b",
+            ):
+                self.assertNotIn(private_value, serialized)
+            self.assertNotIn('"benchmark_args"', serialized)
+            self.assertFalse(loaded["privacy"]["resume_token_persisted"])
+            self.assertFalse(loaded["privacy"]["run_id_persisted"])
+            self.assertFalse(loaded["privacy"]["benchmark_arguments_persisted"])
+            self.assertFalse(loaded["privacy"]["agent_urls_persisted"])
+            self.assertFalse(loaded["privacy"]["result_bodies_persisted"])
+
+            with self.assertRaisesRegex(ValueError, "authentication"):
+                load_coordinator_resume_manifest(
+                    state_path, "different-private-resume-token-32-chars"
+                )
+
+            tampered = json.loads(state_path.read_text(encoding="utf-8"))
+            tampered["planned_start_coordinator_unix_ns"] += 1
+            state_path.write_text(json.dumps(tampered), encoding="utf-8")
+            os.chmod(state_path, 0o600)
+            with self.assertRaisesRegex(ValueError, "authentication"):
+                load_coordinator_resume_manifest(state_path, resume_token)
+
     def test_child_coordination_hashes_id_and_records_measured_window(self) -> None:
         raw_run_id = "private-coordination-id"
         coordination = CoordinatedClientConfig(

@@ -296,6 +296,98 @@ def probe_agent_clock(
     }
 
 
+def _build_run_payload(
+    *,
+    run_id: str,
+    client_index: int,
+    client_count: int,
+    planned_start_agent_unix_ns: int,
+    benchmark_args: list[str],
+    timeout_seconds: float,
+) -> dict[str, object]:
+    """Build the exact request used for status checks and idempotent execution."""
+    return {
+        "schema_version": 1,
+        "run_id": run_id,
+        "client_index": client_index,
+        "client_count": client_count,
+        "planned_start_unix_ns": planned_start_agent_unix_ns,
+        "benchmark_args": benchmark_args,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def query_agent_run_status(
+    base_url: str,
+    *,
+    api_key: str,
+    expected_agent_id_sha256: str,
+    run_id: str,
+    client_index: int,
+    client_count: int,
+    planned_start_agent_unix_ns: int,
+    benchmark_args: list[str],
+    timeout_seconds: float,
+) -> dict[str, object]:
+    """Inspect one exact run request without accepting or executing it."""
+    response = _post_json(
+        base_url,
+        "/v1/run-status",
+        _build_run_payload(
+            run_id=run_id,
+            client_index=client_index,
+            client_count=client_count,
+            planned_start_agent_unix_ns=planned_start_agent_unix_ns,
+            benchmark_args=benchmark_args,
+            timeout_seconds=timeout_seconds,
+        ),
+        api_key=api_key,
+        timeout_seconds=min(timeout_seconds, 10.0),
+    )
+    if response.get("schema_version") != 1:
+        raise RuntimeError("agent status response has an unsupported schema")
+    response_agent_hash = response.get("agent_id_sha256")
+    if not isinstance(response_agent_hash, str) or not hmac.compare_digest(
+        response_agent_hash, expected_agent_id_sha256
+    ):
+        raise RuntimeError("agent identity changed between clock probe and status")
+
+    state = response.get("state")
+    available = response.get("result_available")
+    result_source = response.get("result_source")
+    if state == "completed":
+        if available is not True or result_source not in {"cached", "durable"}:
+            raise RuntimeError("agent completed status is inconsistent")
+        expected_fields = {
+            "schema_version",
+            "agent_id_sha256",
+            "state",
+            "result_available",
+            "result_source",
+        }
+    elif state in {"missing", "accepted", "completed_result_expired"}:
+        if available is not False or result_source is not None:
+            raise RuntimeError("agent non-completed status is inconsistent")
+        expected_fields = {
+            "schema_version",
+            "agent_id_sha256",
+            "state",
+            "result_available",
+        }
+    else:
+        raise RuntimeError("agent run status is invalid")
+    if set(response) != expected_fields:
+        raise RuntimeError("agent status response contains unsupported fields")
+
+    status: dict[str, object] = {
+        "state": state,
+        "result_available": available,
+    }
+    if isinstance(result_source, str):
+        status["result_source"] = result_source
+    return status
+
+
 def run_agent_benchmark(
     base_url: str,
     *,
@@ -316,15 +408,14 @@ def run_agent_benchmark(
         or not 0 <= recovery_attempts <= 3
     ):
         raise ValueError("agent result recovery attempts must be between 0 and 3")
-    payload: dict[str, object] = {
-        "schema_version": 1,
-        "run_id": run_id,
-        "client_index": client_index,
-        "client_count": client_count,
-        "planned_start_unix_ns": planned_start_agent_unix_ns,
-        "benchmark_args": benchmark_args,
-        "timeout_seconds": timeout_seconds,
-    }
+    payload = _build_run_payload(
+        run_id=run_id,
+        client_index=client_index,
+        client_count=client_count,
+        planned_start_agent_unix_ns=planned_start_agent_unix_ns,
+        benchmark_args=benchmark_args,
+        timeout_seconds=timeout_seconds,
+    )
     transport_retries = 0
     while True:
         try:
@@ -715,6 +806,31 @@ class BenchmarkAgentServer(HTTPServer):
                 self.cached_result_bytes -= int(expired_record["artifact_bytes"])
         return None
 
+    def inspect_run(
+        self, identity: str, request_fingerprint: str
+    ) -> dict[str, object]:
+        """Report exact-request state without accepting or executing missing work."""
+        record = self.run_records.get(identity)
+        if record is None:
+            return {"state": "missing", "result_available": False}
+        if not hmac.compare_digest(
+            str(record["request_fingerprint"]), request_fingerprint
+        ):
+            raise AgentProtocolError(
+                "run/client identity was reused for a different request", status=409
+            )
+        state = record.get("state")
+        artifact = record.get("artifact")
+        if state == "completed" and isinstance(artifact, dict):
+            return {
+                "state": "completed",
+                "result_available": True,
+                "result_source": self.cached_result_source,
+            }
+        if state in {"accepted", "completed_result_expired"}:
+            return {"state": state, "result_available": False}
+        raise RuntimeError("agent run state is inconsistent")
+
     def complete_run(self, identity: str, artifact: dict[str, object]) -> None:
         """Attach a completed artifact, evicting older result bodies fail-closed."""
         record = self.run_records.get(identity)
@@ -822,6 +938,8 @@ class BenchmarkAgentHandler(BaseHTTPRequestHandler):
                 self._handle_clock(payload, received_ns)
             elif self.path == "/v1/run":
                 self._handle_run(payload)
+            elif self.path == "/v1/run-status":
+                self._handle_run_status(payload)
             else:
                 raise AgentProtocolError("not found", status=404)
         except AgentProtocolError as exc:
@@ -847,7 +965,9 @@ class BenchmarkAgentHandler(BaseHTTPRequestHandler):
             },
         )
 
-    def _handle_run(self, payload: dict[str, Any]) -> None:
+    def _validate_run_request(
+        self, payload: dict[str, Any]
+    ) -> tuple[str, int, int, int, float, list[str], str, str]:
         allowed_fields = {
             "schema_version",
             "run_id",
@@ -898,6 +1018,49 @@ class BenchmarkAgentHandler(BaseHTTPRequestHandler):
                 payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
             ).encode("utf-8")
         ).hexdigest()
+        return (
+            run_id,
+            client_index,
+            client_count,
+            planned_start_ns,
+            timeout_seconds,
+            list(benchmark_args),
+            replay_identity,
+            request_fingerprint,
+        )
+
+    def _handle_run_status(self, payload: dict[str, Any]) -> None:
+        (
+            _run_id,
+            _client_index,
+            _client_count,
+            _planned_start_ns,
+            _timeout_seconds,
+            _benchmark_args,
+            replay_identity,
+            request_fingerprint,
+        ) = self._validate_run_request(payload)
+        status = self.server.inspect_run(replay_identity, request_fingerprint)
+        self._send_json(
+            200,
+            {
+                "schema_version": 1,
+                "agent_id_sha256": self.server.agent_id_sha256,
+                **status,
+            },
+        )
+
+    def _handle_run(self, payload: dict[str, Any]) -> None:
+        (
+            run_id,
+            client_index,
+            client_count,
+            planned_start_ns,
+            timeout_seconds,
+            benchmark_args,
+            replay_identity,
+            request_fingerprint,
+        ) = self._validate_run_request(payload)
         cached_artifact = self.server.begin_run(
             replay_identity, request_fingerprint
         )

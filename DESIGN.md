@@ -334,7 +334,12 @@ AI infrastructure repos often fail basic review because they cannot run without 
 
 - Add server-lifecycle hooks for controlled cold-start measurements.
 - Add request payload profiles by model family.
-- Extend coordinated clients beyond one host only with authenticated agents and
-  an explicit clock-quality protocol.
+- Exercise the authenticated-agent clock and completed-coordinator-recovery
+  protocols on separate authorized hosts behind TLS. The committed fixtures use
+  separate processes on one host and do not establish production-network or
+  physical-host behavior.
+- Design explicit leases and cancellation before attempting partial-workflow or
+  interrupted-child continuation; completed-shard reconciliation deliberately
+  fails closed rather than launching missing work against a stale clock plan.
 - Exercise multi-source request-path accounting in an orchestrated router and
   model-server deployment rather than only the committed single-host fixture.

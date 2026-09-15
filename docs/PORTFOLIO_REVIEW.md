@@ -33,6 +33,13 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - A real loopback qualification through two agent services and two benchmark
   child processes, with invalid-auth and replay-negative checks. It is protocol
   evidence, not a multi-host or production-network measurement.
+- Opt-in, HMAC-authenticated coordinator state for completed-shard reconciliation
+  after a coordinator process restart, with exact-request status checks and
+  fail-closed handling of missing, in-flight, expired, or conflicting shards.
+- A real restart qualification that withholds two completed agent responses,
+  terminates the coordinator, resumes in a second process, and verifies the
+  target receives eight requests rather than duplicate work. It is a synthetic
+  single-host protocol test, not evidence of general workflow continuation.
 - Phase-separated warmup evidence that is excluded from measured latency,
   throughput, regression, streaming-token, and cost results.
 - A live Triton HTTP path and an OpenAI-compatible streaming path for authorized model-serving infrastructure.
@@ -66,6 +73,8 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Add controlled server-lifecycle hooks for defensible cold-start measurements.
 - Exercise the authenticated agent path on separate authorized hosts behind TLS
   and test bounded clock drift and network faults.
+- Add a lease/cancellation protocol before attempting recovery of interrupted or
+  partially completed distributed work.
 - Exercise the multi-source path qualification in an orchestrated router and
   model-server deployment; the committed fixture is synthetic and single-host.
 - Add saved benchmark reports with trend comparisons over time.
