@@ -242,6 +242,9 @@ jobs:
       - name: Run durable agent-restart qualification
         run: python tests/run_agent_restart_fixture.py
 
+      - name: Run coordinator-restart reconciliation qualification
+        run: python tests/run_coordinator_restart_fixture.py
+
       - name: Run bracketed-telemetry mock benchmark
         shell: bash
         run: |

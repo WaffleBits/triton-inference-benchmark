@@ -4,19 +4,24 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
+import hmac
 import json
 import math
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 from remote_agent import (
     probe_agent_clock,
+    query_agent_run_status,
     run_agent_benchmark,
     validate_agent_base_url,
 )
@@ -24,6 +29,10 @@ from remote_agent import (
 ROOT = Path(__file__).resolve().parent
 HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 MAX_CLIENTS = 64
+MAX_COORDINATOR_STATE_BYTES = 64 * 1024
+COORDINATOR_STATE_SCHEMA_VERSION = 1
+COORDINATOR_STATE_HMAC_CONTEXT = b"triton-coordinator-state-v1\0"
+COORDINATOR_RUN_ID_CONTEXT = b"triton-coordinator-run-v1\0"
 UNSUPPORTED_BENCHMARK_OPTIONS = {
     "-h",
     "--help",
@@ -62,6 +71,351 @@ def validate_benchmark_args(arguments: list[str]) -> None:
             raise ValueError(
                 f"benchmark option {option} is not supported by the coordinator"
             )
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def _validate_resume_token(value: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not 32 <= len(value) <= 4096
+        or "\r" in value
+        or "\n" in value
+    ):
+        raise ValueError("coordinator resume token must contain 32 to 4096 characters")
+
+
+def derive_coordinator_run_id(resume_token: str, workflow_nonce: object) -> str:
+    """Derive a stable private run ID without storing it in coordinator state."""
+    _validate_resume_token(resume_token)
+    if not isinstance(workflow_nonce, str) or HASH_PATTERN.fullmatch(workflow_nonce) is None:
+        raise ValueError("coordinator workflow nonce must be 32 random bytes in hex")
+    return hmac.new(
+        resume_token.encode("utf-8"),
+        COORDINATOR_RUN_ID_CONTEXT + workflow_nonce.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def build_coordinator_configuration_fingerprint(
+    *,
+    client_count: int,
+    benchmark_args: list[str],
+    timeout_seconds: float,
+    max_start_skew_ms: float,
+    max_clock_uncertainty_ms: float,
+    agent_run_recovery_attempts: int,
+    agent_hashes: list[str],
+) -> str:
+    """Bind a resume manifest to all request and reconciliation semantics."""
+    if not 2 <= client_count <= MAX_CLIENTS or len(agent_hashes) != client_count:
+        raise ValueError("coordinator configuration client count is invalid")
+    if any(
+        not isinstance(value, str) or HASH_PATTERN.fullmatch(value) is None
+        for value in agent_hashes
+    ):
+        raise ValueError("coordinator configuration agent identity is invalid")
+    if len(set(agent_hashes)) != len(agent_hashes):
+        raise ValueError("coordinator configuration requires unique agent identities")
+    validate_benchmark_args(benchmark_args)
+    for name, value, minimum in (
+        ("timeout", timeout_seconds, 0.0),
+        ("maximum start skew", max_start_skew_ms, 0.0),
+        ("maximum clock uncertainty", max_clock_uncertainty_ms, 0.0),
+    ):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or (float(value) <= minimum if name == "timeout" else float(value) < minimum)
+        ):
+            raise ValueError(f"coordinator configuration {name} is invalid")
+    if (
+        not isinstance(agent_run_recovery_attempts, int)
+        or isinstance(agent_run_recovery_attempts, bool)
+        or not 0 <= agent_run_recovery_attempts <= 3
+    ):
+        raise ValueError("coordinator configuration recovery attempts are invalid")
+    payload = {
+        "schema_version": 1,
+        "client_count": client_count,
+        "benchmark_args": list(benchmark_args),
+        "timeout_seconds": float(timeout_seconds),
+        "max_start_skew_ms": float(max_start_skew_ms),
+        "max_clock_uncertainty_ms": float(max_clock_uncertainty_ms),
+        "agent_run_recovery_attempts": agent_run_recovery_attempts,
+        "agent_identity_fingerprints_sha256": list(agent_hashes),
+    }
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def _manifest_without_authentication(manifest: dict[str, object]) -> dict[str, object]:
+    unsigned = dict(manifest)
+    unsigned.pop("integrity_hmac_sha256", None)
+    return unsigned
+
+
+def _validate_coordinator_resume_manifest_fields(
+    manifest: dict[str, object],
+) -> None:
+    expected_fields = {
+        "schema_version",
+        "workflow_nonce",
+        "configuration_sha256",
+        "planned_start_coordinator_unix_ns",
+        "agents",
+        "privacy",
+        "integrity_hmac_sha256",
+    }
+    if set(manifest) != expected_fields:
+        raise ValueError("coordinator resume manifest contains unsupported fields")
+    if manifest.get("schema_version") != COORDINATOR_STATE_SCHEMA_VERSION:
+        raise ValueError("coordinator resume manifest schema is unsupported")
+    nonce = manifest.get("workflow_nonce")
+    configuration_hash = manifest.get("configuration_sha256")
+    integrity = manifest.get("integrity_hmac_sha256")
+    if not isinstance(nonce, str) or HASH_PATTERN.fullmatch(nonce) is None:
+        raise ValueError("coordinator resume manifest nonce is invalid")
+    if (
+        not isinstance(configuration_hash, str)
+        or HASH_PATTERN.fullmatch(configuration_hash) is None
+    ):
+        raise ValueError("coordinator resume manifest configuration is invalid")
+    if not isinstance(integrity, str) or HASH_PATTERN.fullmatch(integrity) is None:
+        raise ValueError("coordinator resume manifest authentication is invalid")
+    planned_start = manifest.get("planned_start_coordinator_unix_ns")
+    if (
+        not isinstance(planned_start, int)
+        or isinstance(planned_start, bool)
+        or planned_start <= 0
+    ):
+        raise ValueError("coordinator resume manifest planned start is invalid")
+
+    agents = manifest.get("agents")
+    if not isinstance(agents, list) or not 2 <= len(agents) <= MAX_CLIENTS:
+        raise ValueError("coordinator resume manifest agents are invalid")
+    seen_indexes: set[int] = set()
+    seen_hashes: set[str] = set()
+    for raw_agent in agents:
+        if not isinstance(raw_agent, dict) or set(raw_agent) != {
+            "client_index",
+            "agent_id_sha256",
+            "agent_id_persisted",
+            "clock_offset_agent_minus_coordinator_ns",
+            "clock_network_delay_ns",
+            "clock_uncertainty_ns",
+            "clock_sample_count",
+            "clock_selection",
+            "planned_start_agent_unix_ns",
+        }:
+            raise ValueError("coordinator resume manifest agent record is invalid")
+        client_index = raw_agent.get("client_index")
+        agent_hash = raw_agent.get("agent_id_sha256")
+        offset_ns = raw_agent.get("clock_offset_agent_minus_coordinator_ns")
+        network_delay_ns = raw_agent.get("clock_network_delay_ns")
+        uncertainty_ns = raw_agent.get("clock_uncertainty_ns")
+        sample_count = raw_agent.get("clock_sample_count")
+        planned_agent_ns = raw_agent.get("planned_start_agent_unix_ns")
+        if (
+            not isinstance(client_index, int)
+            or isinstance(client_index, bool)
+            or not 0 <= client_index < len(agents)
+        ):
+            raise ValueError("coordinator resume manifest client index is invalid")
+        if not isinstance(agent_hash, str) or HASH_PATTERN.fullmatch(agent_hash) is None:
+            raise ValueError("coordinator resume manifest agent identity is invalid")
+        for field_name, value in (
+            ("clock offset", offset_ns),
+            ("clock network delay", network_delay_ns),
+            ("clock uncertainty", uncertainty_ns),
+            ("clock sample count", sample_count),
+            ("agent planned start", planned_agent_ns),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"coordinator resume manifest {field_name} is invalid")
+        assert isinstance(network_delay_ns, int)
+        assert isinstance(uncertainty_ns, int)
+        assert isinstance(sample_count, int)
+        assert isinstance(offset_ns, int)
+        assert isinstance(planned_agent_ns, int)
+        if (
+            network_delay_ns < 0
+            or uncertainty_ns != (network_delay_ns + 1) // 2
+            or sample_count <= 0
+            or planned_agent_ns <= 0
+            or planned_agent_ns - offset_ns != planned_start
+            or raw_agent.get("agent_id_persisted") is not False
+            or raw_agent.get("clock_selection") != "minimum_network_delay"
+        ):
+            raise ValueError("coordinator resume manifest clock record is invalid")
+        seen_indexes.add(client_index)
+        seen_hashes.add(agent_hash)
+    if seen_indexes != set(range(len(agents))) or len(seen_hashes) != len(agents):
+        raise ValueError("coordinator resume manifest agent set is invalid")
+
+    privacy = manifest.get("privacy")
+    if not isinstance(privacy, dict) or privacy != {
+        "resume_token_persisted": False,
+        "run_id_persisted": False,
+        "benchmark_arguments_persisted": False,
+        "agent_urls_persisted": False,
+        "result_bodies_persisted": False,
+        "clock_challenges_persisted": False,
+    }:
+        raise ValueError("coordinator resume manifest privacy record is invalid")
+
+
+def create_coordinator_resume_manifest(
+    *,
+    resume_token: str,
+    configuration_sha256: str,
+    planned_start_coordinator_unix_ns: int,
+    clock_profiles: list[dict[str, object]],
+    workflow_nonce: str | None = None,
+) -> dict[str, object]:
+    """Create authenticated, privacy-safe state that can reconstruct exact requests."""
+    _validate_resume_token(resume_token)
+    nonce = workflow_nonce if workflow_nonce is not None else secrets.token_hex(32)
+    agents: list[dict[str, object]] = []
+    for client_index, profile in enumerate(clock_profiles):
+        offset_ns = profile.get("clock_offset_agent_minus_coordinator_ns")
+        if not isinstance(offset_ns, int) or isinstance(offset_ns, bool):
+            raise ValueError("coordinator clock profile offset is invalid")
+        agents.append(
+            {
+                "client_index": client_index,
+                "agent_id_sha256": profile.get("agent_id_sha256"),
+                "agent_id_persisted": profile.get("agent_id_persisted"),
+                "clock_offset_agent_minus_coordinator_ns": offset_ns,
+                "clock_network_delay_ns": profile.get("clock_network_delay_ns"),
+                "clock_uncertainty_ns": profile.get("clock_uncertainty_ns"),
+                "clock_sample_count": profile.get("clock_sample_count"),
+                "clock_selection": profile.get("clock_selection"),
+                "planned_start_agent_unix_ns": (
+                    planned_start_coordinator_unix_ns + offset_ns
+                ),
+            }
+        )
+    unsigned: dict[str, object] = {
+        "schema_version": COORDINATOR_STATE_SCHEMA_VERSION,
+        "workflow_nonce": nonce,
+        "configuration_sha256": configuration_sha256,
+        "planned_start_coordinator_unix_ns": planned_start_coordinator_unix_ns,
+        "agents": agents,
+        "privacy": {
+            "resume_token_persisted": False,
+            "run_id_persisted": False,
+            "benchmark_arguments_persisted": False,
+            "agent_urls_persisted": False,
+            "result_bodies_persisted": False,
+            "clock_challenges_persisted": False,
+        },
+    }
+    manifest = {
+        **unsigned,
+        "integrity_hmac_sha256": hmac.new(
+            resume_token.encode("utf-8"),
+            COORDINATOR_STATE_HMAC_CONTEXT + _canonical_json_bytes(unsigned),
+            hashlib.sha256,
+        ).hexdigest(),
+    }
+    _validate_coordinator_resume_manifest_fields(manifest)
+    return manifest
+
+
+def write_coordinator_resume_manifest(
+    path: Path, manifest: dict[str, object]
+) -> None:
+    """Durably publish a new owner-only manifest without exposing partial JSON."""
+    _validate_coordinator_resume_manifest_fields(manifest)
+    if path.exists() or path.is_symlink():
+        raise ValueError("coordinator resume manifest already exists")
+    if not path.parent.is_dir():
+        raise ValueError("coordinator resume manifest parent directory does not exist")
+    raw = json.dumps(manifest, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+    if len(raw) > MAX_COORDINATOR_STATE_BYTES:
+        raise ValueError("coordinator resume manifest exceeded the size limit")
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            os.chmod(temporary_path, 0o600)
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError as exc:
+            raise ValueError("coordinator resume manifest already exists") from exc
+        temporary_path.unlink()
+        temporary_path = None
+        directory_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def load_coordinator_resume_manifest(
+    path: Path, resume_token: str
+) -> dict[str, object]:
+    """Read and authenticate a bounded owner-only manifest without following links."""
+    _validate_resume_token(resume_token)
+    if path.is_symlink():
+        raise ValueError("coordinator resume manifest must not be a symbolic link")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as exc:
+        raise ValueError("coordinator resume manifest could not be opened") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("coordinator resume manifest must be a regular file")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise ValueError("coordinator resume manifest must be owner-only")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            raw = handle.read(MAX_COORDINATOR_STATE_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(raw) > MAX_COORDINATOR_STATE_BYTES:
+        raise ValueError("coordinator resume manifest exceeded the size limit")
+    try:
+        decoded = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("coordinator resume manifest is not valid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError("coordinator resume manifest must be a JSON object")
+    manifest = dict(decoded)
+    supplied_integrity = manifest.get("integrity_hmac_sha256")
+    if (
+        not isinstance(supplied_integrity, str)
+        or HASH_PATTERN.fullmatch(supplied_integrity) is None
+    ):
+        raise ValueError("coordinator resume manifest authentication is invalid")
+    expected = hmac.new(
+        resume_token.encode("utf-8"),
+        COORDINATOR_STATE_HMAC_CONTEXT
+        + _canonical_json_bytes(_manifest_without_authentication(manifest)),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(supplied_integrity, expected):
+        raise ValueError("coordinator resume manifest authentication failed")
+    _validate_coordinator_resume_manifest_fields(manifest)
+    return manifest
 
 
 def _mapping(value: object, name: str) -> dict[str, Any]:
@@ -367,6 +721,7 @@ def build_remote_coordinated_summary(
     shards: list[dict[str, object]],
     max_start_skew_ms: float,
     max_clock_uncertainty_ms: float,
+    coordinator_recovery: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Normalize authenticated agent windows and report conservative time bounds."""
     if (
@@ -575,6 +930,14 @@ def build_remote_coordinated_summary(
         summary, "successful_requests", "summary"
     )
     summary.pop("throughput_rps")
+    recovery = coordinator_recovery or {
+        "state_enabled": False,
+        "resumed_after_process_restart": False,
+        "completed_statuses_verified_before_retrieval": 0,
+        "missing_or_incomplete_shards_launched": False,
+        "state_authentication": None,
+        "resume_scope": "disabled",
+    }
     summary.update(
         {
             "schema_version": 2,
@@ -597,6 +960,7 @@ def build_remote_coordinated_summary(
                 "durable_results": durable_results,
                 "recovered_after_transport_failure": recovered_results,
             },
+            "coordinator_recovery": recovery,
             "clock_quality": {
                 "method": "ntp_style_minimum_network_delay_sample",
                 "max_uncertainty_ms": round(max_uncertainty_ms, 6),
@@ -653,8 +1017,9 @@ def build_remote_coordinated_summary(
                 "This artifact proves authenticated agent protocol execution, sampled "
                 "clock normalization, and conservative shard reconciliation. Agent "
                 "identity fingerprints do not prove separate physical hosts. It does "
-                "not prove production-network behavior, synchronized hardware clocks, "
-                "a model or GPU, traffic isolation, or fleet scale."
+                "not prove partial-workflow continuation, production-network behavior, "
+                "synchronized hardware clocks, a model or GPU, traffic isolation, or "
+                "fleet scale."
             ),
         }
     )
@@ -665,6 +1030,10 @@ def build_remote_coordinated_summary(
             "authorization_persisted": False,
             "clock_challenges_persisted": False,
             "raw_agent_ids_persisted": False,
+            "coordinator_state_path_persisted": False,
+            "coordinator_resume_token_persisted": False,
+            "coordinator_benchmark_arguments_persisted": False,
+            "coordinator_result_bodies_persisted": False,
         }
     )
     summary["privacy"] = privacy
@@ -677,6 +1046,7 @@ def _format_remote_prometheus(summary: dict[str, object]) -> str:
     clock = _mapping(summary.get("clock_quality"), "clock_quality")
     gate = _mapping(summary.get("coordination_gate"), "coordination_gate")
     delivery = _mapping(summary.get("result_delivery"), "result_delivery")
+    recovery = _mapping(summary.get("coordinator_recovery"), "coordinator_recovery")
     lines = [
         "# HELP triton_coordinated_clients Authenticated benchmark agent clients.",
         "# TYPE triton_coordinated_clients gauge",
@@ -737,6 +1107,18 @@ def _format_remote_prometheus(summary: dict[str, object]) -> str:
         "# TYPE triton_coordinated_agent_recovered_results_total counter",
         "triton_coordinated_agent_recovered_results_total "
         f"{_nonnegative_int(delivery, 'recovered_after_transport_failure', 'result_delivery')}",
+        "# HELP triton_coordinated_coordinator_state_enabled Whether opt-in restart state was selected.",
+        "# TYPE triton_coordinated_coordinator_state_enabled gauge",
+        "triton_coordinated_coordinator_state_enabled "
+        f"{1 if recovery.get('state_enabled') is True else 0}",
+        "# HELP triton_coordinated_coordinator_resumed Whether this aggregate followed a coordinator process restart.",
+        "# TYPE triton_coordinated_coordinator_resumed gauge",
+        "triton_coordinated_coordinator_resumed "
+        f"{1 if recovery.get('resumed_after_process_restart') is True else 0}",
+        "# HELP triton_coordinated_resume_statuses_verified Completed agent states verified before restart retrieval.",
+        "# TYPE triton_coordinated_resume_statuses_verified gauge",
+        "triton_coordinated_resume_statuses_verified "
+        f"{_nonnegative_int(recovery, 'completed_statuses_verified_before_retrieval', 'coordinator_recovery')}",
     ]
     configured_rate = summary.get("configured_aggregate_request_rate_rps")
     if isinstance(configured_rate, (int, float)) and not isinstance(
@@ -834,6 +1216,21 @@ def _parse_args() -> argparse.Namespace:
         default=1,
         help="Retries for ambiguous agent run-response failures (0 to 3).",
     )
+    parser.add_argument(
+        "--coordinator-state-file",
+        type=Path,
+        help=(
+            "Optional owner-only authenticated manifest used to reconcile an "
+            "already-completed agent run after coordinator restart."
+        ),
+    )
+    parser.add_argument(
+        "--coordinator-resume-token-env",
+        help=(
+            "Explicit environment variable containing the coordinator state "
+            "authentication and run-derivation token."
+        ),
+    )
     parser.add_argument("benchmark_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if not 2 <= args.clients <= MAX_CLIENTS:
@@ -877,10 +1274,42 @@ def _parse_args() -> argparse.Namespace:
                 "16 to 4096 characters"
             )
         args.agent_api_key = api_key
+        state_selected = args.coordinator_state_file is not None
+        token_selected = args.coordinator_resume_token_env is not None
+        if state_selected != token_selected:
+            parser.error(
+                "--coordinator-state-file and --coordinator-resume-token-env "
+                "must be supplied together"
+            )
+        if state_selected:
+            if args.coordinator_resume_token_env == args.agent_api_key_env:
+                parser.error(
+                    "coordinator resume and agent API keys must use different "
+                    "environment variables"
+                )
+            resume_token = os.environ.get(args.coordinator_resume_token_env)
+            try:
+                _validate_resume_token(resume_token)  # type: ignore[arg-type]
+            except ValueError as exc:
+                parser.error(str(exc))
+            assert isinstance(resume_token, str)
+            if hmac.compare_digest(resume_token, api_key):
+                parser.error("coordinator resume and agent API keys must be distinct")
+            output_path = Path(args.output_dir).absolute()
+            state_path = args.coordinator_state_file.absolute()
+            if state_path == output_path or output_path in state_path.parents:
+                parser.error("coordinator state file must be outside the output directory")
+            args.coordinator_state_file = state_path
+            args.coordinator_resume_token = resume_token
+        else:
+            args.coordinator_resume_token = None
     else:
         if args.agent_api_key_env:
             parser.error("--agent-api-key-env requires at least one --agent-url")
+        if args.coordinator_state_file or args.coordinator_resume_token_env:
+            parser.error("coordinator restart state requires authenticated agents")
         args.agent_api_key = None
+        args.coordinator_resume_token = None
 
     benchmark_args = list(args.benchmark_args)
     if benchmark_args and benchmark_args[0] == "--":
@@ -977,6 +1406,15 @@ def _run_remote_clients(args: argparse.Namespace) -> dict[str, object]:
     api_key = args.agent_api_key
     if not isinstance(api_key, str):
         raise RuntimeError("remote agent authentication was not configured")
+    state_path = args.coordinator_state_file
+    resume_token = args.coordinator_resume_token
+    state_enabled = isinstance(state_path, Path) and isinstance(resume_token, str)
+    resumed = bool(state_enabled and (state_path.exists() or state_path.is_symlink()))
+    manifest = (
+        load_coordinator_resume_manifest(state_path, resume_token)
+        if resumed and isinstance(state_path, Path) and isinstance(resume_token, str)
+        else None
+    )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.clients) as executor:
         clock_futures = [
@@ -989,59 +1427,172 @@ def _run_remote_clients(args: argparse.Namespace) -> dict[str, object]:
             )
             for agent_url in args.agent_url
         ]
-        clock_profiles = [future.result() for future in clock_futures]
+        current_clock_profiles = [future.result() for future in clock_futures]
 
-    agent_hashes = [profile.get("agent_id_sha256") for profile in clock_profiles]
+    current_agent_hashes = [
+        profile.get("agent_id_sha256") for profile in current_clock_profiles
+    ]
     if (
         any(
             not isinstance(value, str) or HASH_PATTERN.fullmatch(value) is None
-            for value in agent_hashes
+            for value in current_agent_hashes
         )
-        or len(set(agent_hashes)) != args.clients
+        or len(set(current_agent_hashes)) != args.clients
     ):
         raise RuntimeError("remote coordination requires unique stable agent identities")
-    uncertainties_ns = [
-        profile.get("clock_uncertainty_ns") for profile in clock_profiles
-    ]
-    if any(
-        not isinstance(value, int) or isinstance(value, bool) or value < 0
-        for value in uncertainties_ns
-    ):
-        raise RuntimeError("remote agent returned invalid clock uncertainty")
-    max_uncertainty_ms = max(int(value) for value in uncertainties_ns) / 1_000_000
-    if max_uncertainty_ms > args.max_clock_uncertainty_ms:
-        raise RuntimeError(
-            f"remote clock uncertainty {max_uncertainty_ms:g} ms exceeded "
-            f"{args.max_clock_uncertainty_ms:g} ms before workload launch"
-        )
+    agent_hashes = [str(value) for value in current_agent_hashes]
+    configuration_hash = build_coordinator_configuration_fingerprint(
+        client_count=args.clients,
+        benchmark_args=args.benchmark_args,
+        timeout_seconds=args.timeout_seconds,
+        max_start_skew_ms=args.max_start_skew_ms,
+        max_clock_uncertainty_ms=args.max_clock_uncertainty_ms,
+        agent_run_recovery_attempts=args.agent_run_recovery_attempts,
+        agent_hashes=agent_hashes,
+    )
 
-    run_id = secrets.token_hex(32)
-    planned_coordinator_ns = time.time_ns() + int(args.lead_time_ms * 1_000_000)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.clients) as executor:
-        run_futures = []
-        for client_index, (agent_url, profile) in enumerate(
-            zip(args.agent_url, clock_profiles)
+    completed_statuses_verified = 0
+    if manifest is not None:
+        if not hmac.compare_digest(
+            str(manifest["configuration_sha256"]), configuration_hash
         ):
-            offset_ns = profile.get("clock_offset_agent_minus_coordinator_ns")
-            agent_hash = profile.get("agent_id_sha256")
-            if not isinstance(offset_ns, int) or isinstance(offset_ns, bool):
-                raise RuntimeError("remote agent returned invalid clock offset")
-            assert isinstance(agent_hash, str)
-            run_futures.append(
+            raise RuntimeError(
+                "coordinator resume manifest does not match this configuration"
+            )
+        raw_agents = manifest.get("agents")
+        assert isinstance(raw_agents, list)
+        manifest_agents = sorted(
+            [dict(value) for value in raw_agents if isinstance(value, dict)],
+            key=lambda value: int(value["client_index"]),
+        )
+        if len(manifest_agents) != args.clients or [
+            value.get("agent_id_sha256") for value in manifest_agents
+        ] != agent_hashes:
+            raise RuntimeError(
+                "coordinator resume manifest agent identities do not match current agents"
+            )
+        planned_coordinator_ns = int(
+            manifest["planned_start_coordinator_unix_ns"]
+        )
+        clock_profiles = [
+            {
+                key: value[key]
+                for key in (
+                    "agent_id_sha256",
+                    "agent_id_persisted",
+                    "clock_offset_agent_minus_coordinator_ns",
+                    "clock_network_delay_ns",
+                    "clock_uncertainty_ns",
+                    "clock_sample_count",
+                    "clock_selection",
+                )
+            }
+            for value in manifest_agents
+        ]
+        planned_agent_starts = [
+            int(value["planned_start_agent_unix_ns"]) for value in manifest_agents
+        ]
+        assert isinstance(resume_token, str)
+        run_id = derive_coordinator_run_id(resume_token, manifest["workflow_nonce"])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.clients) as executor:
+            status_futures = [
                 executor.submit(
-                    run_agent_benchmark,
+                    query_agent_run_status,
                     agent_url,
                     api_key=api_key,
                     expected_agent_id_sha256=agent_hash,
                     run_id=run_id,
                     client_index=client_index,
                     client_count=args.clients,
-                    planned_start_agent_unix_ns=planned_coordinator_ns + offset_ns,
+                    planned_start_agent_unix_ns=planned_agent_starts[client_index],
                     benchmark_args=args.benchmark_args,
                     timeout_seconds=args.timeout_seconds,
-                    recovery_attempts=args.agent_run_recovery_attempts,
                 )
+                for client_index, (agent_url, agent_hash) in enumerate(
+                    zip(args.agent_url, agent_hashes)
+                )
+            ]
+            statuses = [future.result() for future in status_futures]
+        unavailable = [
+            (index, status.get("state"))
+            for index, status in enumerate(statuses)
+            if status.get("state") != "completed"
+            or status.get("result_available") is not True
+        ]
+        if unavailable:
+            detail = ", ".join(
+                f"client {index}: {state}" for index, state in unavailable
             )
+            raise RuntimeError(
+                "coordinator resume refused missing, incomplete, or expired shards; "
+                f"no workload was launched ({detail})"
+            )
+        completed_statuses_verified = len(statuses)
+    else:
+        uncertainties_ns = [
+            profile.get("clock_uncertainty_ns") for profile in current_clock_profiles
+        ]
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in uncertainties_ns
+        ):
+            raise RuntimeError("remote agent returned invalid clock uncertainty")
+        max_uncertainty_ms = (
+            max(int(value) for value in uncertainties_ns) / 1_000_000
+        )
+        if max_uncertainty_ms > args.max_clock_uncertainty_ms:
+            raise RuntimeError(
+                f"remote clock uncertainty {max_uncertainty_ms:g} ms exceeded "
+                f"{args.max_clock_uncertainty_ms:g} ms before workload launch"
+            )
+
+        clock_profiles = current_clock_profiles
+        planned_coordinator_ns = time.time_ns() + int(
+            args.lead_time_ms * 1_000_000
+        )
+        planned_agent_starts = []
+        for profile in clock_profiles:
+            offset_ns = profile.get("clock_offset_agent_minus_coordinator_ns")
+            if not isinstance(offset_ns, int) or isinstance(offset_ns, bool):
+                raise RuntimeError("remote agent returned invalid clock offset")
+            planned_agent_starts.append(planned_coordinator_ns + offset_ns)
+
+        if state_enabled:
+            assert isinstance(state_path, Path)
+            assert isinstance(resume_token, str)
+            manifest = create_coordinator_resume_manifest(
+                resume_token=resume_token,
+                configuration_sha256=configuration_hash,
+                planned_start_coordinator_unix_ns=planned_coordinator_ns,
+                clock_profiles=clock_profiles,
+            )
+            write_coordinator_resume_manifest(state_path, manifest)
+            run_id = derive_coordinator_run_id(
+                resume_token, manifest["workflow_nonce"]
+            )
+        else:
+            run_id = secrets.token_hex(32)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.clients) as executor:
+        run_futures = [
+            executor.submit(
+                run_agent_benchmark,
+                agent_url,
+                api_key=api_key,
+                expected_agent_id_sha256=agent_hash,
+                run_id=run_id,
+                client_index=client_index,
+                client_count=args.clients,
+                planned_start_agent_unix_ns=planned_agent_starts[client_index],
+                benchmark_args=args.benchmark_args,
+                timeout_seconds=args.timeout_seconds,
+                recovery_attempts=args.agent_run_recovery_attempts,
+            )
+            for client_index, (agent_url, agent_hash) in enumerate(
+                zip(args.agent_url, agent_hashes)
+            )
+        ]
         shards = [future.result() for future in run_futures]
 
     for shard, profile in zip(shards, clock_profiles):
@@ -1049,11 +1600,37 @@ def _run_remote_clients(args: argparse.Namespace) -> dict[str, object]:
             **profile,
             "planned_start_coordinator_unix_ns": planned_coordinator_ns,
         }
-    return build_remote_coordinated_summary(
+    recovery = {
+        "state_enabled": state_enabled,
+        "resumed_after_process_restart": resumed,
+        "completed_statuses_verified_before_retrieval": (
+            completed_statuses_verified
+        ),
+        "missing_or_incomplete_shards_launched": False,
+        "state_authentication": (
+            "hmac_sha256_explicit_resume_token" if state_enabled else None
+        ),
+        "resume_scope": (
+            "completed_shards_only" if state_enabled else "disabled"
+        ),
+    }
+    summary = build_remote_coordinated_summary(
         shards,
         max_start_skew_ms=args.max_start_skew_ms,
         max_clock_uncertainty_ms=args.max_clock_uncertainty_ms,
+        coordinator_recovery=recovery,
     )
+    if resumed:
+        summary["claim_boundary"] = (
+            "This artifact proves completed-result status verification, retrieval, "
+            "and reconciliation after one coordinator process restart. Resume refuses "
+            "missing, incomplete, expired, or conflicting shards rather than launching "
+            "work against the stale clock plan. It does not prove partial-workflow or "
+            "interrupted-child continuation, agent recovery without retained results, "
+            "production-network behavior, synchronized hardware clocks, a model or "
+            "GPU, traffic isolation, or fleet scale."
+        )
+    return summary
 
 
 def main() -> None:

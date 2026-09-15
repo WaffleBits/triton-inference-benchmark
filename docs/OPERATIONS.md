@@ -267,6 +267,55 @@ inside the authorized collector rather than copying traces into public benchmark
 artifacts. A configured flag is not proof that the server accepted the context,
 exported spans, respected sampling, or synchronized clocks.
 
+## Recover Completed Agent Work After Coordinator Restart
+
+Use coordinator state only with authenticated agents whose bounded completed
+results will outlive the recovery window. The state and API-key credentials must
+be different explicitly selected environment variables:
+
+```bash
+export BENCHMARK_AGENT_KEY="replace-with-an-operator-managed-secret"
+export BENCHMARK_COORDINATOR_RESUME_TOKEN="use-a-separate-operator-managed-secret"
+
+python coordinated_benchmark.py \
+  --clients 2 \
+  --agent-url https://loadgen-a.example.internal \
+  --agent-url https://loadgen-b.example.internal \
+  --agent-api-key-env BENCHMARK_AGENT_KEY \
+  --coordinator-state-file /var/lib/triton-benchmark-coordinator/run-state.json \
+  --coordinator-resume-token-env BENCHMARK_COORDINATOR_RESUME_TOKEN \
+  --output-dir coordinated-results \
+  -- \
+  --mode openai \
+  --server-url https://inference.example.internal/v1 \
+  --model-name local-model \
+  --num-requests 100 \
+  --concurrency 8
+```
+
+The first invocation refuses an existing state path and atomically creates an
+owner-only authenticated manifest before dispatch. Keep that path outside the
+output directory on operator-controlled local storage. The manifest contains a
+random nonce, configuration fingerprint, hashed agent identities, and the
+original clock plan. It does not contain the resume token, derived run ID,
+benchmark arguments, endpoint URLs, prompts, result bodies, or raw identifiers.
+
+After a coordinator process failure, run the same command with the same agent
+order, benchmark arguments, state path, and resume token. The new process checks
+the manifest HMAC and configuration, probes current agent identities, and asks
+each agent for the status of the exact original request. It issues retrieval
+requests only if every shard is completed and retained. Missing, still-accepted,
+expired, conflicting, or reconfigured shards stop the recovery before any work
+is launched. The resumed aggregate labels completed status verification and
+cached/durable result sources separately.
+
+This path reconciles completed work only. It does not resume an interrupted
+benchmark child, cancel in-flight work, repair an unavailable agent, reuse a
+stale clock plan for replacement work, or provide a general workflow engine.
+Retain the state only as long as operational recovery requires it; after a
+successful run, remove or archive it under the same access controls as other
+operator state.
+
 ## SLO-Oriented Checks
 
 For a production-style inference service, the benchmark output should be reviewed against service goals such as:

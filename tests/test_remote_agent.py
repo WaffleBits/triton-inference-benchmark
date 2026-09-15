@@ -17,6 +17,7 @@ from remote_agent import (
     _post_json,
     build_child_environment,
     build_coordinated_agent_artifact,
+    query_agent_run_status,
     run_agent_benchmark,
     select_clock_observation,
     validate_agent_base_url,
@@ -24,6 +25,94 @@ from remote_agent import (
 
 
 class RemoteAgentProtocolTest(unittest.TestCase):
+    def test_agent_status_is_read_only_exact_and_bounded(self) -> None:
+        server = BenchmarkAgentServer(
+            ("127.0.0.1", 0),
+            api_key="unit-test-agent-key",
+            agent_id="unit-test-agent",
+            child_timeout_seconds=5,
+            child_environment={"PATH": "", "PYTHONIOENCODING": "utf-8"},
+        )
+        try:
+            identity = "a" * 64
+            fingerprint = "b" * 64
+            self.assertEqual(
+                server.inspect_run(identity, fingerprint),
+                {"state": "missing", "result_available": False},
+            )
+            self.assertNotIn(identity, server.run_records)
+
+            self.assertIsNone(server.begin_run(identity, fingerprint))
+            self.assertEqual(
+                server.inspect_run(identity, fingerprint),
+                {"state": "accepted", "result_available": False},
+            )
+            with self.assertRaisesRegex(AgentProtocolError, "different request"):
+                server.inspect_run(identity, "c" * 64)
+
+            server.complete_run(identity, {"successful_requests": 2})
+            self.assertEqual(
+                server.inspect_run(identity, fingerprint),
+                {
+                    "state": "completed",
+                    "result_available": True,
+                    "result_source": "cached",
+                },
+            )
+        finally:
+            server.server_close()
+
+    def test_status_client_validates_agent_and_completed_result(self) -> None:
+        response = {
+            "schema_version": 1,
+            "agent_id_sha256": "d" * 64,
+            "state": "completed",
+            "result_available": True,
+            "result_source": "durable",
+        }
+        with patch("remote_agent._post_json", return_value=response) as post:
+            status = query_agent_run_status(
+                "https://agent.example.test",
+                api_key="unit-test-agent-key",
+                expected_agent_id_sha256="d" * 64,
+                run_id="private-run-id",
+                client_index=0,
+                client_count=2,
+                planned_start_agent_unix_ns=1_000_000_000,
+                benchmark_args=["--mode", "mock", "--num-requests", "4"],
+                timeout_seconds=5,
+            )
+
+        self.assertEqual(
+            status,
+            {
+                "state": "completed",
+                "result_available": True,
+                "result_source": "durable",
+            },
+        )
+        self.assertEqual(post.call_args.args[1], "/v1/run-status")
+
+        for invalid in (
+            {**response, "agent_id_sha256": "e" * 64},
+            {**response, "state": "missing", "result_available": True},
+            {**response, "result_source": "executed"},
+        ):
+            with self.subTest(invalid=invalid):
+                with patch("remote_agent._post_json", return_value=invalid):
+                    with self.assertRaises(RuntimeError):
+                        query_agent_run_status(
+                            "https://agent.example.test",
+                            api_key="unit-test-agent-key",
+                            expected_agent_id_sha256="d" * 64,
+                            run_id="private-run-id",
+                            client_index=0,
+                            client_count=2,
+                            planned_start_agent_unix_ns=1_000_000_000,
+                            benchmark_args=["--mode", "mock"],
+                            timeout_seconds=5,
+                        )
+
     def test_authenticated_post_does_not_follow_redirects(self) -> None:
         class SinkHandler(BaseHTTPRequestHandler):
             request_count = 0
