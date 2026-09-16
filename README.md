@@ -18,8 +18,9 @@ drives a real inference endpoint.
   start timing, complete-client/configuration validation, start-skew and overlap
   gates, and privacy-safe aggregate request/retry/window artifacts.
 - Authenticated remote-agent coordination with explicit opt-in credentials,
-  NTP-style clock sampling, conservative skew/overlap/throughput bounds, replay
-  conflict rejection, in-memory recovery after ambiguous response loss, optional
+  an optional TLS 1.2+ listener and explicit CA verification, NTP-style clock
+  sampling, conservative skew/overlap/throughput bounds, replay conflict
+  rejection, in-memory recovery after ambiguous response loss, optional
   SQLite-backed recovery across agent restart, and no agent URLs or authorization
   data in aggregate artifacts.
 - Optional phase-separated warmup requests with their own outcomes, latency,
@@ -159,22 +160,34 @@ cross-host clock synchronization, a real model/GPU, or production isolation.
 
 ### Coordinate authenticated agents
 
-Start the same checked-in agent on each authorized load-generator host. Put it
-behind TLS for every non-loopback deployment; the client rejects cleartext
-non-loopback agent URLs. The bearer key is read only from the environment
-variable explicitly named on both sides.
+Start the same checked-in agent on each authorized load-generator host. The
+agent can terminate TLS itself when an operator supplies a certificate and key;
+otherwise put it behind an equivalent TLS-terminating service for every
+non-loopback deployment. The client rejects cleartext non-loopback agent URLs.
+The bearer key is read only from the environment variable explicitly named on
+both sides.
 
 ```bash
 export BENCHMARK_AGENT_KEY="replace-with-an-operator-managed-secret"
 export BENCHMARK_COORDINATOR_RESUME_TOKEN="use-a-separate-operator-managed-secret"
 
 python remote_agent.py \
-  --listen-host 127.0.0.1 \
+  --listen-host 0.0.0.0 \
   --port 8081 \
   --agent-id loadgen-a \
   --api-key-env BENCHMARK_AGENT_KEY \
+  --tls-cert-file /etc/triton-benchmark/agent.crt \
+  --tls-key-file /etc/triton-benchmark/agent.key \
   --state-db /var/lib/triton-benchmark-agent/run-state.sqlite3
 ```
+
+The built-in TLS listener requires the certificate and key as a pair, accepts
+TLS 1.2 or newer, and fails startup if either file is missing, a symbolic link,
+or invalid certificate material. Keep the private key owner-controlled. For a
+private certificate authority, pass its explicit trust bundle to the
+coordinator with `--agent-ca-file`; without that option, HTTPS uses the
+platform's normal certificate verifier. Verification is never disabled and the
+CA path and certificate contents are not written to artifacts.
 
 `--state-db` is optional. Without it, completed-result recovery remains bounded
 and process-local. With it, the agent creates or opens an owner-only SQLite
@@ -281,12 +294,15 @@ stored rows. The coordinator-restart fixture withholds both completed responses,
 terminates the first coordinator, starts a second process, verifies both exact
 completed statuses, and retrieves the two cached shard projections while the
 synthetic target count remains eight. It also checks manifest authentication,
-owner-only permissions, CLI wiring, and serialized privacy boundaries. Agent
-stores retain at most eight completed results / 64 MiB and 1,024 accepted
-identities. These fixtures do not prove partial-workflow continuation, recovery
-of an interrupted child, arbitrary network faults, multi-host storage or
-behavior, hardware clock synchronization, a model/GPU, traffic isolation, or
-fleet scale.
+owner-only permissions, CLI wiring, and serialized privacy boundaries. The TLS
+fixture generates an ephemeral localhost certificate, runs both agents over
+verified HTTPS with an explicit CA bundle, and proves invalid bearer-key and
+untrusted-CA rejection before target work. Agent stores retain at most eight
+completed results / 64 MiB and 1,024 accepted identities. These fixtures do not
+prove partial-workflow continuation, recovery of an interrupted child, arbitrary
+network faults, multi-host storage or behavior, hardware clock synchronization,
+a model/GPU, traffic isolation, production certificate management, mutual TLS,
+or fleet scale.
 
 Gate the extra client work used to recover failed logical requests:
 
@@ -614,6 +630,7 @@ server under test rather than the mock generator.
 python -m unittest discover -s tests
 python tests/run_coordinated_client_fixture.py
 python tests/run_remote_agent_fixture.py
+python tests/run_tls_remote_agent_fixture.py
 python tests/run_agent_restart_fixture.py
 python tests/run_coordinator_restart_fixture.py
 ```

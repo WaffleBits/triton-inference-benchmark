@@ -24,6 +24,7 @@ from remote_agent import (
     query_agent_run_status,
     run_agent_benchmark,
     validate_agent_base_url,
+    validate_agent_ca_file,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -1120,6 +1121,39 @@ def _format_remote_prometheus(summary: dict[str, object]) -> str:
         "triton_coordinated_resume_statuses_verified "
         f"{_nonnegative_int(recovery, 'completed_statuses_verified_before_retrieval', 'coordinator_recovery')}",
     ]
+    protocol = _mapping(summary.get("agent_protocol"), "agent_protocol")
+    transport = protocol.get("transport_security")
+    if isinstance(transport, dict):
+        https_agent_count = _nonnegative_int(
+            transport, "https_agent_count", "transport_security"
+        )
+        loopback_http_agent_count = _nonnegative_int(
+            transport, "loopback_http_agent_count", "transport_security"
+        )
+        certificate_verification = transport.get("certificate_verification")
+        if certificate_verification not in {
+            "explicit_ca_file",
+            "platform_default_for_https",
+        }:
+            raise ValueError("transport security certificate policy is invalid")
+        lines.extend(
+            [
+                "# HELP triton_coordinated_https_agents Agents reached over HTTPS with certificate verification.",
+                "# TYPE triton_coordinated_https_agents gauge",
+                f"triton_coordinated_https_agents {https_agent_count}",
+                "# HELP triton_coordinated_loopback_http_agents Agents reached over explicitly local cleartext HTTP.",
+                "# TYPE triton_coordinated_loopback_http_agents gauge",
+                f"triton_coordinated_loopback_http_agents {loopback_http_agent_count}",
+                "# HELP triton_coordinated_agent_certificate_verification Certificate verification policy for HTTPS agents.",
+                "# TYPE triton_coordinated_agent_certificate_verification gauge",
+                "triton_coordinated_agent_certificate_verification{mode=\""
+                f"{certificate_verification}"
+                "\"} 1",
+                "# HELP triton_coordinated_cleartext_non_loopback_rejected Whether non-loopback cleartext agent URLs are rejected.",
+                "# TYPE triton_coordinated_cleartext_non_loopback_rejected gauge",
+                "triton_coordinated_cleartext_non_loopback_rejected 1",
+            ]
+        )
     configured_rate = summary.get("configured_aggregate_request_rate_rps")
     if isinstance(configured_rate, (int, float)) and not isinstance(
         configured_rate, bool
@@ -1208,6 +1242,11 @@ def _parse_args() -> argparse.Namespace:
         "--agent-api-key-env",
         help="Environment variable containing the bearer key for all selected agents.",
     )
+    parser.add_argument(
+        "--agent-ca-file",
+        type=Path,
+        help="Explicit CA bundle used to verify HTTPS agent certificates.",
+    )
     parser.add_argument("--clock-samples", type=int, default=5)
     parser.add_argument("--max-clock-uncertainty-ms", type=float, default=25.0)
     parser.add_argument(
@@ -1255,6 +1294,15 @@ def _parse_args() -> argparse.Namespace:
         args.agent_url = [validate_agent_base_url(url) for url in args.agent_url]
     except ValueError as exc:
         parser.error(str(exc))
+    if args.agent_ca_file is not None:
+        if not args.agent_url or not any(
+            url.startswith("https://") for url in args.agent_url
+        ):
+            parser.error("--agent-ca-file requires at least one HTTPS --agent-url")
+        try:
+            args.agent_ca_file = validate_agent_ca_file(args.agent_ca_file)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.agent_url:
         if len(args.agent_url) != args.clients:
             parser.error("--agent-url must be repeated exactly once per client")
@@ -1424,6 +1472,7 @@ def _run_remote_clients(args: argparse.Namespace) -> dict[str, object]:
                 api_key=api_key,
                 sample_count=args.clock_samples,
                 timeout_seconds=min(args.timeout_seconds, 10.0),
+                ca_file=getattr(args, "agent_ca_file", None),
             )
             for agent_url in args.agent_url
         ]
@@ -1508,6 +1557,7 @@ def _run_remote_clients(args: argparse.Namespace) -> dict[str, object]:
                     planned_start_agent_unix_ns=planned_agent_starts[client_index],
                     benchmark_args=args.benchmark_args,
                     timeout_seconds=args.timeout_seconds,
+                    ca_file=getattr(args, "agent_ca_file", None),
                 )
                 for client_index, (agent_url, agent_hash) in enumerate(
                     zip(args.agent_url, agent_hashes)
@@ -1588,6 +1638,7 @@ def _run_remote_clients(args: argparse.Namespace) -> dict[str, object]:
                 benchmark_args=args.benchmark_args,
                 timeout_seconds=args.timeout_seconds,
                 recovery_attempts=args.agent_run_recovery_attempts,
+                ca_file=getattr(args, "agent_ca_file", None),
             )
             for client_index, (agent_url, agent_hash) in enumerate(
                 zip(args.agent_url, agent_hashes)
@@ -1620,6 +1671,22 @@ def _run_remote_clients(args: argparse.Namespace) -> dict[str, object]:
         max_clock_uncertainty_ms=args.max_clock_uncertainty_ms,
         coordinator_recovery=recovery,
     )
+    protocol = _mapping(summary.get("agent_protocol"), "agent_protocol")
+    https_agent_count = sum(
+        url.startswith("https://") for url in args.agent_url
+    )
+    protocol["transport_security"] = {
+        "https_agent_count": https_agent_count,
+        "loopback_http_agent_count": len(args.agent_url) - https_agent_count,
+        "certificate_verification": (
+            "explicit_ca_file"
+            if getattr(args, "agent_ca_file", None) is not None
+            else "platform_default_for_https"
+        ),
+        "tls_minimum_version": "TLSv1.2",
+        "cleartext_non_loopback_rejected": True,
+    }
+    summary["agent_protocol"] = protocol
     if resumed:
         summary["claim_boundary"] = (
             "This artifact proves completed-result status verification, retrieval, "

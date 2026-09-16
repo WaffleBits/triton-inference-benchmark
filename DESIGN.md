@@ -72,10 +72,15 @@ Remote mode keeps the existing benchmark and shard contracts but replaces local
 child launch with an authenticated HTTP agent. The operator must explicitly name
 the bearer-key environment variable; no ambient credential is selected. Agent
 URLs may use cleartext HTTP only on loopback and otherwise require HTTPS. The
-authenticated client refuses redirects so the bearer key cannot move to a
-different origin. The aggregate excludes authorization data, raw challenges,
-agent URLs, raw agent IDs, child paths, target endpoints, prompts, outputs, and
-trace identifiers.
+agent can terminate TLS itself when `--tls-cert-file` and `--tls-key-file` are
+provided as a pair. Its server context accepts TLS 1.2 or newer, rejects missing
+or symlinked material before serving, and does not enable client-certificate
+authentication. The coordinator can take an explicit `--agent-ca-file` for a
+private trust anchor; it never disables certificate verification and does not
+persist the CA path or certificate material. The authenticated client refuses
+redirects so the bearer key cannot move to a different origin. The aggregate
+excludes authorization data, raw challenges, agent URLs, raw agent IDs, child
+paths, target endpoints, prompts, outputs, and trace identifiers.
 
 Before choosing a start time, the coordinator sends 1 to 20 authenticated clock
 challenges to each agent. For each exchange it records coordinator send/receive
@@ -126,6 +131,12 @@ checks database integrity, file mode and persisted-field privacy. These local
 fixtures do not establish coordinator recovery, safe continuation of an
 interrupted child, general network-fault handling, shared-store coordination or
 actual multi-host behavior.
+A separate TLS fixture generates an ephemeral certificate, runs the two agent
+services over verified HTTPS with an explicit CA bundle, rejects an invalid
+bearer key, rejects an untrusted CA before target work, and checks that transport
+policy appears without secrets or paths in JSON/Prometheus. These local fixtures
+still do not establish production certificate management, mutual TLS, general
+network-fault handling, shared-store coordination or actual multi-host behavior.
 
 ## Metrics
 
