@@ -12,6 +12,7 @@ import math
 import os
 import re
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -100,6 +101,40 @@ def validate_agent_base_url(value: str) -> str:
     if parsed.scheme == "http" and not loopback:
         raise ValueError("non-loopback agent URLs must use HTTPS")
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+def validate_agent_ca_file(value: str | Path) -> Path:
+    """Validate an explicit CA bundle without following a symbolic link."""
+    path = Path(value)
+    if path.is_symlink():
+        raise ValueError("agent CA file must not be a symbolic link")
+    if not path.exists():
+        raise ValueError("agent CA file does not exist")
+    if not path.is_file():
+        raise ValueError("agent CA file must be a regular file")
+    return path
+
+
+def validate_tls_material_file(value: str | Path, label: str) -> Path:
+    """Validate a server certificate or private-key path before socket setup."""
+    path = Path(value)
+    if path.is_symlink():
+        raise ValueError(f"TLS {label} file must not be a symbolic link")
+    if not path.exists():
+        raise ValueError(f"TLS {label} file does not exist")
+    if not path.is_file():
+        raise ValueError(f"TLS {label} file must be a regular file")
+    return path
+
+
+def _build_agent_opener(ca_file: Path | None) -> urllib.request.OpenerDirector:
+    """Build a redirect-blocking opener with optional explicit HTTPS trust."""
+    handlers: list[Any] = [_NoRedirectHandler()]
+    if ca_file is not None:
+        context = ssl.create_default_context(cafile=str(ca_file))
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    return urllib.request.build_opener(*handlers)
 
 
 def build_child_environment(
@@ -192,6 +227,7 @@ def _post_json(
     *,
     api_key: str,
     timeout_seconds: float,
+    ca_file: Path | None = None,
 ) -> dict[str, Any]:
     normalized = validate_agent_base_url(base_url)
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -206,7 +242,7 @@ def _post_json(
         method="POST",
     )
     try:
-        opener = urllib.request.build_opener(_NoRedirectHandler())
+        opener = _build_agent_opener(ca_file)
         with opener.open(request, timeout=timeout_seconds) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
@@ -241,6 +277,7 @@ def probe_agent_clock(
     api_key: str,
     sample_count: int,
     timeout_seconds: float,
+    ca_file: Path | None = None,
 ) -> dict[str, object]:
     """Measure one agent clock without retaining URLs or raw challenges."""
     if not isinstance(sample_count, int) or isinstance(sample_count, bool) or sample_count < 1:
@@ -256,6 +293,7 @@ def probe_agent_clock(
             {"schema_version": 1, "challenge": challenge},
             api_key=api_key,
             timeout_seconds=timeout_seconds,
+            ca_file=ca_file,
         )
         received_ns = time.time_ns()
         if response.get("schema_version") != 1:
@@ -328,6 +366,7 @@ def query_agent_run_status(
     planned_start_agent_unix_ns: int,
     benchmark_args: list[str],
     timeout_seconds: float,
+    ca_file: Path | None = None,
 ) -> dict[str, object]:
     """Inspect one exact run request without accepting or executing it."""
     response = _post_json(
@@ -343,6 +382,7 @@ def query_agent_run_status(
         ),
         api_key=api_key,
         timeout_seconds=min(timeout_seconds, 10.0),
+        ca_file=ca_file,
     )
     if response.get("schema_version") != 1:
         raise RuntimeError("agent status response has an unsupported schema")
@@ -400,6 +440,7 @@ def run_agent_benchmark(
     benchmark_args: list[str],
     timeout_seconds: float,
     recovery_attempts: int = 0,
+    ca_file: Path | None = None,
 ) -> dict[str, object]:
     """Run one child, retrying only ambiguous transport failures when configured."""
     if (
@@ -425,6 +466,7 @@ def run_agent_benchmark(
                 payload,
                 api_key=api_key,
                 timeout_seconds=timeout_seconds + 5,
+                ca_file=ca_file,
             )
             break
         except AgentTransportError:
@@ -712,6 +754,7 @@ class BenchmarkAgentServer(HTTPServer):
         state_db: Path | None = None,
     ) -> None:
         super().__init__(server_address, BenchmarkAgentHandler)
+        self.tls_enabled = False
         self.api_key = api_key
         self.agent_id_sha256 = hashlib.sha256(agent_id.encode("utf-8")).hexdigest()
         self.child_timeout_seconds = child_timeout_seconds
@@ -745,6 +788,22 @@ class BenchmarkAgentServer(HTTPServer):
                     self.completed_result_order.append(identity)
                     self.cached_result_count += 1
                     self.cached_result_bytes += int(record["artifact_bytes"])
+
+    def enable_tls(
+        self, certificate_file: str | Path, key_file: str | Path
+    ) -> None:
+        """Wrap the listening socket with an explicitly configured TLS server."""
+        if self.tls_enabled:
+            raise ValueError("agent TLS is already enabled")
+        certificate_path = validate_tls_material_file(certificate_file, "certificate")
+        key_path = validate_tls_material_file(key_file, "key")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(
+            certfile=str(certificate_path), keyfile=str(key_path)
+        )
+        self.socket = context.wrap_socket(self.socket, server_side=True)
+        self.tls_enabled = True
 
     @property
     def cached_result_source(self) -> str:
@@ -1155,6 +1214,16 @@ def _parse_args() -> argparse.Namespace:
             "the file contains hashes and coordinator-only result projections."
         ),
     )
+    parser.add_argument(
+        "--tls-cert-file",
+        type=Path,
+        help="PEM certificate for the agent HTTPS listener.",
+    )
+    parser.add_argument(
+        "--tls-key-file",
+        type=Path,
+        help="PEM private key for the agent HTTPS listener.",
+    )
     args = parser.parse_args()
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
@@ -1171,6 +1240,16 @@ def _parse_args() -> argparse.Namespace:
         )
     except ValueError as exc:
         parser.error(str(exc))
+    tls_cert_selected = args.tls_cert_file is not None
+    tls_key_selected = args.tls_key_file is not None
+    if tls_cert_selected != tls_key_selected:
+        parser.error("--tls-cert-file and --tls-key-file must be supplied together")
+    if tls_cert_selected and tls_key_selected:
+        try:
+            validate_tls_material_file(args.tls_cert_file, "certificate")
+            validate_tls_material_file(args.tls_key_file, "key")
+        except ValueError as exc:
+            parser.error(str(exc))
     args.api_key = api_key
     args.child_environment = child_environment
     return args
@@ -1186,6 +1265,12 @@ def main() -> None:
         child_environment=args.child_environment,
         state_db=args.state_db,
     )
+    try:
+        if args.tls_cert_file is not None and args.tls_key_file is not None:
+            server.enable_tls(args.tls_cert_file, args.tls_key_file)
+    except (OSError, ssl.SSLError, ValueError) as exc:
+        server.server_close()
+        raise SystemExit(f"could not configure agent TLS: {exc}") from exc
     if args.port_file:
         Path(args.port_file).write_text(str(server.server_address[1]), encoding="utf-8")
     try:
