@@ -64,6 +64,37 @@ python benchmark.py \
   --prometheus
 ```
 
+### Saved trend reports
+
+To compare more than one saved run, use the standalone report command. Pass JSON
+artifacts in the comparison order; the command compares each adjacent pair:
+
+```bash
+python benchmark_report.py \
+  --input benchmark_results/run-a/benchmark_20260923-090000.json \
+  --input benchmark_results/run-b/benchmark_20260923-091000.json \
+  --output-dir benchmark_trend_reports \
+  --max-p95-regression-pct 10 \
+  --max-success-rate-drop 0.01 \
+  --max-throughput-drop-pct 10 \
+  --max-attempt-amplification-increase 0.05 \
+  --fail-on-regression
+```
+
+The report writes JSON and Markdown with the run order, measured headline values,
+adjacent changes, and explicit gate results. It does not merge child or run-level
+percentile distributions into a new percentile. Throughput is the saved
+benchmark's successful-completion rate over its measured duration. Retry
+amplification is client-observed calls to `InferenceClient.infer`; it is not a
+server request count or service MTTR. A zero baseline for a percentage comparison
+fails that check closed rather than inventing a percentage.
+
+Only a bounded whitelist is projected from each source artifact. Source paths,
+endpoints, prompts, outputs, configuration, credentials, raw telemetry, and trace
+identifiers are excluded. Keep workload, model, serving configuration, and
+measurement conditions comparable before treating a trend as an engineering
+finding; the report does not claim a universal SLO or production-scale behavior.
+
 ## Warmup Phase
 
 Use `--warmup-requests` to precondition the same request path before headline
