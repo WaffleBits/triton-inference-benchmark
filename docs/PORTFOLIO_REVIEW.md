@@ -48,6 +48,9 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
   local SSE fixture proving header wiring and identifier-free artifacts.
 - Prometheus-compatible benchmark artifacts for dashboard and CI ingestion.
 - Baseline-versus-candidate comparison with explicit regression reasons.
+- Saved multi-run JSON and Markdown trend reports with adjacent p95, success-rate,
+  throughput, and client-attempt-amplification gates; report artifacts use a
+  bounded privacy-safe projection and do not merge percentile distributions.
 - Correlated server telemetry for GPU utilization, memory pressure, queue time, and Triton counters.
 - Fail-closed server failure-rate and queue-fraction gates derived from paired
   cumulative counters, with aggregate-decrease, missing-family, and hashed
@@ -77,4 +80,3 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
   partially completed distributed work.
 - Exercise the multi-source path qualification in an orchestrated router and
   model-server deployment; the committed fixture is synthetic and single-host.
-- Add saved benchmark reports with trend comparisons over time.

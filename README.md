@@ -37,6 +37,9 @@ drives a real inference endpoint.
 - Latency metrics: average, p50, p95, p99, min, max, plus throughput and success rate.
 - JSON output and Prometheus text export for trend tracking.
 - Baseline-versus-candidate comparison with p95 and success-rate gates.
+- A saved trend-report CLI that compares ordered JSON runs, adds throughput and
+  retry-amplification gates, and emits privacy-safe JSON and Markdown without
+  copying endpoints, prompts, configuration, or trace identifiers.
 - Paired before/after Triton counter windows with fail-closed server failure-rate
   and queue-fraction gates plus hashed series-membership validation; raw scrapes,
   labels, and operator paths stay out of artifacts.
@@ -416,6 +419,27 @@ python benchmark.py \
   --max-success-rate-drop 0.01 \
   --fail-on-regression
 ```
+
+Build a report across saved runs in the order supplied:
+
+```bash
+python benchmark_report.py \
+  --input benchmark_results/baseline/benchmark_20260923-090000.json \
+  --input benchmark_results/candidate/benchmark_20260923-091000.json \
+  --output-dir benchmark_trend_reports \
+  --max-p95-regression-pct 10 \
+  --max-success-rate-drop 0.01 \
+  --max-throughput-drop-pct 10 \
+  --max-attempt-amplification-increase 0.05 \
+  --fail-on-regression
+```
+
+The command writes `benchmark_trend.json` and `benchmark_trend.md`. It compares
+adjacent saved runs; it does not merge percentile distributions or infer a
+universal SLO. The report keeps only measured headline fields and client-observed
+retry accounting. It omits source paths, endpoints, prompts, configuration,
+credentials, raw telemetry, and trace identifiers. Workload, model, serving
+configuration, and measurement conditions must be kept comparable by the operator.
 
 Gate on server counters from two operator-supplied Prometheus snapshots:
 
