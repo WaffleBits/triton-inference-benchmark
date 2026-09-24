@@ -115,6 +115,41 @@ call the first warmup request a cold-start measurement unless an external
 lifecycle controller actually restarts the server, reloads the model, and
 records that boundary.
 
+## Controlled local lifecycle qualification
+
+Use `lifecycle_qualification.py` when the service itself must be started and
+readiness must be measured before the benchmark phase:
+
+```bash
+python lifecycle_qualification.py \
+  --service-command 'python service.py --port {port}' \
+  --health-url http://127.0.0.1:{port}/healthz \
+  --startup-timeout-seconds 60 \
+  --output-dir lifecycle_report \
+  --benchmark \
+  --mode openai \
+  --server-url http://127.0.0.1:{port}/v1 \
+  --model-name local-model \
+  --num-requests 200 \
+  --concurrency 16
+```
+
+The wrapper allocates one ephemeral loopback port and requires `{port}` in the
+service command. It accepts only loopback HTTP(S) health URLs without embedded
+credentials, blocks redirects, executes the service and benchmark with
+`shell=False`, and terminates the service process group after the measured phase.
+The report keeps a SHA-256 identifier for the command and health URL but not
+their values. Benchmark data is reduced through the same whitelist used by the
+saved trend report; paths, endpoints, prompts, configuration, credentials, raw
+telemetry, and trace identifiers are excluded.
+
+`startup_latency_ms` is measured from subprocess launch until the selected
+health endpoint returns HTTP 200. Choose a health endpoint whose readiness
+semantics match the question being asked. The value is not model-weight load
+time, accelerator initialization time, service MTTR, a remote-host timing, or a
+production SLO. The checked fixture uses a delayed local service and a synthetic
+OpenAI-compatible request path.
+
 ## OpenAI-Compatible Streaming Runs
 
 Use `--mode openai` for an authorized vLLM, SGLang, or compatible completion

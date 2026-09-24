@@ -51,6 +51,9 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 - Saved multi-run JSON and Markdown trend reports with adjacent p95, success-rate,
   throughput, and client-attempt-amplification gates; report artifacts use a
   bounded privacy-safe projection and do not merge percentile distributions.
+- Controlled local lifecycle qualification that measures process-launch to a
+  selected HTTP-200 readiness response before invoking the existing benchmark;
+  command and health URL values are hashed rather than persisted.
 - Correlated server telemetry for GPU utilization, memory pressure, queue time, and Triton counters.
 - Fail-closed server failure-rate and queue-fraction gates derived from paired
   cumulative counters, with aggregate-decrease, missing-family, and hashed
@@ -73,7 +76,6 @@ This project is intentionally designed as a public-safe AI infrastructure benchm
 
 ## Gaps Worth Closing Next
 
-- Add controlled server-lifecycle hooks for defensible cold-start measurements.
 - Exercise the authenticated agent path on separate authorized hosts behind TLS
   and test bounded clock drift and network faults.
 - Add a lease/cancellation protocol before attempting recovery of interrupted or
