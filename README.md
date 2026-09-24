@@ -58,6 +58,9 @@ drives a real inference endpoint.
   requests, with fresh identifiers per HTTP attempt and no identifiers in artifacts.
 - Isolated-versus-concurrent output gates with exact fingerprints by default and
   opt-in run-scoped numeric tolerances; output values stay in process memory.
+- Controlled local lifecycle qualification that starts an explicit service
+  command without a shell, waits for a loopback HTTP-200 health response, then
+  runs the existing benchmark and writes privacy-safe startup evidence.
 
 ## Quick Start
 
@@ -105,6 +108,30 @@ outcomes and latency distribution are reported under a separate `warmup`
 record. They do not contribute to headline latency, throughput, streaming-token,
 regression, or cost calculations. This phase preconditions a serving path; it
 does not prove a process, model, or accelerator cold start.
+
+Measure a controlled local process launch through readiness before benchmarking:
+
+```bash
+python lifecycle_qualification.py \
+  --service-command 'python service.py --port {port}' \
+  --health-url http://127.0.0.1:{port}/healthz \
+  --output-dir lifecycle_report \
+  --benchmark \
+  --mode openai \
+  --server-url http://127.0.0.1:{port}/v1 \
+  --model-name local-model \
+  --num-requests 200 \
+  --concurrency 16
+```
+
+The service command is parsed into arguments and executed with `shell=False`.
+The wrapper selects one ephemeral loopback port, requires an explicit loopback
+health URL, and passes only the benchmark arguments after `--benchmark`. The
+JSON and Markdown reports retain the measured process-launch-to-health-200
+latency, probe count, termination status, and the existing safe benchmark
+projection. They hash but do not write the command or health URL. This is
+controlled local lifecycle evidence, not model-weight load time, accelerator
+initialization, service MTTR, remote-host timing, or a production SLO.
 
 Pace only the measured phase at an explicit offered request rate:
 
@@ -657,6 +684,7 @@ python tests/run_remote_agent_fixture.py
 python tests/run_tls_remote_agent_fixture.py
 python tests/run_agent_restart_fixture.py
 python tests/run_coordinator_restart_fixture.py
+python tests/run_lifecycle_qualification_fixture.py
 ```
 
 ## More
@@ -667,7 +695,6 @@ python tests/run_coordinator_restart_fixture.py
 
 ## Roadmap
 
-- Server-lifecycle hooks for controlled cold-start measurements.
 - Exercise authenticated agents on separate authorized hosts behind TLS, then
   qualify bounded clock drift, shared-store ownership, and broader controlled
   network faults without weakening the conservative time bounds.

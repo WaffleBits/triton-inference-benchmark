@@ -343,7 +343,10 @@ AI infrastructure repos often fail basic review because they cannot run without 
 
 ## Production Extensions
 
-- Add server-lifecycle hooks for controlled cold-start measurements.
+- `lifecycle_qualification.py` now supplies a bounded local lifecycle hook: it
+  launches an explicit command without a shell, waits for a loopback health
+  response, and runs the existing benchmark. Its startup value is process launch
+  to selected health readiness, not a model or accelerator cold-start claim.
 - Add request payload profiles by model family.
 - Exercise the authenticated-agent clock and completed-coordinator-recovery
   protocols on separate authorized hosts behind TLS. The committed fixtures use
