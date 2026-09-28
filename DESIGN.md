@@ -337,6 +337,22 @@ The `--baseline` option compares a candidate benchmark run with a saved JSON res
 
 The default gates mark a run as a regression when p95 latency rises by more than 10% or success rate drops by more than 0.01. `--fail-on-regression` makes that comparison exit non-zero for CI. Those thresholds are intentionally CLI-configurable because production latency budgets differ by model, accelerator, queueing policy, and product surface.
 
+## Content-addressed qualification manifests
+
+`qualification_manifest.py` adds a bounded provenance step after trend-report
+generation. The `create` command reads the report and the ordered input artifacts,
+re-derives the report through `benchmark_report`, and fails closed if any run,
+threshold, comparison, or regression result differs. It then records SHA-256
+digests and byte counts for the exact report and input bytes, plus run indexes and
+bounded gate metadata. The `verify` command repeats the derivation and digest
+checks without retaining or printing the supplied paths.
+
+The manifest is deliberately not an attestation of the target system. It proves
+only that the saved report is reproducible from the supplied bytes and that the
+bytes have not changed since creation. It does not establish server, model,
+accelerator, physical-host, or production-workload identity. No source paths,
+prompts, endpoints, credentials, outputs, or raw telemetry are serialized.
+
 ## Why Mock Mode Exists
 
 AI infrastructure repos often fail basic review because they cannot run without specialized hardware. Mock mode makes the benchmark harness reviewable anywhere while live Triton mode remains available for real server testing.

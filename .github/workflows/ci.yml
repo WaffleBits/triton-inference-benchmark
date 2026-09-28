@@ -24,6 +24,9 @@ jobs:
       - name: Run saved benchmark trend-report fixture
         run: python tests/run_benchmark_report_fixture.py
 
+      - name: Run content-addressed qualification manifest fixture
+        run: python tests/run_qualification_manifest_fixture.py
+
       - name: Run controlled lifecycle qualification fixture
         run: python tests/run_lifecycle_qualification_fixture.py
 
