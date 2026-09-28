@@ -468,6 +468,39 @@ retry accounting. It omits source paths, endpoints, prompts, configuration,
 credentials, raw telemetry, and trace identifiers. Workload, model, serving
 configuration, and measurement conditions must be kept comparable by the operator.
 
+## Create a content-addressed qualification manifest
+
+Bind a saved trend report to the exact ordered JSON artifacts used to derive it:
+
+```bash
+python qualification_manifest.py create \
+  --report benchmark_trend_reports/benchmark_trend.json \
+  --input benchmark_results/baseline/benchmark.json \
+  --input benchmark_results/candidate/benchmark.json \
+  --output benchmark_trend_reports/qualification-manifest.json \
+  --require-pass
+```
+
+The command re-derives the trend report before writing the manifest. The manifest
+stores only SHA-256 digests, byte counts, run indexes, bounded schema metadata,
+and the regression-gate status. It does not store source paths, report contents,
+endpoints, prompts, credentials, outputs, or raw telemetry. `--require-pass`
+rejects a report that failed its configured regression gate.
+
+Verify the manifest later against the same ordered artifacts:
+
+```bash
+python qualification_manifest.py verify \
+  --manifest benchmark_trend_reports/qualification-manifest.json \
+  --report benchmark_trend_reports/benchmark_trend.json \
+  --input benchmark_results/baseline/benchmark.json \
+  --input benchmark_results/candidate/benchmark.json
+```
+
+This proves byte identity and safe re-derivation of the saved report. It does not
+verify server identity, model or accelerator identity, physical-host separation,
+or production operation.
+
 Gate on server counters from two operator-supplied Prometheus snapshots:
 
 ```bash
