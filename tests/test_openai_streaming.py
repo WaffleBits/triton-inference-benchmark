@@ -302,6 +302,114 @@ class OpenAIStreamingClientTest(unittest.TestCase):
         self.assertIn("triton_benchmark_streaming_output_tokens_per_second", output)
         self.assertIn('mode="openai"', output)
 
+    def test_rejects_invalid_server_reported_completion_token_counts(self) -> None:
+        cases = (
+            (True, None, True),
+            (-1, None, True),
+            (1.5, None, True),
+            ("2", None, True),
+            (0, 0, False),
+            (None, None, False),
+        )
+        for usage_value, expected_tokens, expected_invalid in cases:
+            with self.subTest(usage_value=usage_value):
+                class Handler(BaseHTTPRequestHandler):
+                    def log_message(self, format: str, *args: object) -> None:
+                        return
+
+                    def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+                        length = int(self.headers["Content-Length"])
+                        self.rfile.read(length)
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.end_headers()
+                        events = [
+                            {"choices": [{"text": "ok"}]},
+                            {"choices": [], "usage": {"completion_tokens": usage_value}},
+                        ]
+                        for event in events:
+                            self.wfile.write(
+                                f"data: {json.dumps(event)}\n\n".encode("utf-8")
+                            )
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+
+                server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    client = OpenAICompatibleStreamingClient(
+                        server_url=f"http://127.0.0.1:{server.server_port}",
+                        model_name="review-model",
+                        prompt="synthetic prompt",
+                        max_tokens=8,
+                        timeout_seconds=5.0,
+                    )
+                    observation = client.infer()
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
+
+                self.assertEqual(observation.reported_output_tokens, expected_tokens)
+                self.assertEqual(
+                    observation.invalid_reported_output_tokens,
+                    expected_invalid,
+                )
+
+    def test_incomplete_or_invalid_usage_cannot_drive_token_rates_or_cost(self) -> None:
+        results = [
+            InferenceResult(
+                ok=True,
+                latency_ms=10.0,
+                streaming=StreamingInferenceObservation(2.0, 0.0, 1, 5, 2),
+            ),
+            InferenceResult(
+                ok=True,
+                latency_ms=10.0,
+                streaming=StreamingInferenceObservation(2.0, 0.0, 1, None, 2),
+            ),
+            InferenceResult(
+                ok=True,
+                latency_ms=10.0,
+                streaming=StreamingInferenceObservation(
+                    2.0,
+                    0.0,
+                    1,
+                    None,
+                    2,
+                    invalid_reported_output_tokens=True,
+                ),
+            ),
+        ]
+        metrics = summarize_results(
+            results,
+            duration_seconds=2.0,
+            config=BenchmarkConfig(mode="openai", num_requests=3, concurrency=1),
+        )
+
+        streaming = metrics["streaming"]
+        self.assertEqual(streaming["reported_token_request_count"], 1)
+        self.assertEqual(streaming["missing_token_usage_requests"], 1)
+        self.assertEqual(streaming["invalid_token_usage_requests"], 1)
+        self.assertIsNone(streaming["output_tokens_per_second"])
+        prometheus = format_prometheus_metrics(metrics)
+        self.assertIn(
+            "triton_benchmark_streaming_missing_token_usage_requests", prometheus
+        )
+        self.assertIn(
+            "triton_benchmark_streaming_invalid_token_usage_requests", prometheus
+        )
+        self.assertNotIn(
+            "triton_benchmark_streaming_output_tokens_per_second{", prometheus
+        )
+        cost = build_cost_model(
+            metrics,
+            CostModelConfig(output_tokens_per_request=128),
+        )
+        self.assertEqual(cost["workload"]["output_tokens_source"], "configured estimate")
+        self.assertEqual(cost["workload"]["successful_output_tokens"], 384)
+
     def test_measures_streaming_completion_events(self) -> None:
         class Handler(BaseHTTPRequestHandler):
             payload = None

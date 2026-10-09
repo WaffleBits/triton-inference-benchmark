@@ -285,6 +285,7 @@ class StreamingInferenceObservation:
     reported_output_tokens: int | None
     output_bytes: int
     response_trace_context: str | None = None
+    invalid_reported_output_tokens: bool = False
 
 
 @dataclass(frozen=True)
@@ -730,6 +731,7 @@ class OpenAICompatibleStreamingClient:
         inter_chunk_gaps_ms: list[float] = []
         observed_output_chunks = 0
         reported_output_tokens: int | None = None
+        invalid_reported_output_tokens = False
         output_bytes = 0
 
         response_trace_context: str | None = None
@@ -750,10 +752,20 @@ class OpenAICompatibleStreamingClient:
                     continue
                 event = json.loads(raw_event)
                 usage = event.get("usage")
-                if isinstance(usage, dict) and isinstance(
-                    usage.get("completion_tokens"), int
-                ):
-                    reported_output_tokens = usage["completion_tokens"]
+                if usage is not None:
+                    if not isinstance(usage, dict):
+                        invalid_reported_output_tokens = True
+                        reported_output_tokens = None
+                    elif "completion_tokens" in usage:
+                        token_count = usage["completion_tokens"]
+                        if token_count is None:
+                            pass
+                        elif type(token_count) is int and token_count >= 0:
+                            if not invalid_reported_output_tokens:
+                                reported_output_tokens = token_count
+                        else:
+                            invalid_reported_output_tokens = True
+                            reported_output_tokens = None
 
                 choices = event.get("choices")
                 if not isinstance(choices, list) or not choices:
@@ -784,6 +796,7 @@ class OpenAICompatibleStreamingClient:
             reported_output_tokens=reported_output_tokens,
             output_bytes=output_bytes,
             response_trace_context=response_trace_context,
+            invalid_reported_output_tokens=invalid_reported_output_tokens,
         )
 
 
@@ -1798,7 +1811,16 @@ def summarize_results(
             item.reported_output_tokens
             for item in streaming
             if item.reported_output_tokens is not None
+            and not item.invalid_reported_output_tokens
         ]
+        invalid_token_usage_requests = sum(
+            item.invalid_reported_output_tokens for item in streaming
+        )
+        missing_token_usage_requests = sum(
+            item.reported_output_tokens is None
+            and not item.invalid_reported_output_tokens
+            for item in streaming
+        )
 
         def distribution(values: list[float]) -> dict[str, float]:
             return {
@@ -1815,7 +1837,8 @@ def summarize_results(
         summary["streaming"] = {
             "request_count": len(streaming),
             "reported_token_request_count": len(reported_tokens),
-            "missing_token_usage_requests": len(streaming) - len(reported_tokens),
+            "missing_token_usage_requests": missing_token_usage_requests,
+            "invalid_token_usage_requests": invalid_token_usage_requests,
             "reported_output_tokens": total_reported_tokens,
             "observed_output_chunks": sum(
                 item.observed_output_chunks for item in streaming
@@ -4188,6 +4211,21 @@ def format_prometheus_metrics(metrics: dict[str, object]) -> str:
                     )
 
         scalar_specs = [
+            (
+                "reported_token_request_count",
+                "triton_benchmark_streaming_reported_token_requests",
+                "Successful streams with valid server-reported completion-token usage.",
+            ),
+            (
+                "missing_token_usage_requests",
+                "triton_benchmark_streaming_missing_token_usage_requests",
+                "Successful streams without a server-reported completion-token count.",
+            ),
+            (
+                "invalid_token_usage_requests",
+                "triton_benchmark_streaming_invalid_token_usage_requests",
+                "Successful streams with invalid server-reported completion-token usage.",
+            ),
             (
                 "reported_output_tokens",
                 "triton_benchmark_streaming_reported_output_tokens_total",

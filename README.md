@@ -54,6 +54,10 @@ drives a real inference endpoint.
   OpenAI-compatible streaming mode for vLLM/SGLang-style endpoints.
 - Measured streaming TTFT, inter-chunk latency, output bytes, and server-reported
   output-token throughput without treating transport chunks as tokens.
+- Validates server-reported completion-token usage as non-negative integers,
+  rejects booleans and malformed values, and separates invalid from missing
+  usage coverage. Server-reported token throughput is omitted unless every
+  successful streaming request has valid usage.
 - Opt-in W3C `traceparent` propagation for live Triton and OpenAI-compatible
   requests, with fresh identifiers per HTTP attempt and no identifiers in artifacts.
 - Isolated-versus-concurrent output gates with exact fingerprints by default and
