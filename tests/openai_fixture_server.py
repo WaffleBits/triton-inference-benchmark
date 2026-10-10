@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port-file", required=True)
     parser.add_argument("--trace-file", required=True)
     parser.add_argument("--fail-first-requests", type=int, default=0)
+    parser.add_argument("--invalid-token-usage", action="store_true")
     args = parser.parse_args()
     if args.fail_first_requests < 0:
         parser.error("--fail-first-requests must be zero or greater")
@@ -106,7 +107,12 @@ def main() -> None:
             events = (
                 {"choices": [{"text": "fixture"}]},
                 {"choices": [{"text": " response"}]},
-                {"choices": [], "usage": {"completion_tokens": 2}},
+                {
+                    "choices": [],
+                    "usage": {
+                        "completion_tokens": -1 if args.invalid_token_usage else 2
+                    },
+                },
             )
             for event in events:
                 self.wfile.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
