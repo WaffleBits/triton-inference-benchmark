@@ -35,6 +35,27 @@ MAX_STARTUP_TIMEOUT_SECONDS = 10 * 60
 MAX_PROBE_INTERVAL_SECONDS = 10.0
 MAX_SHUTDOWN_TIMEOUT_SECONDS = 60.0
 MAX_HEALTH_BODY_BYTES = 4096
+_PENDING_SIGNAL: int | None = None
+
+
+class LifecycleInterrupted(Exception):
+    """Raised at safe checkpoints after an operator termination signal."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _record_termination_signal(signum: int, _frame: object) -> None:
+    """Defer cleanup to normal control flow instead of exiting asynchronously."""
+    global _PENDING_SIGNAL
+    if _PENDING_SIGNAL is None:
+        _PENDING_SIGNAL = signum
+
+
+def _raise_if_interrupted() -> None:
+    if _PENDING_SIGNAL is not None:
+        raise LifecycleInterrupted(_PENDING_SIGNAL)
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -285,8 +306,10 @@ def _wait_for_readiness(
     deadline = time.monotonic() + timeout_seconds
     probes = 0
     while True:
+        _raise_if_interrupted()
         probes += 1
         if _health_ready(health_url, min(probe_interval_seconds, 1.0)):
+            _raise_if_interrupted()
             elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000
             return elapsed_ms, probes
         if process.poll() is not None:
@@ -321,6 +344,37 @@ def terminate_process(
         return process.wait(timeout=timeout), "SIGKILL"
 
 
+def _run_benchmark_process(
+    command: Sequence[str], timeout_seconds: float, shutdown_timeout_seconds: float
+) -> int:
+    """Run a benchmark child that can be cancelled without orphaning its group."""
+    process = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=(os.name == "posix"),
+    )
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while True:
+            _raise_if_interrupted()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+            try:
+                return_code = process.wait(timeout=min(remaining, 0.1))
+                _raise_if_interrupted()
+                return return_code
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(command, timeout_seconds)
+    finally:
+        if process.poll() is None:
+            terminate_process(process, shutdown_timeout_seconds)
+
+
 def _parse_service_command(value: str) -> list[str]:
     if not isinstance(value, str) or not value or len(value) > MAX_COMMAND_LENGTH:
         raise ValueError("service command must be non-empty and bounded")
@@ -341,6 +395,7 @@ def _validate_timeout(value: float, field: str, maximum: float) -> float:
 
 
 def run_qualification(args: argparse.Namespace) -> dict[str, object]:
+    _raise_if_interrupted()
     service_command = _parse_service_command(args.service_command)
     validate_benchmark_arguments(args.benchmark)
     startup_timeout = _validate_timeout(
@@ -395,18 +450,14 @@ def run_qualification(args: argparse.Namespace) -> dict[str, object]:
                 "--output-dir",
                 str(result_dir),
             ]
-            completed = subprocess.run(
+            return_code = _run_benchmark_process(
                 benchmark_command,
-                cwd=ROOT,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=benchmark_timeout,
-                check=False,
+                benchmark_timeout,
+                shutdown_timeout,
             )
-            if completed.returncode != 0:
+            if return_code != 0:
                 raise RuntimeError(
-                    f"benchmark child exited with status {completed.returncode}"
+                    f"benchmark child exited with status {return_code}"
                 )
             artifacts = sorted(result_dir.glob("benchmark_*.json"))
             if len(artifacts) != 1:
@@ -418,6 +469,7 @@ def run_qualification(args: argparse.Namespace) -> dict[str, object]:
         if process is not None:
             service_exit_code, termination = terminate_process(process, shutdown_timeout)
 
+    _raise_if_interrupted()
     assert startup_latency_ms is not None
     report = build_lifecycle_report(
         startup_latency_ms=startup_latency_ms,
@@ -465,9 +517,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    global _PENDING_SIGNAL
+    _PENDING_SIGNAL = None
+    previous_handlers: dict[int, object] = {}
     try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, _record_termination_signal)
         args = parse_args(argv)
         report = run_qualification(args)
+    except LifecycleInterrupted as exc:
+        print(
+            f"lifecycle qualification interrupted by {signal.Signals(exc.signum).name}",
+            file=sys.stderr,
+        )
+        return 128 + exc.signum
     except (
         OSError,
         RuntimeError,
@@ -478,6 +541,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     ) as exc:
         print(f"lifecycle qualification failed: {exc}", file=sys.stderr)
         return 1
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        _PENDING_SIGNAL = None
     lifecycle = report["lifecycle"]
     assert isinstance(lifecycle, dict)
     print(

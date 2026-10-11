@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,12 +16,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--ready-delay-ms", type=float, default=0.0)
+    parser.add_argument("--response-delay-ms", type=float, default=0.0)
     parser.add_argument("--state-file", type=Path, required=True)
+    parser.add_argument("--pid-file", type=Path)
+    parser.add_argument("--termination-file", type=Path)
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
     if args.ready_delay_ms < 0:
         parser.error("--ready-delay-ms must be non-negative")
+    if args.response_delay_ms < 0:
+        parser.error("--response-delay-ms must be non-negative")
     return args
 
 
@@ -65,6 +72,7 @@ def main() -> None:
             with state_lock:
                 state["requests"] += 1
             persist_state()
+            time.sleep(args.response_delay_ms / 1000.0)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -79,12 +87,22 @@ def main() -> None:
             self.wfile.flush()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    server.daemon_threads = True
+    if args.pid_file is not None:
+        args.pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
     persist_state()
+
+    def stop_server(_signum: int, _frame: object) -> None:
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, stop_server)
     try:
         server.serve_forever()
     finally:
         server.server_close()
         persist_state()
+        if args.termination_file is not None:
+            args.termination_file.write_text("terminated\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

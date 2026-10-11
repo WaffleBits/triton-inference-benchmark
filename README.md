@@ -137,6 +137,13 @@ projection. They hash but do not write the command or health URL. This is
 controlled local lifecycle evidence, not model-weight load time, accelerator
 initialization, service MTTR, remote-host timing, or a production SLO.
 
+On SIGINT or SIGTERM during readiness or benchmarking, the wrapper stops and
+reaps its benchmark child, terminates the controlled service process group, and
+returns `128 + signal` without writing a successful lifecycle report.
+Deterministic fixtures interrupt a held-open local request with SIGINT and
+SIGTERM to verify this cleanup; they do not establish remote cancellation or
+service recovery.
+
 Pace only the measured phase at an explicit offered request rate:
 
 ```bash
