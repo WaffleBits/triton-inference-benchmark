@@ -30,6 +30,12 @@ jobs:
       - name: Run controlled lifecycle qualification fixture
         run: python tests/run_lifecycle_qualification_fixture.py
 
+      - name: Run lifecycle SIGINT cleanup fixture
+        run: python tests/run_lifecycle_signal_fixture.py SIGINT
+
+      - name: Run lifecycle SIGTERM cleanup fixture
+        run: python tests/run_lifecycle_signal_fixture.py SIGTERM
+
       - name: Run malformed streaming-usage CLI fixture
         run: python tests/run_streaming_usage_validation_fixture.py
 
