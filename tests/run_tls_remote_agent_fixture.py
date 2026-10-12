@@ -125,6 +125,22 @@ def assert_wrong_key_is_rejected(agent_url: str, ca_file: Path) -> None:
     else:
         raise AssertionError("TLS agent accepted an invalid bearer key")
 
+    cancel_request = urllib.request.Request(
+        agent_url + "/v1/run-cancel",
+        data=body,
+        headers={
+            "Authorization": "Bearer definitely-the-wrong-agent-key",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        opener.open(cancel_request, timeout=3)
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 401, exc.code
+    else:
+        raise AssertionError("TLS agent accepted invalid cancellation credentials")
+
 
 def coordinator_command(
     result_dir: Path,

@@ -6,6 +6,7 @@ import argparse
 import json
 import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -20,9 +21,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trace-file", required=True)
     parser.add_argument("--fail-first-requests", type=int, default=0)
     parser.add_argument("--invalid-token-usage", action="store_true")
+    parser.add_argument("--response-delay-ms", type=int, default=0)
     args = parser.parse_args()
     if args.fail_first_requests < 0:
         parser.error("--fail-first-requests must be zero or greater")
+    if args.response_delay_ms < 0:
+        parser.error("--response-delay-ms must be zero or greater")
     return args
 
 
@@ -90,6 +94,9 @@ def main() -> None:
 
             with state_lock:
                 request_state["backend"] += 1
+
+            if args.response_delay_ms:
+                time.sleep(args.response_delay_ms / 1000)
 
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")

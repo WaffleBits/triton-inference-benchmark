@@ -16,12 +16,13 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ MAX_BENCHMARK_ARGUMENT_BYTES = 32 * 1024
 MAX_REPLAY_IDENTITIES = 1024
 MAX_CACHED_RESULTS = 8
 MAX_CACHED_RESULT_BYTES = 64 * 1024 * 1024
+MAX_AGENT_CONTROL_THREADS = 8
 COORDINATED_ARTIFACT_FIELDS = (
     "mode",
     "num_requests",
@@ -405,7 +407,13 @@ def query_agent_run_status(
             "result_available",
             "result_source",
         }
-    elif state in {"missing", "accepted", "completed_result_expired"}:
+    elif state in {
+        "missing",
+        "accepted",
+        "running",
+        "cancelled",
+        "completed_result_expired",
+    }:
         if available is not False or result_source is not None:
             raise RuntimeError("agent non-completed status is inconsistent")
         expected_fields = {
@@ -426,6 +434,77 @@ def query_agent_run_status(
     if isinstance(result_source, str):
         status["result_source"] = result_source
     return status
+
+
+def cancel_agent_run(
+    base_url: str,
+    *,
+    api_key: str,
+    expected_agent_id_sha256: str,
+    run_id: str,
+    client_index: int,
+    client_count: int,
+    planned_start_agent_unix_ns: int,
+    benchmark_args: list[str],
+    timeout_seconds: float,
+    ca_file: Path | None = None,
+) -> dict[str, object]:
+    """Cancel one exact in-flight request and validate the agent acknowledgement."""
+    response = _post_json(
+        base_url,
+        "/v1/run-cancel",
+        _build_run_payload(
+            run_id=run_id,
+            client_index=client_index,
+            client_count=client_count,
+            planned_start_agent_unix_ns=planned_start_agent_unix_ns,
+            benchmark_args=benchmark_args,
+            timeout_seconds=timeout_seconds,
+        ),
+        api_key=api_key,
+        timeout_seconds=min(timeout_seconds, 8.0),
+        ca_file=ca_file,
+    )
+    if response.get("schema_version") != 1:
+        raise RuntimeError("agent cancellation response has an unsupported schema")
+    response_agent_hash = response.get("agent_id_sha256")
+    if not isinstance(response_agent_hash, str) or not hmac.compare_digest(
+        response_agent_hash, expected_agent_id_sha256
+    ):
+        raise RuntimeError("agent identity changed before cancellation")
+    state = response.get("state")
+    cancelled = response.get("cancelled")
+    if state not in {
+        "missing",
+        "accepted",
+        "running",
+        "cancelled",
+        "completed",
+        "completed_result_expired",
+    }:
+        raise RuntimeError("agent cancellation response has an invalid state")
+    if not isinstance(cancelled, bool) or cancelled != (state == "cancelled"):
+        raise RuntimeError("agent cancellation acknowledgement is inconsistent")
+    expected_fields = {
+        "schema_version",
+        "agent_id_sha256",
+        "state",
+        "result_available",
+        "cancelled",
+    }
+    if state == "completed":
+        expected_fields.add("result_source")
+    if set(response) != expected_fields:
+        raise RuntimeError("agent cancellation response contains unsupported fields")
+    if state == "completed" and response.get("result_source") not in {
+        "cached",
+        "durable",
+    }:
+        raise RuntimeError("agent cancellation result source is invalid")
+    if response.get("result_available") is not (state == "completed"):
+        raise RuntimeError("agent cancellation result status is inconsistent")
+    result: dict[str, object] = {"state": state, "cancelled": cancelled}
+    return result
 
 
 def run_agent_benchmark(
@@ -738,8 +817,8 @@ class DurableRunRecordStore:
         self.connection.close()
 
 
-class BenchmarkAgentServer(HTTPServer):
-    """Single-job-at-a-time server with bounded memory or opt-in durable state."""
+class BenchmarkAgentServer(ThreadingHTTPServer):
+    """Single-job agent with a responsive authenticated control plane."""
 
     def __init__(
         self,
@@ -768,6 +847,11 @@ class BenchmarkAgentServer(HTTPServer):
         self.completed_result_order: deque[str] = deque()
         self.cached_result_count = 0
         self.cached_result_bytes = 0
+        self.run_state_lock = threading.RLock()
+        self.active_run_identity: str | None = None
+        self.active_processes: dict[str, subprocess.Popen[str]] = {}
+        self.cancel_requested: set[str] = set()
+        self.control_slots = threading.BoundedSemaphore(MAX_AGENT_CONTROL_THREADS)
         self.durable_store: DurableRunRecordStore | None = None
         if state_db is not None:
             try:
@@ -788,6 +872,23 @@ class BenchmarkAgentServer(HTTPServer):
                     self.completed_result_order.append(identity)
                     self.cached_result_count += 1
                     self.cached_result_bytes += int(record["artifact_bytes"])
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        """Bound concurrent control handlers while allowing cancel/status during runs."""
+        if not self.control_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.control_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.control_slots.release()
 
     def enable_tls(
         self, certificate_file: str | Path, key_file: str | Path
@@ -820,129 +921,252 @@ class BenchmarkAgentServer(HTTPServer):
     def begin_run(
         self, identity: str, request_fingerprint: str
     ) -> dict[str, object] | None:
-        """Accept a new identity or return its identical completed result."""
-        record = self.run_records.get(identity)
-        if record is not None:
+        """Accept one exact run, enforcing one active benchmark per agent."""
+        with self.run_state_lock:
+            record = self.run_records.get(identity)
+            if record is not None:
+                if not hmac.compare_digest(
+                    str(record["request_fingerprint"]), request_fingerprint
+                ):
+                    raise AgentProtocolError(
+                        "run/client identity was reused for a different request",
+                        status=409,
+                    )
+                artifact = record.get("artifact")
+                if isinstance(artifact, dict):
+                    return dict(artifact)
+                if record.get("state") == "completed_result_expired":
+                    raise AgentProtocolError(
+                        "completed run result expired from the bounded cache", status=410
+                    )
+                if record.get("state") == "cancelled":
+                    raise AgentProtocolError("benchmark run was cancelled", status=409)
+                raise AgentProtocolError(
+                    "run/client identity was accepted but did not complete", status=409
+                )
+
+            if self.active_run_identity is not None:
+                raise AgentProtocolError("agent already has an active benchmark", status=409)
+
+            new_record = {
+                "request_fingerprint": request_fingerprint,
+                "state": "accepted",
+                "artifact": None,
+                "artifact_bytes": 0,
+                "cancel_event": threading.Event(),
+            }
+            durable_expired: list[str] = []
+            if self.durable_store is not None:
+                durable_expired = self.durable_store.accept_run(
+                    identity, request_fingerprint
+                )
+            self.run_records[identity] = new_record
+            self.replay_order.append(identity)
+            self.active_run_identity = identity
+            if len(self.replay_order) > MAX_REPLAY_IDENTITIES:
+                expired = self.replay_order.popleft()
+                self.cancel_requested.discard(expired)
+                if durable_expired and durable_expired != [expired]:
+                    raise RuntimeError("durable agent identity eviction order diverged")
+                expired_record = self.run_records.pop(expired, None)
+                if expired_record is not None and isinstance(
+                    expired_record.get("artifact"), dict
+                ):
+                    self.cached_result_count -= 1
+                    self.cached_result_bytes -= int(expired_record["artifact_bytes"])
+            return None
+
+    def attach_process(
+        self, identity: str, process: subprocess.Popen[str]
+    ) -> bool:
+        """Register the child and report whether cancellation raced its launch."""
+        with self.run_state_lock:
+            record = self.run_records.get(identity)
+            if record is None or self.active_run_identity != identity:
+                return True
+            if record.get("state") == "cancelled":
+                return True
+            if record.get("state") != "accepted":
+                raise RuntimeError("run identity was not awaiting a child process")
+            record["state"] = "running"
+            self.active_processes[identity] = process
+            return identity in self.cancel_requested
+
+    def is_cancel_requested(self, identity: str) -> bool:
+        with self.run_state_lock:
+            return identity in self.cancel_requested
+
+    def finish_run(self, identity: str) -> str:
+        """Release the active slot and signal control requests after child cleanup."""
+        with self.run_state_lock:
+            record = self.run_records.get(identity)
+            if record is None:
+                return "missing"
+            if identity in self.cancel_requested and record.get("state") != "completed":
+                record.update({"state": "cancelled", "artifact": None, "artifact_bytes": 0})
+            elif record.get("state") in {"accepted", "running"}:
+                record["state"] = "accepted"
+            self.active_processes.pop(identity, None)
+            if self.active_run_identity == identity:
+                self.active_run_identity = None
+            event = record.get("cancel_event")
+            if isinstance(event, threading.Event):
+                event.set()
+            self.cancel_requested.discard(identity)
+            return str(record.get("state"))
+
+    def cancel_run(
+        self, identity: str, request_fingerprint: str
+    ) -> dict[str, object]:
+        """Request cancellation and wait briefly for confirmed child cleanup."""
+        with self.run_state_lock:
+            record = self.run_records.get(identity)
+            if record is None:
+                return {"state": "missing", "result_available": False, "cancelled": False}
             if not hmac.compare_digest(
                 str(record["request_fingerprint"]), request_fingerprint
             ):
                 raise AgentProtocolError(
                     "run/client identity was reused for a different request", status=409
                 )
-            artifact = record.get("artifact")
-            if isinstance(artifact, dict):
-                return dict(artifact)
-            if record.get("state") == "completed_result_expired":
-                raise AgentProtocolError(
-                    "completed run result expired from the bounded cache", status=410
-                )
-            raise AgentProtocolError(
-                "run/client identity was accepted but did not complete", status=409
-            )
+            state = record.get("state")
+            if state == "completed" and isinstance(record.get("artifact"), dict):
+                result: dict[str, object] = {
+                    "state": "completed",
+                    "result_available": True,
+                    "result_source": self.cached_result_source,
+                }
+                result["cancelled"] = False
+                return result
+            if state in {"completed_result_expired", "cancelled"}:
+                return {
+                    "state": state,
+                    "result_available": False,
+                    "cancelled": state == "cancelled",
+                }
+            if state not in {"accepted", "running"}:
+                raise RuntimeError("agent run state is inconsistent")
 
-        new_record = {
-            "request_fingerprint": request_fingerprint,
-            "state": "accepted",
-            "artifact": None,
-            "artifact_bytes": 0,
-        }
-        durable_expired: list[str] = []
-        if self.durable_store is not None:
-            durable_expired = self.durable_store.accept_run(
-                identity, request_fingerprint
-            )
-        self.run_records[identity] = new_record
-        self.replay_order.append(identity)
-        if len(self.replay_order) > MAX_REPLAY_IDENTITIES:
-            expired = self.replay_order.popleft()
-            if durable_expired and durable_expired != [expired]:
-                raise RuntimeError("durable agent identity eviction order diverged")
-            expired_record = self.run_records.pop(expired, None)
-            if expired_record is not None and isinstance(
-                expired_record.get("artifact"), dict
-            ):
-                self.cached_result_count -= 1
-                self.cached_result_bytes -= int(expired_record["artifact_bytes"])
-        return None
+            self.cancel_requested.add(identity)
+            process = self.active_processes.get(identity)
+            event = record.get("cancel_event")
+            active = self.active_run_identity == identity
+            if not active:
+                record["state"] = "cancelled"
+                if isinstance(event, threading.Event):
+                    event.set()
+                self.cancel_requested.discard(identity)
+
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 3.0
+            while process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+        if active and isinstance(event, threading.Event):
+            event.wait(timeout=5.0)
+
+        with self.run_state_lock:
+            status = self.inspect_run(identity, request_fingerprint)
+            status["cancelled"] = status["state"] == "cancelled"
+            return status
 
     def inspect_run(
         self, identity: str, request_fingerprint: str
     ) -> dict[str, object]:
         """Report exact-request state without accepting or executing missing work."""
-        record = self.run_records.get(identity)
-        if record is None:
-            return {"state": "missing", "result_available": False}
-        if not hmac.compare_digest(
-            str(record["request_fingerprint"]), request_fingerprint
-        ):
-            raise AgentProtocolError(
-                "run/client identity was reused for a different request", status=409
-            )
-        state = record.get("state")
-        artifact = record.get("artifact")
-        if state == "completed" and isinstance(artifact, dict):
-            return {
-                "state": "completed",
-                "result_available": True,
-                "result_source": self.cached_result_source,
-            }
-        if state in {"accepted", "completed_result_expired"}:
-            return {"state": state, "result_available": False}
-        raise RuntimeError("agent run state is inconsistent")
+        with self.run_state_lock:
+            record = self.run_records.get(identity)
+            if record is None:
+                return {"state": "missing", "result_available": False}
+            if not hmac.compare_digest(
+                str(record["request_fingerprint"]), request_fingerprint
+            ):
+                raise AgentProtocolError(
+                    "run/client identity was reused for a different request", status=409
+                )
+            state = record.get("state")
+            artifact = record.get("artifact")
+            if state == "completed" and isinstance(artifact, dict):
+                return {
+                    "state": "completed",
+                    "result_available": True,
+                    "result_source": self.cached_result_source,
+                }
+            if state in {"accepted", "running", "cancelled", "completed_result_expired"}:
+                return {"state": state, "result_available": False}
+            raise RuntimeError("agent run state is inconsistent")
 
     def complete_run(self, identity: str, artifact: dict[str, object]) -> None:
         """Attach a completed artifact, evicting older result bodies fail-closed."""
-        record = self.run_records.get(identity)
-        if record is None or record.get("state") != "accepted":
-            raise RuntimeError("run identity was not in the accepted state")
-        artifact_copy = dict(artifact)
-        artifact_bytes = len(
-            json.dumps(artifact_copy, separators=(",", ":")).encode("utf-8")
-        )
-        durable_expired: list[str] | None = None
-        if self.durable_store is not None:
-            durable_expired = self.durable_store.complete_run(identity, artifact_copy)
-        record.update(
-            {
-                "state": "completed",
-                "artifact": artifact_copy,
-                "artifact_bytes": artifact_bytes,
-            }
-        )
-        self.completed_result_order.append(identity)
-        self.cached_result_count += 1
-        self.cached_result_bytes += artifact_bytes
-
-        while durable_expired or (
-            durable_expired is None
-            and (
-                self.cached_result_count > self.max_cached_results
-                or self.cached_result_bytes > self.max_cached_result_bytes
+        with self.run_state_lock:
+            record = self.run_records.get(identity)
+            if record is None or record.get("state") not in {"accepted", "running"}:
+                raise RuntimeError("run identity was not active")
+            if identity in self.cancel_requested:
+                raise AgentProtocolError("benchmark run was cancelled", status=409)
+            artifact_copy = dict(artifact)
+            artifact_bytes = len(
+                json.dumps(artifact_copy, separators=(",", ":")).encode("utf-8")
             )
-        ):
-            expired = (
-                durable_expired.pop(0)
-                if durable_expired is not None
-                else self.completed_result_order.popleft()
-            )
-            if self.completed_result_order and self.completed_result_order[0] == expired:
-                self.completed_result_order.popleft()
-            elif durable_expired is not None:
-                raise RuntimeError("durable agent result eviction order diverged")
-            expired_record = self.run_records.get(expired)
-            if expired_record is None or not isinstance(
-                expired_record.get("artifact"), dict
-            ):
-                continue
-            self.cached_result_count -= 1
-            self.cached_result_bytes -= int(expired_record["artifact_bytes"])
-            expired_record.update(
+            if self.durable_store is not None:
+                durable_expired = self.durable_store.complete_run(identity, artifact_copy)
+            else:
+                durable_expired = None
+            record.update(
                 {
-                    "state": "completed_result_expired",
-                    "artifact": None,
-                    "artifact_bytes": 0,
+                    "state": "completed",
+                    "artifact": artifact_copy,
+                    "artifact_bytes": artifact_bytes,
                 }
             )
+            self.completed_result_order.append(identity)
+            self.cached_result_count += 1
+            self.cached_result_bytes += artifact_bytes
+
+            while durable_expired or (
+                durable_expired is None
+                and (
+                    self.cached_result_count > self.max_cached_results
+                    or self.cached_result_bytes > self.max_cached_result_bytes
+                )
+            ):
+                expired = (
+                    durable_expired.pop(0)
+                    if durable_expired is not None
+                    else self.completed_result_order.popleft()
+                )
+                if self.completed_result_order and self.completed_result_order[0] == expired:
+                    self.completed_result_order.popleft()
+                elif durable_expired is not None:
+                    raise RuntimeError("durable agent result eviction order diverged")
+                expired_record = self.run_records.get(expired)
+                if expired_record is None or not isinstance(
+                    expired_record.get("artifact"), dict
+                ):
+                    continue
+                self.cached_result_count -= 1
+                self.cached_result_bytes -= int(expired_record["artifact_bytes"])
+                expired_record.update(
+                    {
+                        "state": "completed_result_expired",
+                        "artifact": None,
+                        "artifact_bytes": 0,
+                    }
+                )
+            self.active_processes.pop(identity, None)
+            if self.active_run_identity == identity:
+                self.active_run_identity = None
+            event = record.get("cancel_event")
+            if isinstance(event, threading.Event):
+                event.set()
 
 
 class BenchmarkAgentHandler(BaseHTTPRequestHandler):
@@ -957,8 +1181,12 @@ class BenchmarkAgentHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError:
+            # A coordinator may close its run socket while the agent is replying.
+            return
 
     def _authorize(self) -> None:
         expected = f"Bearer {self.server.api_key}"
@@ -999,6 +1227,8 @@ class BenchmarkAgentHandler(BaseHTTPRequestHandler):
                 self._handle_run(payload)
             elif self.path == "/v1/run-status":
                 self._handle_run_status(payload)
+            elif self.path == "/v1/run-cancel":
+                self._handle_run_cancel(payload)
             else:
                 raise AgentProtocolError("not found", status=404)
         except AgentProtocolError as exc:
@@ -1109,6 +1339,27 @@ class BenchmarkAgentHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_run_cancel(self, payload: dict[str, Any]) -> None:
+        (
+            _run_id,
+            _client_index,
+            _client_count,
+            _planned_start_ns,
+            _timeout_seconds,
+            _benchmark_args,
+            replay_identity,
+            request_fingerprint,
+        ) = self._validate_run_request(payload)
+        status = self.server.cancel_run(replay_identity, request_fingerprint)
+        self._send_json(
+            200,
+            {
+                "schema_version": 1,
+                "agent_id_sha256": self.server.agent_id_sha256,
+                **status,
+            },
+        )
+
     def _handle_run(self, payload: dict[str, Any]) -> None:
         (
             run_id,
@@ -1135,61 +1386,84 @@ class BenchmarkAgentHandler(BaseHTTPRequestHandler):
             )
             return
 
-        with tempfile.TemporaryDirectory(prefix="benchmark-agent-") as temp_dir:
-            command = [
-                sys.executable,
-                str(ROOT / "benchmark.py"),
-                *benchmark_args,
-                f"--coordinated-run-id={run_id}",
-                "--coordinated-client-index",
-                str(client_index),
-                "--coordinated-client-count",
-                str(client_count),
-                "--coordinated-start-unix-ns",
-                str(planned_start_ns),
-                "--output-dir",
-                temp_dir,
-            ]
-            try:
-                completed = subprocess.run(
+        process: subprocess.Popen[str] | None = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="benchmark-agent-") as temp_dir:
+                command = [
+                    sys.executable,
+                    str(ROOT / "benchmark.py"),
+                    *benchmark_args,
+                    f"--coordinated-run-id={run_id}",
+                    "--coordinated-client-index",
+                    str(client_index),
+                    "--coordinated-client-count",
+                    str(client_count),
+                    "--coordinated-start-unix-ns",
+                    str(planned_start_ns),
+                    "--output-dir",
+                    temp_dir,
+                ]
+                process = subprocess.Popen(
                     command,
                     cwd=ROOT,
                     env=self.server.child_environment,
                     text=True,
-                    capture_output=True,
-                    timeout=timeout_seconds,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
                 )
-            except subprocess.TimeoutExpired as exc:
-                raise AgentProtocolError("benchmark child timed out", status=504) from exc
-            if completed.returncode:
-                detail = completed.stderr.strip()[:2000] or "no diagnostic"
-                raise AgentProtocolError(
-                    f"benchmark child failed with status {completed.returncode}: {detail}",
-                    status=422,
-                )
-            artifacts = list(Path(temp_dir).glob("benchmark_*.json"))
-            if len(artifacts) != 1:
-                raise AgentProtocolError(
-                    "benchmark child did not write exactly one JSON artifact", status=500
-                )
-            try:
-                artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise AgentProtocolError("benchmark child artifact is invalid", status=500) from exc
-            if not isinstance(artifact, dict):
-                raise AgentProtocolError("benchmark child artifact is invalid", status=500)
+                cancel_on_attach = self.server.attach_process(replay_identity, process)
+                if cancel_on_attach and process.poll() is None:
+                    process.terminate()
+                try:
+                    stdout, stderr = process.communicate(timeout=timeout_seconds)
+                except subprocess.TimeoutExpired as exc:
+                    if process.poll() is None:
+                        process.kill()
+                    stdout, stderr = process.communicate()
+                    if self.server.is_cancel_requested(replay_identity):
+                        raise AgentProtocolError("benchmark child cancelled", status=409) from exc
+                    raise AgentProtocolError("benchmark child timed out", status=504) from exc
+                if self.server.is_cancel_requested(replay_identity):
+                    raise AgentProtocolError("benchmark child cancelled", status=409)
+                if process.returncode:
+                    detail = stderr.strip()[:2000] or "no diagnostic"
+                    raise AgentProtocolError(
+                        f"benchmark child failed with status {process.returncode}: {detail}",
+                        status=422,
+                    )
+                artifacts = list(Path(temp_dir).glob("benchmark_*.json"))
+                if len(artifacts) != 1:
+                    raise AgentProtocolError(
+                        "benchmark child did not write exactly one JSON artifact", status=500
+                    )
+                try:
+                    artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise AgentProtocolError("benchmark child artifact is invalid", status=500) from exc
+                if not isinstance(artifact, dict):
+                    raise AgentProtocolError("benchmark child artifact is invalid", status=500)
 
-        coordinated_artifact = build_coordinated_agent_artifact(artifact)
-        self.server.complete_run(replay_identity, coordinated_artifact)
-        self._send_json(
-            200,
-            {
-                "schema_version": 1,
-                "agent_id_sha256": self.server.agent_id_sha256,
-                "result_source": "executed",
-                "artifact": coordinated_artifact,
-            },
-        )
+            coordinated_artifact = build_coordinated_agent_artifact(artifact)
+            self.server.complete_run(replay_identity, coordinated_artifact)
+            self._send_json(
+                200,
+                {
+                    "schema_version": 1,
+                    "agent_id_sha256": self.server.agent_id_sha256,
+                    "result_source": "executed",
+                    "artifact": coordinated_artifact,
+                },
+            )
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate(timeout=2)
+            self.server.finish_run(replay_identity)
 
 
 def _parse_args() -> argparse.Namespace:

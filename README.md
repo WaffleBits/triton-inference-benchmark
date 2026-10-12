@@ -141,8 +141,7 @@ On SIGINT or SIGTERM during readiness or benchmarking, the wrapper stops and
 reaps its benchmark child, terminates the controlled service process group, and
 returns `128 + signal` without writing a successful lifecycle report.
 Deterministic fixtures interrupt a held-open local request with SIGINT and
-SIGTERM to verify this cleanup; they do not establish remote cancellation or
-service recovery.
+SIGTERM to verify this local cleanup; they do not establish service recovery.
 
 Pace only the measured phase at an explicit offered request rate:
 
@@ -270,6 +269,20 @@ clock uncertainty exceeds the configured limit. The final gate uses the sum of
 two worst-case clock uncertainties to report a start-skew upper bound and an
 overlap lower bound. It reports normalized observed throughput separately from
 a conservative lower bound based on the union-duration upper bound.
+
+In authenticated remote-agent mode, SIGINT and SIGTERM make the coordinator send
+an authenticated `/v1/run-cancel` request for each exact active shard identity.
+The agent keeps its single-job limit while serving this control request,
+terminates and reaps the matching benchmark child, and marks the interrupted
+run cancelled so it cannot be replayed or published as a successful result. The
+coordinator reports how many agents confirmed cancellation and exits with
+`128 + signal`; it writes no aggregate success artifact. The SIGINT/SIGTERM
+fixtures exercise two loopback agents and a delayed synthetic target through the
+real coordinator CLI. They do not prove delivery over arbitrary production
+networks, durable continuation of interrupted work, multi-host operation, or
+production recovery/SLO behavior. If an agent is unreachable, cancellation is
+not confirmed and remote work may continue until that agent's own timeout or
+operator intervention.
 
 The agent accepts a bounded JSON protocol, invokes only this repository's
 `benchmark.py`, rejects coordinator-owned/shared-counter options, and remembers
@@ -726,6 +739,8 @@ python -m unittest discover -s tests
 python tests/run_coordinated_client_fixture.py
 python tests/run_remote_agent_fixture.py
 python tests/run_tls_remote_agent_fixture.py
+python tests/run_remote_agent_cancellation_fixture.py SIGINT
+python tests/run_remote_agent_cancellation_fixture.py SIGTERM
 python tests/run_agent_restart_fixture.py
 python tests/run_coordinator_restart_fixture.py
 python tests/run_lifecycle_qualification_fixture.py

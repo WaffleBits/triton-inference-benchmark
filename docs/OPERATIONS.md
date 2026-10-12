@@ -376,8 +376,14 @@ is launched. The resumed aggregate labels completed status verification and
 cached/durable result sources separately.
 
 This path reconciles completed work only. It does not resume an interrupted
-benchmark child, cancel in-flight work, repair an unavailable agent, reuse a
-stale clock plan for replacement work, or provide a general workflow engine.
+benchmark child or repair an unavailable agent. During an active remote run,
+SIGINT/SIGTERM asks each configured agent to cancel the exact shard and waits
+for a bounded confirmation. A reachable agent terminates and reaps its child;
+the coordinator reports confirmations and exits with `128 + signal` without a
+success aggregate. If an agent cannot be reached or does not confirm, remote
+work may continue until its configured child timeout or operator intervention.
+Cancellation does not continue a partial workflow, replace an agent, or reuse a
+stale clock plan for replacement work.
 Retain the state only as long as operational recovery requires it; after a
 successful run, remove or archive it under the same access controls as other
 operator state.

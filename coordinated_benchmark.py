@@ -11,6 +11,7 @@ import math
 import os
 import re
 import secrets
+import signal
 import stat
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from remote_agent import (
+    cancel_agent_run,
     probe_agent_clock,
     query_agent_run_status,
     run_agent_benchmark,
@@ -34,6 +36,16 @@ MAX_COORDINATOR_STATE_BYTES = 64 * 1024
 COORDINATOR_STATE_SCHEMA_VERSION = 1
 COORDINATOR_STATE_HMAC_CONTEXT = b"triton-coordinator-state-v1\0"
 COORDINATOR_RUN_ID_CONTEXT = b"triton-coordinator-run-v1\0"
+
+
+class CoordinatorInterrupted(Exception):
+    """Operator cancellation signal captured for remote-agent cleanup."""
+
+    def __init__(self, signal_number: int) -> None:
+        super().__init__(signal_number)
+        self.signal_number = signal_number
+
+
 UNSUPPORTED_BENCHMARK_OPTIONS = {
     "-h",
     "--help",
@@ -1450,6 +1462,47 @@ def _run_local_clients(args: argparse.Namespace, output_dir: Path) -> dict[str, 
     return build_coordinated_summary(shards, args.max_start_skew_ms)
 
 
+def _cancel_remote_agents(
+    args: argparse.Namespace,
+    agent_hashes: list[str],
+    run_id: str,
+    planned_agent_starts: list[int],
+) -> int:
+    """Ask every target agent to stop this exact run; count only confirmed cleanup."""
+    api_key = args.agent_api_key
+    if not isinstance(api_key, str):
+        return 0
+    ca_file = getattr(args, "agent_ca_file", None)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.clients) as executor:
+        futures = [
+            executor.submit(
+                cancel_agent_run,
+                agent_url,
+                api_key=api_key,
+                expected_agent_id_sha256=agent_hash,
+                run_id=run_id,
+                client_index=client_index,
+                client_count=args.clients,
+                planned_start_agent_unix_ns=planned_agent_starts[client_index],
+                benchmark_args=args.benchmark_args,
+                timeout_seconds=args.timeout_seconds,
+                ca_file=ca_file,
+            )
+            for client_index, (agent_url, agent_hash) in enumerate(
+                zip(args.agent_url, agent_hashes)
+            )
+        ]
+        confirmed = 0
+        for future in futures:
+            try:
+                response = future.result()
+            except Exception:
+                continue
+            if response.get("cancelled") is True:
+                confirmed += 1
+    return confirmed
+
+
 def _run_remote_clients(args: argparse.Namespace) -> dict[str, object]:
     api_key = args.agent_api_key
     if not isinstance(api_key, str):
@@ -1624,7 +1677,8 @@ def _run_remote_clients(args: argparse.Namespace) -> dict[str, object]:
         else:
             run_id = secrets.token_hex(32)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.clients) as executor:
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.clients)
+    try:
         run_futures = [
             executor.submit(
                 run_agent_benchmark,
@@ -1645,6 +1699,17 @@ def _run_remote_clients(args: argparse.Namespace) -> dict[str, object]:
             )
         ]
         shards = [future.result() for future in run_futures]
+    except CoordinatorInterrupted:
+        confirmed = _cancel_remote_agents(
+            args, agent_hashes, run_id, planned_agent_starts
+        )
+        print(
+            f"remote agent cancellation confirmed: {confirmed}/{args.clients}",
+            file=sys.stderr,
+        )
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
 
     for shard, profile in zip(shards, clock_profiles):
         shard["_remote_agent"] = {
@@ -1700,6 +1765,13 @@ def _run_remote_clients(args: argparse.Namespace) -> dict[str, object]:
     return summary
 
 
+def _handle_coordinator_signal(signum: int, _frame: Any) -> None:
+    """Capture the first operator signal and let cleanup finish uninterrupted."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise CoordinatorInterrupted(signum)
+
+
 def main() -> None:
     args = _parse_args()
     output_dir = Path(args.output_dir)
@@ -1708,7 +1780,20 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.agent_url:
-        summary = _run_remote_clients(args)
+        original_handlers = {
+            selected: signal.getsignal(selected)
+            for selected in (signal.SIGINT, signal.SIGTERM)
+        }
+        try:
+            signal.signal(signal.SIGINT, _handle_coordinator_signal)
+            signal.signal(signal.SIGTERM, _handle_coordinator_signal)
+            try:
+                summary = _run_remote_clients(args)
+            except CoordinatorInterrupted as interrupted:
+                raise SystemExit(128 + interrupted.signal_number) from None
+        finally:
+            for selected, handler in original_handlers.items():
+                signal.signal(selected, handler)
     else:
         summary = _run_local_clients(args, output_dir)
 

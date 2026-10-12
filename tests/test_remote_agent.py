@@ -17,6 +17,7 @@ from remote_agent import (
     _post_json,
     build_child_environment,
     build_coordinated_agent_artifact,
+    cancel_agent_run,
     query_agent_run_status,
     run_agent_benchmark,
     select_clock_observation,
@@ -52,6 +53,15 @@ class RemoteAgentProtocolTest(unittest.TestCase):
 
             server.complete_run(identity, {"successful_requests": 2})
             self.assertEqual(
+                server.cancel_run(identity, fingerprint),
+                {
+                    "state": "completed",
+                    "result_available": True,
+                    "result_source": "cached",
+                    "cancelled": False,
+                },
+            )
+            self.assertEqual(
                 server.inspect_run(identity, fingerprint),
                 {
                     "state": "completed",
@@ -61,6 +71,99 @@ class RemoteAgentProtocolTest(unittest.TestCase):
             )
         finally:
             server.server_close()
+
+    def test_cancelled_exact_run_is_fail_closed_and_idempotent(self) -> None:
+        server = BenchmarkAgentServer(
+            ("127.0.0.1", 0),
+            api_key="unit-test-agent-key",
+            agent_id="unit-test-agent",
+            child_timeout_seconds=5,
+            child_environment={"PATH": "", "PYTHONIOENCODING": "utf-8"},
+        )
+        try:
+            identity = "a" * 64
+            fingerprint = "b" * 64
+            self.assertIsNone(server.begin_run(identity, fingerprint))
+            # Model an accepted record recovered after the agent process exited.
+            self.assertEqual(server.finish_run(identity), "accepted")
+            self.assertEqual(
+                server.cancel_run(identity, fingerprint),
+                {"state": "cancelled", "result_available": False, "cancelled": True},
+            )
+            self.assertNotIn(identity, server.cancel_requested)
+            self.assertEqual(
+                server.cancel_run(identity, fingerprint),
+                {"state": "cancelled", "result_available": False, "cancelled": True},
+            )
+            with self.assertRaisesRegex(AgentProtocolError, "different request"):
+                server.cancel_run(identity, "c" * 64)
+            with self.assertRaisesRegex(AgentProtocolError, "was cancelled"):
+                server.begin_run(identity, fingerprint)
+        finally:
+            server.server_close()
+
+    def test_cancellation_client_uses_exact_run_and_checks_acknowledgement(self) -> None:
+        response = {
+            "schema_version": 1,
+            "agent_id_sha256": "d" * 64,
+            "state": "cancelled",
+            "result_available": False,
+            "cancelled": True,
+        }
+        with patch("remote_agent._post_json", return_value=response) as post:
+            status = cancel_agent_run(
+                "https://agent.example.test",
+                api_key="unit-test-agent-key",
+                expected_agent_id_sha256="d" * 64,
+                run_id="private-run-id",
+                client_index=0,
+                client_count=2,
+                planned_start_agent_unix_ns=1_000_000_000,
+                benchmark_args=["--mode", "mock", "--num-requests", "4"],
+                timeout_seconds=5,
+            )
+        self.assertEqual(status, {"state": "cancelled", "cancelled": True})
+        self.assertEqual(post.call_args.args[1], "/v1/run-cancel")
+        self.assertEqual(post.call_args.args[2]["run_id"], "private-run-id")
+
+        inconsistent = {**response, "state": "accepted"}
+        with patch("remote_agent._post_json", return_value=inconsistent):
+            with self.assertRaisesRegex(RuntimeError, "acknowledgement"):
+                cancel_agent_run(
+                    "https://agent.example.test",
+                    api_key="unit-test-agent-key",
+                    expected_agent_id_sha256="d" * 64,
+                    run_id="private-run-id",
+                    client_index=0,
+                    client_count=2,
+                    planned_start_agent_unix_ns=1_000_000_000,
+                    benchmark_args=["--mode", "mock"],
+                    timeout_seconds=5,
+                )
+
+    def test_status_client_accepts_cancelled_run_state(self) -> None:
+        response = {
+            "schema_version": 1,
+            "agent_id_sha256": "d" * 64,
+            "state": "cancelled",
+            "result_available": False,
+        }
+        with patch("remote_agent._post_json", return_value=response):
+            status = query_agent_run_status(
+                "https://agent.example.test",
+                api_key="unit-test-agent-key",
+                expected_agent_id_sha256="d" * 64,
+                run_id="private-run-id",
+                client_index=0,
+                client_count=1,
+                planned_start_agent_unix_ns=1_000_000_000,
+                benchmark_args=["--mode", "mock"],
+                timeout_seconds=5,
+            )
+        self.assertEqual(
+            status,
+            {"state": "cancelled", "result_available": False},
+        )
 
     def test_status_client_validates_agent_and_completed_result(self) -> None:
         response = {
@@ -315,6 +418,7 @@ class RemoteAgentProtocolTest(unittest.TestCase):
             self.assertIsNone(server.begin_run("unfinished", "d" * 64))
             with self.assertRaisesRegex(AgentProtocolError, "did not complete"):
                 server.begin_run("unfinished", "d" * 64)
+            self.assertEqual(server.finish_run("unfinished"), "accepted")
 
             self.assertIsNone(server.begin_run("run-b", "c" * 64))
             server.complete_run("run-b", {"successful_requests": 2})

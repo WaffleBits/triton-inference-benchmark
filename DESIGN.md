@@ -128,15 +128,24 @@ case without a duplicate child execution. A second fixture discards a completed
 two-request result, stops the agent, starts a new process on the same SQLite file,
 and retrieves the durable projection while the target count remains two. It also
 checks database integrity, file mode and persisted-field privacy. These local
-fixtures do not establish coordinator recovery, safe continuation of an
-interrupted child, general network-fault handling, shared-store coordination or
-actual multi-host behavior.
+fixtures do not establish safe continuation of interrupted work, general
+network-fault handling, shared-store coordination or actual multi-host behavior.
 A separate TLS fixture generates an ephemeral certificate, runs the two agent
 services over verified HTTPS with an explicit CA bundle, rejects an invalid
 bearer key, rejects an untrusted CA before target work, and checks that transport
 policy appears without secrets or paths in JSON/Prometheus. These local fixtures
 still do not establish production certificate management, mutual TLS, general
 network-fault handling, shared-store coordination or actual multi-host behavior.
+
+The cancellation fixture holds a synthetic target request open, sends SIGINT or
+SIGTERM to the real coordinator CLI, and checks that both authenticated loopback
+agents acknowledge cancellation, their benchmark children are reaped, no
+success artifact is written, and the coordinator returns `128 + signal`. The
+agent accepts cancellation concurrently with `/v1/run` but retains one active
+benchmark slot and checks the exact hashed run identity and request fingerprint.
+An unreachable agent may not receive the request; this test is not evidence of
+reliable cancellation over arbitrary networks, durable interrupted-work
+continuation, production inference behavior, or fleet scale.
 
 ## Metrics
 
