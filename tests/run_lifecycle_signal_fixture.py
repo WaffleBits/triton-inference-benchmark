@@ -111,8 +111,14 @@ def main() -> None:
                         f"stdout:\n{stdout}\nstderr:\n{stderr}"
                     )
                 if pid_file.exists() and state_file.exists():
-                    service_pid = int(pid_file.read_text(encoding="utf-8").strip())
-                    state = json.loads(state_file.read_text(encoding="utf-8"))
+                    try:
+                        service_pid = int(pid_file.read_text(encoding="utf-8").strip())
+                        state = json.loads(state_file.read_text(encoding="utf-8"))
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        # The fixture publishes these small files with write_text;
+                        # retry while an initial write is still being completed.
+                        time.sleep(0.02)
+                        continue
                     if state["requests"] == 1:
                         benchmark_pids = [pid for pid in _children(wrapper.pid) if pid != service_pid]
                         if benchmark_pids:

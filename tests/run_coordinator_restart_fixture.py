@@ -271,7 +271,9 @@ def main() -> None:
             assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
             assert output_dir.is_dir() and not any(output_dir.iterdir())
 
-            first_coordinator.terminate()
+            # Exercise restart reconciliation after an abrupt coordinator crash;
+            # SIGTERM is now a handled request to cancel active agent work.
+            first_coordinator.kill()
             first_coordinator.wait(timeout=3)
             first_return_code = first_coordinator.returncode
             first_coordinator = None
