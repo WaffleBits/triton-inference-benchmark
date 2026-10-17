@@ -52,6 +52,8 @@ drives a real inference endpoint.
   each records context, output, batch, TTFT, decode, and KV-cache assumptions.
 - Dependency-free mock backend for CI, an optional Triton HTTP mode, and an
   OpenAI-compatible streaming mode for vLLM/SGLang-style endpoints.
+- CI audits the declared Python dependency graph in `requirements.txt` with
+  PyPA's `pip-audit` action before running the test suite.
 - Measured streaming TTFT, inter-chunk latency, output bytes, and server-reported
   output-token throughput without treating transport chunks as tokens.
 - Validates server-reported completion-token usage as non-negative integers,
