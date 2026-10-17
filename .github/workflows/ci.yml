@@ -18,6 +18,11 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Audit Python dependencies
+        uses: pypa/gh-action-pip-audit@v1.1.0
+        with:
+          inputs: requirements.txt
+
       - name: Run unit tests
         run: python -m unittest discover -s tests
 
