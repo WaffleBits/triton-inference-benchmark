@@ -59,7 +59,11 @@ The host's system Python 3.9.16 cannot resolve the declared `urllib3` wheel beca
 
 ## Pull-request and publication results
 
-_Pending GitHub push, pull-request CI, and remote read-back._
+- Pushed commit `32bc6058c977d34a776c8820fd9c096d54ee4384` to `ci/pip-audit-requirements-20261017` and opened [PR #30](https://github.com/WaffleBits/triton-inference-benchmark/pull/30). GitHub read-back confirmed the PR targets `main`, has the expected three changed files, and is at the pushed commit.
+- PR workflow [run 39027438941](https://github.com/WaffleBits/triton-inference-benchmark/actions/runs/39027438941) passed. GitHub's job-step read-back confirms the PyPA audit action passed before the full workflow's unit tests and CLI fixtures; its log reports `No known vulnerabilities found`. All workflow steps succeeded.
+- This repository has no deployment workflow. PR #30 remains open; no merge or profile publication is claimed.
+
+
 
 ## Remaining boundary
 
