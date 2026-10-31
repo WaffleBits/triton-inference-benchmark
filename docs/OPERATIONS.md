@@ -600,7 +600,7 @@ When a candidate run is marked as a regression:
 - Inspect server logs, accelerator telemetry, queue depth, and request batching before changing the benchmark threshold.
 - Compare correlated queue duration and GPU utilization before changing concurrency or batching policy.
 
-## Public-Safe Boundaries
+## Artifact Boundaries
 
 Do not commit production prompts, customer payloads, model weights, secrets,
 trace identifiers, traces, or logs. Keep benchmark samples synthetic or generated.
