@@ -180,7 +180,7 @@ def build_lifecycle_report(
     health_url: str,
     benchmark_artifact: dict[str, object],
 ) -> dict[str, object]:
-    """Project measured lifecycle and benchmark data into a public-safe report."""
+    """Project measured lifecycle and benchmark data into a shareable report."""
     latency = _finite_nonnegative(startup_latency_ms, "startup latency")
     if (
         not isinstance(readiness_probe_count, int)

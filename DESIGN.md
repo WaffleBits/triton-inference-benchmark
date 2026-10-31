@@ -1,5 +1,9 @@
 # Design Notes
 
+## Code Layout
+
+`benchmark.py` is the command line. The library lives in `bench_core/`: configuration and result types, inference clients, telemetry clients and gates, summaries, Prometheus export, regression reports, and the runner.
+
 ## Benchmark Model
 
 The benchmark separates the harness from the inference client:

@@ -1,4 +1,4 @@
-# Synthetic Triton/DCGM telemetry fixture for portfolio review and CI-safe demos.
+# Synthetic Triton/DCGM telemetry fixture for CI-safe demos.
 DCGM_FI_DEV_GPU_UTIL{gpu="0",uuid="GPU-synthetic-0"} 78
 DCGM_FI_DEV_GPU_UTIL{gpu="1",uuid="GPU-synthetic-1"} 86
 DCGM_FI_DEV_MEM_COPY_UTIL{gpu="0",uuid="GPU-synthetic-0"} 19
