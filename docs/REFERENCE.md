@@ -304,7 +304,9 @@ follow redirects, keeping the bearer key pinned to the selected agent origin.
 Benchmark children receive only `PATH`, `PYTHONIOENCODING`, and values named by
 an agent-side `--allow-child-env`; the agent's own API-key variable cannot be
 allowed. A live target credential therefore requires opt-in by both the agent
-operator and the benchmark CLI.
+operator and the benchmark CLI. `--allow-child-env` also requires at least one
+`--allowed-server-url`, and the agent refuses a run naming any other target, so
+a coordinator cannot send a forwarded credential to a host of its choosing.
 Raw keys, challenges, agent IDs, URLs, child paths, endpoints, prompts, outputs,
 and trace IDs are absent from the aggregate. Hashed agent identities establish
 protocol-level distinctness, not proof of separate physical machines.

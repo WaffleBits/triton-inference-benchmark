@@ -29,6 +29,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 CHALLENGE_PATTERN = HASH_PATTERN
+DEFAULT_SERVER_URL = "localhost:8000"
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_BENCHMARK_ARGUMENT_BYTES = 32 * 1024
@@ -137,6 +138,18 @@ def _build_agent_opener(ca_file: Path | None) -> urllib.request.OpenerDirector:
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         handlers.append(urllib.request.HTTPSHandler(context=context))
     return urllib.request.build_opener(*handlers)
+
+
+def requested_server_urls(benchmark_args: list[str]) -> list[str]:
+    """Return every target a run names, including the benchmark default."""
+    urls = []
+    for index, token in enumerate(benchmark_args):
+        if token == "--server-url":
+            following = benchmark_args[index + 1 :]
+            urls.append(following[0] if following else "")
+        elif token.startswith("--server-url="):
+            urls.append(token.split("=", 1)[1])
+    return urls or [DEFAULT_SERVER_URL]
 
 
 def build_child_environment(
@@ -828,6 +841,7 @@ class BenchmarkAgentServer(ThreadingHTTPServer):
         agent_id: str,
         child_timeout_seconds: float,
         child_environment: dict[str, str],
+        allowed_server_urls: tuple[str, ...] = (),
         max_cached_results: int = MAX_CACHED_RESULTS,
         max_cached_result_bytes: int = MAX_CACHED_RESULT_BYTES,
         state_db: Path | None = None,
@@ -838,6 +852,7 @@ class BenchmarkAgentServer(ThreadingHTTPServer):
         self.agent_id_sha256 = hashlib.sha256(agent_id.encode("utf-8")).hexdigest()
         self.child_timeout_seconds = child_timeout_seconds
         self.child_environment = dict(child_environment)
+        self.allowed_server_urls = tuple(allowed_server_urls)
         if max_cached_results < 1 or max_cached_result_bytes < 1:
             raise ValueError("completed-result cache limits must be positive")
         self.max_cached_results = max_cached_results
@@ -1191,7 +1206,7 @@ class BenchmarkAgentHandler(BaseHTTPRequestHandler):
     def _authorize(self) -> None:
         expected = f"Bearer {self.server.api_key}"
         supplied = self.headers.get("Authorization", "")
-        if not hmac.compare_digest(supplied, expected):
+        if not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
             raise AgentProtocolError("unauthorized", status=401)
 
     def _read_payload(self) -> dict[str, Any]:
@@ -1299,6 +1314,11 @@ class BenchmarkAgentHandler(BaseHTTPRequestHandler):
             validate_benchmark_args(list(benchmark_args))
         except ValueError as exc:
             raise AgentProtocolError(str(exc)) from exc
+        allowed_urls = self.server.allowed_server_urls
+        if allowed_urls and any(
+            url not in allowed_urls for url in requested_server_urls(benchmark_args)
+        ):
+            raise AgentProtocolError("target is not allowed by this agent", status=403)
         replay_identity = hashlib.sha256(
             f"{run_id}\0{client_index}".encode("utf-8")
         ).hexdigest()
@@ -1479,6 +1499,15 @@ def _parse_args() -> argparse.Namespace:
         default=[],
         help="Environment variable explicitly allowed into benchmark children.",
     )
+    parser.add_argument(
+        "--allowed-server-url",
+        action="append",
+        default=[],
+        help=(
+            "Target a run may name. Required with --allow-child-env, so a "
+            "forwarded credential cannot be pointed at another host."
+        ),
+    )
     parser.add_argument("--child-timeout-seconds", type=float, default=180.0)
     parser.add_argument(
         "--state-db",
@@ -1505,6 +1534,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--agent-id must contain 1 to 256 characters")
     if not math.isfinite(args.child_timeout_seconds) or args.child_timeout_seconds <= 0:
         parser.error("--child-timeout-seconds must be finite and positive")
+    if args.allow_child_env and not args.allowed_server_url:
+        parser.error("--allow-child-env requires --allowed-server-url")
     api_key = os.environ.get(args.api_key_env)
     if api_key is None or not 16 <= len(api_key) <= 4096 or "\r" in api_key or "\n" in api_key:
         parser.error("the selected API-key environment variable must contain 16 to 4096 characters")
@@ -1537,6 +1568,7 @@ def main() -> None:
         agent_id=args.agent_id,
         child_timeout_seconds=args.child_timeout_seconds,
         child_environment=args.child_environment,
+        allowed_server_urls=tuple(args.allowed_server_url),
         state_db=args.state_db,
     )
     try:
