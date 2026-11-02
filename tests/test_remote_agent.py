@@ -6,6 +6,8 @@ import stat
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -19,10 +21,93 @@ from remote_agent import (
     build_coordinated_agent_artifact,
     cancel_agent_run,
     query_agent_run_status,
+    requested_server_urls,
     run_agent_benchmark,
     select_clock_observation,
     validate_agent_base_url,
 )
+
+
+class AgentTargetTest(unittest.TestCase):
+    def serve(self, **kwargs: object) -> tuple[BenchmarkAgentServer, str]:
+        server = BenchmarkAgentServer(
+            ("127.0.0.1", 0),
+            api_key="unit-test-agent-key",
+            agent_id="unit-test-agent",
+            child_timeout_seconds=5,
+            child_environment={"PATH": "", "PYTHONIOENCODING": "utf-8"},
+            **kwargs,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+    def post(self, url: str, body: dict[str, object], token: bytes) -> tuple[int, dict]:
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Authorization": token, "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def run_status(self, base: str, args: list[str]) -> tuple[int, dict]:
+        return self.post(
+            f"{base}/v1/run-status",
+            {
+                "schema_version": 1,
+                "run_id": "run",
+                "client_index": 0,
+                "client_count": 2,
+                "planned_start_unix_ns": 1,
+                "benchmark_args": args,
+                "timeout_seconds": 1,
+            },
+            b"Bearer unit-test-agent-key",
+        )
+
+    def test_finds_every_form_of_the_target_option(self) -> None:
+        self.assertEqual(requested_server_urls([]), ["localhost:8000"])
+        self.assertEqual(requested_server_urls(["--server-url", "a"]), ["a"])
+        self.assertEqual(
+            requested_server_urls(["--server-url=a", "--server-url", "b"]), ["a", "b"]
+        )
+
+    def test_agent_refuses_a_target_outside_its_allowlist(self) -> None:
+        _, base = self.serve(allowed_server_urls=("https://model.internal",))
+
+        denied, _ = self.run_status(
+            base, ["--mode", "openai", "--server-url", "https://attacker.example"]
+        )
+        allowed, _ = self.run_status(
+            base, ["--mode", "openai", "--server-url=https://model.internal"]
+        )
+
+        self.assertEqual(denied, 403)
+        self.assertEqual(allowed, 200)
+
+    def test_later_duplicate_cannot_slip_past_the_allowlist(self) -> None:
+        _, base = self.serve(allowed_server_urls=("https://model.internal",))
+
+        status, _ = self.run_status(
+            base,
+            ["--server-url", "https://model.internal", "--server-url=https://attacker.example"],
+        )
+
+        self.assertEqual(status, 403)
+
+    def test_non_ascii_authorization_is_a_clean_401(self) -> None:
+        _, base = self.serve()
+
+        status, _ = self.post(f"{base}/v1/clock", {}, "Bearer \u00e9".encode("latin-1"))
+
+        self.assertEqual(status, 401)
 
 
 class RemoteAgentProtocolTest(unittest.TestCase):

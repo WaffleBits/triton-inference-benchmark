@@ -176,7 +176,7 @@ def parse_shape(raw_shape: str) -> tuple[int, ...]:
 
 
 def parse_args() -> CliOptions:
-    parser = argparse.ArgumentParser(description="Benchmark Triton-style inference workloads.")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="Benchmark Triton-style inference workloads.")
     parser.add_argument("--mode", choices=["mock", "triton", "openai"], default="mock")
     parser.add_argument("--server-url", default="localhost:8000")
     parser.add_argument("--model-name", default="resnet50_trt_fp16")

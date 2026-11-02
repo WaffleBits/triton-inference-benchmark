@@ -56,6 +56,13 @@ from benchmark import (
 )
 
 
+class OptionParsingTest(unittest.TestCase):
+    def test_abbreviated_options_are_rejected(self) -> None:
+        with patch("sys.argv", ["benchmark.py", "--output-di", "elsewhere"]):
+            with patch("sys.stderr"), self.assertRaises(SystemExit):
+                benchmark.parse_args()
+
+
 class BenchmarkHarnessTest(unittest.TestCase):
     def test_build_traceparent_returns_unique_w3c_sampled_contexts(self) -> None:
         traceparents = {build_traceparent() for _ in range(32)}
