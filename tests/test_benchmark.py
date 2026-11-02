@@ -60,7 +60,7 @@ class OptionParsingTest(unittest.TestCase):
     def test_abbreviated_options_are_rejected(self) -> None:
         with patch("sys.argv", ["benchmark.py", "--output-di", "elsewhere"]):
             with patch("sys.stderr"), self.assertRaises(SystemExit):
-                benchmark.parse_args()
+                parse_args()
 
 
 class BenchmarkHarnessTest(unittest.TestCase):
