@@ -350,6 +350,14 @@ The `--baseline` option compares a candidate benchmark run with a saved JSON res
 
 The default gates mark a run as a regression when p95 latency rises by more than 10% or success rate drops by more than 0.01. `--fail-on-regression` makes that comparison exit non-zero for CI. Those thresholds are intentionally CLI-configurable because production latency budgets differ by model, accelerator, queueing policy, and product surface.
 
+The saved trend CLI also accepts an opt-in repeated-run analysis. It pairs the
+first N baseline summaries with the next N candidate summaries by position,
+requires at least seven pairs, applies a one-sided exact binomial test to practical
+threshold exceedances, and corrects across four metrics with Holm step-down.
+Observations are run-level aggregates, not request-level samples. The operator
+must match conditions within each pair and collect independent runs. This
+statistical gate is separate from the adjacent-comparison gate.
+
 ## Content-addressed qualification manifests
 
 `qualification_manifest.py` adds a bounded provenance step after trend-report
@@ -358,7 +366,8 @@ re-derives the report through `benchmark_report`, and fails closed if any run,
 threshold, comparison, or regression result differs. It then records SHA-256
 digests and byte counts for the exact report and input bytes, plus run indexes and
 bounded gate metadata. The `verify` command repeats the derivation and digest
-checks without retaining or printing the supplied paths.
+checks without retaining or printing the supplied paths. Paired reports use
+manifest schema 2 and preserve verification of schema 1 reports and manifests.
 
 The manifest is deliberately not an attestation of the target system. It proves
 only that the saved report is reproducible from the supplied bytes and that the

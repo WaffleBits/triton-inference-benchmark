@@ -63,6 +63,7 @@ class QualificationManifestTests(unittest.TestCase):
             manifest = qualification_manifest.create_manifest(report_path, inputs)
             serialized = json.dumps(manifest)
 
+            self.assertEqual(manifest["schema_version"], 1)
             self.assertEqual(manifest["kind"], "benchmark_qualification_manifest")
             self.assertEqual(manifest["trend_report"]["run_count"], 2)
             self.assertEqual(len(manifest["input_artifacts"]), 2)
@@ -106,6 +107,57 @@ class QualificationManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "regression gate"):
                 qualification_manifest.create_manifest(
                     report_path, inputs, require_pass=True
+                )
+
+    def test_manifest_rederives_and_enforces_paired_statistical_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inputs: list[Path] = []
+            for group in ("baseline", "candidate"):
+                for index in range(7):
+                    artifact = copy.deepcopy(BASELINE)
+                    baseline_p95 = 8.0 * 1.09**index
+                    artifact["latency_ms"]["p95"] = (
+                        baseline_p95 if group == "baseline" else baseline_p95 * 1.11
+                    )
+                    artifact["latency_ms"]["p99"] = artifact["latency_ms"]["p95"] + 2.0
+                    path = root / f"{group}-{index}.json"
+                    path.write_text(json.dumps(artifact), encoding="utf-8")
+                    inputs.append(path)
+            runs = [
+                benchmark_report.load_run(path, index)
+                for index, path in enumerate(inputs, 1)
+            ]
+            report = benchmark_report.build_trend_report(
+                runs, paired_baseline_runs=7, paired_significance_level=0.05
+            )
+            report_path = root / "trend.json"
+            report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+            manifest = qualification_manifest.create_manifest(report_path, inputs)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+            )
+            verified = qualification_manifest.verify_manifest(
+                manifest_path, report_path, inputs
+            )
+
+            self.assertEqual(manifest["trend_report"]["schema_version"], 2)
+            self.assertFalse(manifest["trend_report"]["regression"])
+            self.assertTrue(manifest["trend_report"]["statistical_regression"])
+            self.assertTrue(verified["statistical_regression"])
+            self.assertNotIn("private.example", json.dumps(manifest))
+            passing = qualification_manifest.create_manifest(
+                report_path, inputs, require_pass=True
+            )
+            self.assertEqual(passing["gate_policy"]["trend_gate"], "passed")
+            self.assertFalse(passing["gate_policy"]["require_statistical_pass"])
+            with self.assertRaisesRegex(ValueError, "regression gate"):
+                qualification_manifest.create_manifest(
+                    report_path,
+                    inputs,
+                    require_statistical_pass=True,
                 )
 
 
