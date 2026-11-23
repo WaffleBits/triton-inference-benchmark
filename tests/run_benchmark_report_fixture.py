@@ -94,6 +94,59 @@ def main() -> None:
         assert "source paths" in serialized
         assert "client-observed" in serialized
 
+        paired_inputs: list[Path] = []
+        source_metrics = json.loads(first_path.read_text(encoding="utf-8"))
+        for group in ("baseline", "candidate"):
+            for index in range(7):
+                metrics = json.loads(json.dumps(source_metrics))
+                baseline_p95 = source_metrics["latency_ms"]["p95"] * 1.09**index
+                metrics["latency_ms"]["p95"] = (
+                    baseline_p95 if group == "baseline" else baseline_p95 * 1.11
+                )
+                metrics["latency_ms"]["p99"] = max(
+                    source_metrics["latency_ms"]["p99"],
+                    metrics["latency_ms"]["p95"],
+                )
+                metrics["server_url"] = "https://private.example/v1"
+                metrics["config"] = {"prompt": "private fixture data"}
+                artifact = root / f"{group}-{index}.json"
+                artifact.write_text(json.dumps(metrics), encoding="utf-8")
+                paired_inputs.append(artifact)
+
+        paired_dir = root / "paired-report"
+        paired_command = [sys.executable, "benchmark_report.py"]
+        for artifact in paired_inputs:
+            paired_command.extend(["--input", str(artifact)])
+        paired_command.extend(
+            [
+                "--paired-baseline-runs",
+                "7",
+                "--fail-on-statistical-regression",
+                "--output-dir",
+                str(paired_dir),
+            ]
+        )
+        paired_result = subprocess.run(
+            paired_command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert paired_result.returncode == 2, paired_result
+        paired_json = paired_dir / "benchmark_trend.json"
+        paired_markdown = paired_dir / "benchmark_trend.md"
+        report = json.loads(paired_json.read_text(encoding="utf-8"))
+        serialized = paired_json.read_text(encoding="utf-8") + paired_markdown.read_text(
+            encoding="utf-8"
+        )
+        assert report["regression"] is False
+        assert report["statistical_regression"] is True
+        assert report["paired_statistical_analysis"]["tests"][0]["exceeding_pairs"] == 7
+        assert "private.example" not in serialized
+        assert "private fixture data" not in serialized
+        assert str(root) not in serialized
+
     print("saved benchmark trend report fixture passed")
 
 

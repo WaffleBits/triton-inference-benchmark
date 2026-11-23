@@ -19,6 +19,14 @@ MAX_INPUTS = 64
 MAX_INPUT_BYTES = 10 * 1024 * 1024
 MAX_MODE_LENGTH = 32
 SUPPORTED_MODES = {"mock", "triton", "openai"}
+MIN_PAIRED_RUNS = 7
+MAX_PAIRED_RUNS = MAX_INPUTS // 2
+PAIRED_STATISTICAL_METRICS = (
+    "p95_latency",
+    "success_rate",
+    "throughput",
+    "attempt_amplification",
+)
 
 
 def _finite_number(value: object, field: str, *, minimum: float | None = None, maximum: float | None = None) -> float:
@@ -168,6 +176,176 @@ def _percent_change(baseline: float, candidate: float) -> float | None:
     return round(((candidate - baseline) / baseline) * 100.0, 4)
 
 
+def _binomial_upper_tail(exceedances: int, trials: int) -> float:
+    """Return P[X >= exceedances] for X~Binomial(trials, 0.5)."""
+    if (
+        isinstance(exceedances, bool)
+        or not isinstance(exceedances, int)
+        or isinstance(trials, bool)
+        or not isinstance(trials, int)
+        or trials < 1
+        or not 0 <= exceedances <= trials
+    ):
+        raise ValueError("binomial exceedances and trials are invalid")
+    numerator = sum(math.comb(trials, count) for count in range(exceedances, trials + 1))
+    return numerator / (2**trials)
+
+
+def _holm_adjusted_p_values(p_values: list[float]) -> list[float]:
+    """Return Holm step-down adjusted p-values in original input order."""
+    if not p_values:
+        raise ValueError("Holm adjustment requires at least one p-value")
+    validated = [
+        _finite_number(value, "p-value", minimum=0.0, maximum=1.0)
+        for value in p_values
+    ]
+    ordered = sorted(enumerate(validated), key=lambda item: (item[1], item[0]))
+    adjusted = [1.0] * len(validated)
+    running_max = 0.0
+    family_size = len(validated)
+    for rank, (original_index, raw_value) in enumerate(ordered):
+        running_max = max(
+            running_max,
+            min(1.0, (family_size - rank) * raw_value),
+        )
+        adjusted[original_index] = running_max
+    return adjusted
+
+
+def _paired_adverse_change(
+    metric: str,
+    baseline: dict[str, object],
+    candidate: dict[str, object],
+) -> float | None:
+    """Project one paired run change into its positive adverse direction."""
+    if metric == "p95_latency":
+        baseline_latency = baseline["latency_ms"]
+        candidate_latency = candidate["latency_ms"]
+        assert isinstance(baseline_latency, dict)
+        assert isinstance(candidate_latency, dict)
+        delta = _percent_change(
+            float(baseline_latency["p95"]), float(candidate_latency["p95"])
+        )
+        return delta
+    if metric == "success_rate":
+        return round(
+            float(baseline["success_rate"]) - float(candidate["success_rate"]), 4
+        )
+    if metric == "throughput":
+        delta = _percent_change(
+            float(baseline["throughput_rps"]), float(candidate["throughput_rps"])
+        )
+        return None if delta is None else round(-delta, 4)
+    if metric == "attempt_amplification":
+        baseline_retry = baseline.get("retry")
+        candidate_retry = candidate.get("retry")
+        if not isinstance(baseline_retry, dict) or not isinstance(candidate_retry, dict):
+            return None
+        return round(
+            float(candidate_retry["client_attempt_amplification"])
+            - float(baseline_retry["client_attempt_amplification"]),
+            4,
+        )
+    raise ValueError(f"unsupported paired metric: {metric}")
+
+
+def _build_paired_statistical_analysis(
+    runs: list[dict[str, object]],
+    *,
+    baseline_count: int,
+    significance_level: float,
+    thresholds: dict[str, float | int],
+) -> dict[str, object]:
+    baseline_runs = runs[:baseline_count]
+    candidate_runs = runs[baseline_count:]
+    threshold_by_metric: dict[str, tuple[float, str]] = {
+        "p95_latency": (
+            float(thresholds["max_p95_regression_pct"]),
+            "percentage increase in p95 latency",
+        ),
+        "success_rate": (
+            float(thresholds["max_success_rate_drop"]),
+            "absolute drop in success rate",
+        ),
+        "throughput": (
+            float(thresholds["max_throughput_drop_pct"]),
+            "percentage drop in throughput",
+        ),
+        "attempt_amplification": (
+            float(thresholds["max_attempt_amplification_increase"]),
+            "increase in client attempt amplification",
+        ),
+    }
+
+    tests: list[dict[str, object]] = []
+    raw_p_values: list[float] = []
+    for metric in PAIRED_STATISTICAL_METRICS:
+        allowed_adverse_change, unit = threshold_by_metric[metric]
+        adverse_changes: list[float] = []
+        note: str | None = None
+        for baseline, candidate in zip(baseline_runs, candidate_runs):
+            change = _paired_adverse_change(metric, baseline, candidate)
+            if change is None:
+                if metric == "attempt_amplification":
+                    note = "retry data was not present in every paired run"
+                else:
+                    note = "a percentage comparison had a zero baseline and nonzero candidate"
+                break
+            adverse_changes.append(change)
+
+        evaluable = note is None
+        exceeding_pairs = (
+            sum(change > allowed_adverse_change for change in adverse_changes)
+            if evaluable
+            else 0
+        )
+        p_value = (
+            _binomial_upper_tail(exceeding_pairs, baseline_count)
+            if evaluable
+            else 1.0
+        )
+        raw_p_values.append(p_value)
+        tests.append(
+            {
+                "metric": metric,
+                "unit": unit,
+                "threshold": allowed_adverse_change,
+                "pairs": baseline_count,
+                "exceeding_pairs": exceeding_pairs,
+                "p_value": p_value,
+                "evaluable": evaluable,
+                "note": note,
+            }
+        )
+
+    adjusted_p_values = _holm_adjusted_p_values(raw_p_values)
+    for result, adjusted_p_value in zip(tests, adjusted_p_values):
+        result["adjusted_p_value"] = adjusted_p_value
+        result["significance_level"] = significance_level
+        result["regression"] = bool(
+            result["evaluable"] and adjusted_p_value <= significance_level
+        )
+
+    return {
+        "method": "one_sided_exact_binomial_test_of_paired_threshold_exceedances",
+        "multiple_comparison_correction": "Holm step-down",
+        "family_size": len(PAIRED_STATISTICAL_METRICS),
+        "significance_level": significance_level,
+        "run_count_per_group": baseline_count,
+        "data_unit": "paired per-run aggregate benchmark summaries",
+        "pairing": "first N inputs are baseline runs; next N are candidate runs; matching positions form pairs",
+        "operator_assumptions": (
+            "paired observations are independent across runs; the operator matches model, workload, "
+            "configuration, environment, and measurement conditions within each pair"
+        ),
+        "interpretation": (
+            "tests whether more than half of paired runs exceed a configured practical regression "
+            "threshold; it is not a request-level confidence interval"
+        ),
+        "tests": tests,
+    }
+
+
 def _comparison_check(
     *,
     baseline: float,
@@ -269,8 +447,10 @@ def build_trend_report(
     max_success_rate_drop: float = 0.01,
     max_throughput_drop_pct: float = 10.0,
     max_attempt_amplification_increase: float = 0.05,
+    paired_baseline_runs: int | None = None,
+    paired_significance_level: float = 0.05,
 ) -> dict[str, object]:
-    """Build adjacent-run comparisons in caller-supplied order."""
+    """Build point comparisons and, when requested, a paired run-level test."""
     if not 2 <= len(runs) <= MAX_INPUTS:
         raise ValueError(f"trend report requires 2 to {MAX_INPUTS} runs")
     thresholds = {
@@ -288,6 +468,31 @@ def build_trend_report(
             "max_attempt_amplification_increase",
         ),
     }
+    if paired_baseline_runs is not None:
+        if (
+            isinstance(paired_baseline_runs, bool)
+            or not isinstance(paired_baseline_runs, int)
+            or not MIN_PAIRED_RUNS <= paired_baseline_runs <= MAX_PAIRED_RUNS
+        ):
+            raise ValueError(
+                f"paired_baseline_runs must be an integer at least {MIN_PAIRED_RUNS} "
+                f"and at most {MAX_PAIRED_RUNS}"
+            )
+        if len(runs) != 2 * paired_baseline_runs:
+            raise ValueError(
+                f"paired analysis requires exactly 2 times paired_baseline_runs "
+                f"({2 * paired_baseline_runs}) input artifacts"
+            )
+        significance_level = _finite_number(
+            paired_significance_level,
+            "paired significance level",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if not 0.0 < significance_level < 1.0:
+            raise ValueError("paired significance level must be greater than 0 and less than 1")
+        thresholds["paired_baseline_runs"] = paired_baseline_runs
+        thresholds["paired_significance_level"] = significance_level
     modes = {run.get("mode") for run in runs}
     if len(modes) != 1:
         raise ValueError("all trend runs must use the same benchmark mode")
@@ -381,8 +586,8 @@ def build_trend_report(
             }
         )
 
-    return {
-        "schema_version": 1,
+    report: dict[str, object] = {
+        "schema_version": 2 if paired_baseline_runs is not None else 1,
         "run_count": len(runs),
         "scope": {
             "comparison": "adjacent runs in caller-supplied order; percentile distributions are not merged",
@@ -397,6 +602,20 @@ def build_trend_report(
         "comparisons": comparisons,
         "regression": any(comparison["regression"] for comparison in comparisons),
     }
+    if paired_baseline_runs is not None:
+        analysis = _build_paired_statistical_analysis(
+            runs,
+            baseline_count=paired_baseline_runs,
+            significance_level=float(thresholds["paired_significance_level"]),
+            thresholds=thresholds,
+        )
+        report["paired_statistical_analysis"] = analysis
+        report["statistical_regression"] = any(
+            result["regression"]
+            for result in analysis["tests"]
+            if isinstance(result, dict)
+        )
+    return report
 
 
 def _format_number(value: object) -> str:
@@ -460,6 +679,37 @@ def render_markdown(report: dict[str, object]) -> str:
         assert isinstance(reasons, list)
         for reason in reasons:
             lines.append(f"  - {reason}")
+    analysis = report.get("paired_statistical_analysis")
+    if isinstance(analysis, dict):
+        lines.extend(
+            [
+                "",
+                "## Paired statistical analysis",
+                "",
+                f"- Method: {analysis['method']}; correction: {analysis['multiple_comparison_correction']} across {analysis['family_size']} metrics.",
+                f"- Paired observations: {analysis['run_count_per_group']} independent run-level pairs; {analysis['data_unit']}.",
+                f"- Significance level: {_format_number(analysis['significance_level'])}; statistical regression: {'FAILED' if report['statistical_regression'] else 'not detected'}.",
+                f"- Pairing: {analysis['pairing']}.",
+                f"- Operator assumptions: {analysis['operator_assumptions']}.",
+                "- This is not a request-level confidence interval.",
+                "",
+                "| Metric | Threshold | Exceeding pairs | Raw p-value | Holm-adjusted p-value | Regression |",
+                "|---|---:|---:|---:|---:|---|",
+            ]
+        )
+        for result in analysis["tests"]:
+            assert isinstance(result, dict)
+            status = "yes" if result["regression"] else "no"
+            if not result["evaluable"]:
+                status = "unavailable"
+            lines.append(
+                f"| {result['metric']} | {_format_number(result['threshold'])} {result['unit']} | "
+                f"{result['exceeding_pairs']}/{result['pairs']} | "
+                f"{_format_number(result['p_value'])} | "
+                f"{_format_number(result['adjusted_p_value'])} | {status} |"
+            )
+            if result.get("note"):
+                lines.append(f"  - {result['metric']}: {result['note']}")
     lines.extend(
         [
             "",
@@ -487,9 +737,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-throughput-drop-pct", type=float, default=10.0)
     parser.add_argument("--max-attempt-amplification-increase", type=float, default=0.05)
     parser.add_argument(
+        "--paired-baseline-runs",
+        type=int,
+        help=(
+            "Enable a run-level paired test. The first N inputs are baseline runs, "
+            "the next N are candidates; N must be at least 7."
+        ),
+    )
+    parser.add_argument(
+        "--paired-significance-level",
+        type=float,
+        help="One-sided significance level for the paired test (default: 0.05).",
+    )
+    parser.add_argument(
         "--fail-on-regression",
         action="store_true",
         help="Exit with status 2 when any adjacent comparison fails a configured gate.",
+    )
+    parser.add_argument(
+        "--fail-on-statistical-regression",
+        action="store_true",
+        help="Exit with status 2 when Holm-adjusted paired analysis detects regression.",
     )
     return parser.parse_args(argv)
 
@@ -498,6 +766,20 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if not 2 <= len(args.inputs) <= MAX_INPUTS:
         raise SystemExit(f"--input must be supplied 2 to {MAX_INPUTS} times")
+    if args.fail_on_statistical_regression and args.paired_baseline_runs is None:
+        print(
+            "benchmark trend report error: --fail-on-statistical-regression requires "
+            "--paired-baseline-runs",
+            file=sys.stderr,
+        )
+        return 2
+    if args.paired_significance_level is not None and args.paired_baseline_runs is None:
+        print(
+            "benchmark trend report error: --paired-significance-level requires "
+            "--paired-baseline-runs",
+            file=sys.stderr,
+        )
+        return 2
     try:
         runs = [load_run(Path(raw_path), index) for index, raw_path in enumerate(args.inputs, 1)]
         report = build_trend_report(
@@ -506,6 +788,12 @@ def main(argv: list[str] | None = None) -> int:
             max_success_rate_drop=args.max_success_rate_drop,
             max_throughput_drop_pct=args.max_throughput_drop_pct,
             max_attempt_amplification_increase=args.max_attempt_amplification_increase,
+            paired_baseline_runs=args.paired_baseline_runs,
+            paired_significance_level=(
+                args.paired_significance_level
+                if args.paired_significance_level is not None
+                else 0.05
+            ),
         )
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -521,6 +809,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Saved trend JSON to {json_path}")
     print(f"Saved trend Markdown to {markdown_path}")
     if args.fail_on_regression and report["regression"]:
+        return 2
+    if args.fail_on_statistical_regression and report["statistical_regression"]:
         return 2
     return 0
 

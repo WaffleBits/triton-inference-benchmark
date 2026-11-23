@@ -487,6 +487,15 @@ retry accounting. It omits source paths, endpoints, prompts, configuration,
 credentials, raw telemetry, and trace identifiers. Workload, model, serving
 configuration, and measurement conditions must be kept comparable by the operator.
 
+For a repeated-run gate, supply at least seven baseline artifacts first and the
+same number of candidate artifacts second. Matching positions form pairs. Use
+`--paired-baseline-runs N` and, optionally, `--paired-significance-level ALPHA`.
+The report tests whether more than half the paired per-run summaries exceed a
+configured practical threshold, using a one-sided exact binomial test and Holm
+correction across four metrics. The operator is responsible for matching the
+workload and collecting independent runs. This is not a request-level test. Add
+`--fail-on-statistical-regression` to gate on the adjusted paired results.
+
 ## Create a content-addressed qualification manifest
 
 Bind a saved trend report to the exact ordered JSON artifacts used to derive it:
@@ -504,7 +513,9 @@ The command re-derives the trend report before writing the manifest. The manifes
 stores only SHA-256 digests, byte counts, run indexes, bounded schema metadata,
 and the regression-gate status. It does not store source paths, report contents,
 endpoints, prompts, credentials, outputs, or raw telemetry. `--require-pass`
-rejects a report that failed its configured regression gate.
+rejects a report that failed its configured adjacent-comparison
+gate. For a paired report, `--require-statistical-pass` rejects an adjusted
+statistical regression. Version 1 reports and manifests remain verifiable.
 
 Verify the manifest later against the same ordered artifacts:
 

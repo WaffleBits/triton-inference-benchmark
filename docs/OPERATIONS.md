@@ -95,6 +95,39 @@ identifiers are excluded. Keep workload, model, serving configuration, and
 measurement conditions comparable before treating a trend as an engineering
 finding; the report does not claim a universal SLO or production-scale behavior.
 
+For repeated-run analysis, pass at least seven baseline artifacts followed by the
+same number of candidate artifacts. Matching positions form pairs. The operator
+must keep each pair comparable and collect independent runs. The report applies a
+one-sided exact binomial test to run-level summary changes beyond the configured
+practical limits, with Holm correction across p95 latency, success rate,
+throughput, and client attempt amplification:
+
+```bash
+python benchmark_report.py \
+  --input baseline/run-1.json \
+  --input baseline/run-2.json \
+  --input baseline/run-3.json \
+  --input baseline/run-4.json \
+  --input baseline/run-5.json \
+  --input baseline/run-6.json \
+  --input baseline/run-7.json \
+  --input candidate/run-1.json \
+  --input candidate/run-2.json \
+  --input candidate/run-3.json \
+  --input candidate/run-4.json \
+  --input candidate/run-5.json \
+  --input candidate/run-6.json \
+  --input candidate/run-7.json \
+  --paired-baseline-runs 7 \
+  --fail-on-statistical-regression
+```
+
+This tests paired per-run summaries, not request-level samples or a confidence
+interval over individual requests. `--fail-on-statistical-regression` is
+separate from the existing adjacent-comparison gate. A paired report is
+re-derived by `qualification_manifest.py`; use `--require-statistical-pass` when
+creating a manifest that must reject statistical regressions.
+
 ## Warmup Phase
 
 Use `--warmup-requests` to precondition the same request path before headline

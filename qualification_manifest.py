@@ -18,7 +18,8 @@ from typing import Any
 import benchmark_report
 
 
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
+LEGACY_MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_KIND = "benchmark_qualification_manifest"
 
 
@@ -56,7 +57,9 @@ def _canonical_sha256(value: object) -> str:
     return _sha256(encoded)
 
 
-def _load_inputs(paths: list[Path]) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+def _load_inputs(
+    paths: list[Path],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     if not 2 <= len(paths) <= benchmark_report.MAX_INPUTS:
         raise ValueError(
             f"--input must be supplied 2 to {benchmark_report.MAX_INPUTS} times"
@@ -77,7 +80,7 @@ def _load_inputs(paths: list[Path]) -> tuple[list[dict[str, object]], list[dict[
     return runs, artifacts
 
 
-def _report_thresholds(report: dict[str, Any]) -> dict[str, float]:
+def _report_thresholds(report: dict[str, Any]) -> dict[str, float | int]:
     thresholds = report.get("thresholds")
     if not isinstance(thresholds, dict):
         raise ValueError("trend report thresholds are missing")
@@ -87,14 +90,30 @@ def _report_thresholds(report: dict[str, Any]) -> dict[str, float]:
         "max_throughput_drop_pct",
         "max_attempt_amplification_increase",
     )
-    if set(thresholds) != set(required):
+    schema_version = report.get("schema_version")
+    expected = set(required)
+    if schema_version == 2:
+        expected.update(("paired_baseline_runs", "paired_significance_level"))
+    if set(thresholds) != expected:
         raise ValueError("trend report thresholds do not match the current schema")
-    values: dict[str, float] = {}
+    values: dict[str, float | int] = {}
     for key in required:
         value = thresholds.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"trend report threshold is invalid: {key}")
         values[key] = float(value)
+    if schema_version == 2:
+        pair_count = thresholds.get("paired_baseline_runs")
+        significance_level = thresholds.get("paired_significance_level")
+        if (
+            isinstance(pair_count, bool)
+            or not isinstance(pair_count, int)
+            or isinstance(significance_level, bool)
+            or not isinstance(significance_level, (int, float))
+        ):
+            raise ValueError("paired trend report thresholds are invalid")
+        values["paired_baseline_runs"] = pair_count
+        values["paired_significance_level"] = float(significance_level)
     return values
 
 
@@ -103,7 +122,7 @@ def _rebuild_report(
     runs: list[dict[str, object]],
 ) -> dict[str, object]:
     schema_version = report.get("schema_version")
-    if schema_version != 1:
+    if type(schema_version) is not int or schema_version not in (1, 2):
         raise ValueError("unsupported trend report schema")
     if not isinstance(report.get("run_count"), int):
         raise ValueError("trend report run_count is invalid")
@@ -113,6 +132,8 @@ def _rebuild_report(
         raise ValueError("trend report regression status is invalid")
 
     thresholds = _report_thresholds(report)
+    paired_baseline_runs = thresholds.get("paired_baseline_runs")
+    paired_significance_level = thresholds.get("paired_significance_level", 0.05)
     rebuilt = benchmark_report.build_trend_report(
         runs,
         max_p95_regression_pct=thresholds["max_p95_regression_pct"],
@@ -121,6 +142,10 @@ def _rebuild_report(
         max_attempt_amplification_increase=thresholds[
             "max_attempt_amplification_increase"
         ],
+        paired_baseline_runs=(
+            int(paired_baseline_runs) if paired_baseline_runs is not None else None
+        ),
+        paired_significance_level=float(paired_significance_level),
     )
     if rebuilt != report:
         raise ValueError(
@@ -141,6 +166,7 @@ def create_manifest(
     input_paths: list[Path],
     *,
     require_pass: bool = False,
+    require_statistical_pass: bool = False,
 ) -> dict[str, object]:
     """Create a manifest after re-deriving the report from exact input bytes."""
     report, report_bytes, artifacts = _validate_report(report_path, input_paths)
@@ -148,11 +174,20 @@ def create_manifest(
     assert isinstance(regression, bool)
     if require_pass and regression:
         raise ValueError("trend report failed its regression gate")
+    statistical_regression = report.get("statistical_regression")
+    if require_statistical_pass and statistical_regression is None:
+        raise ValueError("statistical pass requires paired statistical analysis")
+    if require_statistical_pass and statistical_regression:
+        raise ValueError("trend report failed its statistical regression gate")
 
     thresholds = report["thresholds"]
     assert isinstance(thresholds, dict)
-    return {
-        "schema_version": MANIFEST_SCHEMA_VERSION,
+    manifest: dict[str, object] = {
+        "schema_version": (
+            MANIFEST_SCHEMA_VERSION
+            if report["schema_version"] == 2
+            else LEGACY_MANIFEST_SCHEMA_VERSION
+        ),
         "kind": MANIFEST_KIND,
         "trend_report": {
             "sha256": _sha256(report_bytes),
@@ -177,6 +212,17 @@ def create_manifest(
             "production_measurement_verified": False,
         },
     }
+    if report["schema_version"] == 2:
+        trend_summary = manifest["trend_report"]
+        gate_policy = manifest["gate_policy"]
+        assert isinstance(trend_summary, dict)
+        assert isinstance(gate_policy, dict)
+        trend_summary["statistical_regression"] = bool(statistical_regression)
+        gate_policy["require_statistical_pass"] = require_statistical_pass
+        gate_policy["statistical_gate"] = (
+            "passed" if not statistical_regression else "failed"
+        )
+    return manifest
 
 
 def verify_manifest(
@@ -186,7 +232,11 @@ def verify_manifest(
 ) -> dict[str, object]:
     """Verify manifest metadata, byte digests, and report re-derivation."""
     manifest, _ = _read_json(manifest_path)
-    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+    manifest_schema = manifest.get("schema_version")
+    if type(manifest_schema) is not int or manifest_schema not in (
+        LEGACY_MANIFEST_SCHEMA_VERSION,
+        MANIFEST_SCHEMA_VERSION,
+    ):
         raise ValueError("unsupported qualification manifest schema")
     if manifest.get("kind") != MANIFEST_KIND:
         raise ValueError("unexpected qualification manifest kind")
@@ -195,12 +245,24 @@ def verify_manifest(
         policy.get("require_trend_pass"), bool
     ):
         raise ValueError("qualification manifest gate policy is invalid")
+    if manifest_schema == MANIFEST_SCHEMA_VERSION and not isinstance(
+        policy.get("require_statistical_pass"), bool
+    ):
+        raise ValueError("qualification manifest statistical gate policy is invalid")
 
     expected = create_manifest(
         report_path,
         input_paths,
         require_pass=policy["require_trend_pass"],
+        require_statistical_pass=policy.get("require_statistical_pass", False)
+        if manifest_schema == MANIFEST_SCHEMA_VERSION
+        else False,
     )
+    if (
+        manifest_schema == LEGACY_MANIFEST_SCHEMA_VERSION
+        and expected["schema_version"] != LEGACY_MANIFEST_SCHEMA_VERSION
+    ):
+        raise ValueError("manifest schema does not match trend report schema")
     if expected != manifest:
         raise ValueError("qualification manifest does not match supplied artifacts")
 
@@ -210,6 +272,11 @@ def verify_manifest(
         "kind": MANIFEST_KIND,
         "run_count": report["run_count"],
         "trend_gate": policy["trend_gate"],
+        **(
+            {"statistical_regression": report["statistical_regression"]}
+            if report.get("schema_version") == 2
+            else {}
+        ),
     }
 
 
@@ -233,6 +300,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="reject a trend report whose regression gate failed",
     )
+    create.add_argument(
+        "--require-statistical-pass",
+        action="store_true",
+        help="reject a paired trend report whose statistical gate failed",
+    )
 
     verify = subparsers.add_parser("verify", help="verify a saved manifest")
     verify.add_argument("--manifest", required=True, help="qualification manifest JSON")
@@ -254,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
                 Path(args.report),
                 [Path(value) for value in args.input],
                 require_pass=args.require_pass,
+                require_statistical_pass=args.require_statistical_pass,
             )
             output = Path(args.output)
             output.parent.mkdir(parents=True, exist_ok=True)
